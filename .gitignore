@@ -1,0 +1,56 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Credentials, signing material and local connector configuration
+*.pem
+*.p12
+*.pfx
+*.key
+*_credentials.json
+*token*.json
+.mcp.local.json
+
+# Machine-specific launch configuration (contains local paths and user id).
+config/com.zerong.asharelab.plist
+
+# Local research data and generated artifacts
+var/
+data/
+cache/
+reports/
+raw_data/
+licensed_data/
+vendor_data/
+exports/
+CSMAR*/
+**/CSMAR*/
+*.parquet
+*.arrow
+*.feather
+*.xlsx
+*.xls
+*.xlsb
+*.zip
+*.duckdb
+*.duckdb.wal
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Keep small deterministic fixtures under version control.
+!sample_data/
+!sample_data/**

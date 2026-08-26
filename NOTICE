@@ -1,0 +1,14 @@
+A Share Lab
+Copyright 2026 A Share Lab contributors
+
+This product is licensed under the Apache License, Version 2.0.
+
+The source distribution does not include CSMAR data, provider exports, news
+content, API credentials, brokerage credentials, or generated research
+databases. Those materials remain subject to their owners' separate terms and
+must not be redistributed with this project.
+
+This project was developed alongside the Apache-2.0-licensed TradingAgents
+project but is packaged as a separate application. If future contributions copy
+or modify TradingAgents source, contributors must preserve the applicable
+upstream copyright, attribution, and change notices required by Apache-2.0.

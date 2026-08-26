@@ -1,0 +1,4 @@
+interface:
+  display_name: "A股中线研究"
+  short_description: "Build a low-drawdown A-share portfolio"
+  default_prompt: "Use $a-share-midterm-research to analyze the latest licensed A-share data and produce an evidence-based four-stock medium-term research portfolio."

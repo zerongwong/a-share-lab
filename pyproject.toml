@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "a-share-lab"
+version = "0.1.0"
+description = "Local, evidence-first A-share research assistant"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "duckdb>=1.4,<2",
+    "httpx>=0.28,<1",
+    "numpy>=2.0,<3",
+    "openpyxl>=3.1,<4",
+    "pandas>=2.2,<3.1",
+    "platformdirs>=4.3,<5",
+    "plotly>=6,<7",
+    "pyarrow>=18,<23",
+    "pydantic>=2.10,<3",
+    "pydantic-settings>=2.7,<3",
+    "streamlit>=1.42,<2",
+    "tenacity>=9,<10",
+    "yfinance>=1.6,<2",
+]
+
+[project.scripts]
+ashare-import-csmar = "ashare_lab.cli.import_csmar:main"
+ashare-import-csmar-reference = "ashare_lab.cli.import_csmar_reference:main"
+ashare-mcp = "ashare_lab.mcp_server:main"
+
+[project.optional-dependencies]
+# AKShare is deliberately optional. It is useful for a personal research MVP,
+# but every call must remain behind a data-provider adapter so a licensed feed
+# can replace it without changing the analysis code.
+akshare = ["akshare>=1.16,<2"]
+mcp = ["mcp>=1.26,<2"]
+dev = [
+    "hypothesis>=6.120,<7",
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<8",
+    "ruff>=0.9,<1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: accesses a live external data provider",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "C4"]
+ignore = ["E501"]

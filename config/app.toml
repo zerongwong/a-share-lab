@@ -1,0 +1,18 @@
+[app]
+name = "A股研究室"
+version = "0.1.0"
+timezone = "Asia/Shanghai"
+default_symbol = "600150"
+minimum_daily_bars = 120
+
+[data]
+provider = "akshare"
+adjust = "qfq"
+cache_max_age_hours = 24
+
+[safety]
+auto_trading = false
+margin_enabled = false
+limit_watchlist_enabled = false
+research_only = true
+

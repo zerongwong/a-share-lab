@@ -1,0 +1,109 @@
+schema_version = 1
+ratio_units = [3, 2, 2, 1]
+ratio_note = "Weights apply within stock exposure; unused allocation remains cash."
+return_disclaimer = "Return, drawdown and Sharpe estimates are uncertain ranges, never guarantees."
+
+[profiles.conservative]
+display_name = "稳健型"
+stock_exposure = 0.60
+base_cash_ratio = 0.40
+position_weights = [0.225, 0.150, 0.150, 0.075]
+
+[profiles.conservative.risk]
+target_annual_volatility_max = 0.12
+drawdown_alert = 0.08
+drawdown_de_risk = 0.12
+per_position_loss_cap = 0.004
+sector_exposure_cap = 0.30
+
+[profiles.conservative.scoring]
+drawdown_cvar = 0.35
+risk_adjusted_return = 0.25
+quality_liquidity = 0.00
+expected_return = 0.08
+diversification = 0.05
+trend_catalyst = 0.00
+fundamentals = 0.14
+liquidity = 0.06
+trend = 0.03
+news = 0.01
+market_sector = 0.03
+
+[profiles.conservative.financing]
+enabled = false
+default_margin_debt_ratio = 0.00
+max_margin_debt_ratio = 0.00
+max_gross_exposure = 0.60
+automatic_activation = false
+allow_averaging_down = false
+licensed_broker_only = true
+
+[profiles.balanced]
+display_name = "平衡型"
+stock_exposure = 0.80
+base_cash_ratio = 0.20
+position_weights = [0.30, 0.20, 0.20, 0.10]
+
+[profiles.balanced.risk]
+target_annual_volatility_max = 0.18
+drawdown_alert = 0.12
+drawdown_de_risk = 0.18
+per_position_loss_cap = 0.006
+sector_exposure_cap = 0.40
+
+[profiles.balanced.scoring]
+drawdown_cvar = 0.25
+risk_adjusted_return = 0.20
+quality_liquidity = 0.00
+expected_return = 0.20
+diversification = 0.10
+trend_catalyst = 0.00
+fundamentals = 0.12
+liquidity = 0.05
+trend = 0.04
+news = 0.02
+market_sector = 0.02
+
+[profiles.balanced.financing]
+enabled = false
+default_margin_debt_ratio = 0.00
+max_margin_debt_ratio = 0.00
+max_gross_exposure = 0.80
+automatic_activation = false
+allow_averaging_down = false
+licensed_broker_only = true
+
+[profiles.aggressive]
+display_name = "激进型"
+stock_exposure = 0.90
+base_cash_ratio = 0.10
+position_weights = [0.3375, 0.225, 0.225, 0.1125]
+
+[profiles.aggressive.risk]
+target_annual_volatility_max = 0.25
+drawdown_alert = 0.18
+drawdown_de_risk = 0.25
+per_position_loss_cap = 0.008
+sector_exposure_cap = 0.50
+
+[profiles.aggressive.scoring]
+drawdown_cvar = 0.15
+risk_adjusted_return = 0.15
+quality_liquidity = 0.00
+expected_return = 0.30
+diversification = 0.08
+trend_catalyst = 0.00
+fundamentals = 0.08
+liquidity = 0.03
+trend = 0.10
+news = 0.05
+market_sector = 0.06
+
+[profiles.aggressive.financing]
+enabled = true
+default_margin_debt_ratio = 0.00
+max_margin_debt_ratio = 0.10
+max_gross_exposure = 1.10
+automatic_activation = false
+allow_averaging_down = false
+licensed_broker_only = true

@@ -1,0 +1,108 @@
+schema_version = 1
+
+# This file is public configuration only. Never add provider credentials here.
+
+[sources.ifind]
+display_name = "同花顺 iFinD"
+status = "not_connected"
+purposes = ["A股行情", "财务数据", "公司与行业基础资料"]
+official_url = "https://quantapi.10jqka.com.cn/gwstatic/static/ds_web/quantapi-web/"
+application_url = "https://quantapi.10jqka.com.cn/gwstatic/static/ds_web/quantapi-web/help-center/deploy.html"
+authorization_basis = "account_entitlement"
+authorization_reference = ""
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache", "fundamental_data_read", "metadata_read"]
+notes = "需自行购买或获得账户数据权限；默认未连接。"
+
+[sources.choice]
+display_name = "东方财富 Choice"
+status = "not_connected"
+purposes = ["A股行情", "财务数据", "公司与行业基础资料"]
+official_url = "https://quantapi.eastmoney.com/"
+application_url = "https://choice.eastmoney.com/product/datacenter"
+authorization_basis = "account_entitlement"
+authorization_reference = ""
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache", "fundamental_data_read", "metadata_read"]
+notes = "需自行购买或获得账户数据权限；默认未连接。"
+
+[sources.tushare]
+display_name = "Tushare Pro"
+status = "not_connected"
+purposes = ["A股证券主表", "全市场日线行情", "交易日历"]
+official_url = "https://tushare.pro/"
+application_url = "https://tushare.pro/register"
+authorization_basis = "account_entitlement"
+authorization_reference = ""
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "需用户自行注册并取得相应积分/接口权限；令牌只放操作系统密钥存储或运行环境，禁止写入本配置。"
+
+[sources.csmar]
+display_name = "CSMAR 本地导出"
+status = "connected"
+purposes = ["用户已取得的本地A股证券主表", "用户已取得的本地全市场日线"]
+official_url = "https://data.csmar.com/"
+application_url = "https://data.csmar.com/"
+authorization_basis = "account_entitlement"
+authorization_reference = "user-supplied-local-export"
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "仅处理用户明确指定的本地导出目录；不得上传、传播或绕过原始数据许可。"
+
+[sources.infoway]
+display_name = "Infoway A股实时行情"
+status = "experimental"
+purposes = ["沪深A股实时K线", "最新成交", "五档盘口", "证券清单"]
+official_url = "https://docs.infoway.io/en-docs/readme/china-a-shares-data-api"
+application_url = "https://infoway.io/dashboard"
+authorization_basis = "personal_research_only"
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "免费档仅用于个人研究；REST每秒1次，WebSocket最多10只。密钥只保存在macOS钥匙串。"
+
+[sources.cls]
+display_name = "财联社"
+status = "blocked_require_written_authorization"
+purposes = ["新闻与事件元数据", "授权后的新闻正文研究"]
+official_url = "https://www.cls.cn/our?nav=copyright"
+application_url = "https://image.cls.cn/html/business/cooperation_671.html"
+authorization_basis = "written_authorization"
+authorization_reference = ""
+configurable = true
+allowed_actions = []
+notes = "未取得可核验书面授权前，不抓取、不落盘、不发送模型、不展示或导出正文。"
+
+[sources.stcn]
+display_name = "证券时报"
+status = "blocked_require_written_authorization"
+purposes = ["新闻与公告线索元数据", "授权后的新闻正文研究"]
+official_url = "https://www.stcn.com/article/detail/1709906.html"
+application_url = "https://www.stcn.com/public/contact.html"
+authorization_basis = "written_authorization"
+authorization_reference = ""
+configurable = true
+allowed_actions = []
+notes = "未取得可核验书面授权前，不抓取、不落盘、不发送模型、不展示或导出正文。"
+
+[sources.akshare]
+display_name = "AKShare"
+status = "experimental"
+purposes = ["个人研究用实验行情", "已标记缓存"]
+official_url = "https://akshare.akfamily.xyz/"
+application_url = "https://akshare.akfamily.xyz/"
+authorization_basis = "personal_research_only"
+configurable = false
+allowed_actions = ["market_data_read", "market_data_cache"]
+notes = "非生产级授权源；接口可能变化，结果必须保留来源、时间戳和质量标记。"
+
+[sources.yahoo]
+display_name = "Yahoo Finance"
+status = "price_backup"
+purposes = ["价格备用与交叉核验"]
+official_url = "https://finance.yahoo.com/"
+application_url = "https://finance.yahoo.com/"
+authorization_basis = "personal_research_only"
+configurable = false
+allowed_actions = ["market_data_read", "market_data_cache"]
+notes = "只作价格备用；不静默替代主源，不用于新闻正文。"
