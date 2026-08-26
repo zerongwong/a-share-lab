@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
+from ashare_lab.adapters.csmar_reference import CSMARReferenceData
+from ashare_lab.analytics.balance_sheet_strength import (
+    assess_balance_sheet_strength_snapshot,
+)
 from ashare_lab.domain.errors import DataQualityError, DataUnavailableError
 from ashare_lab.domain.market_rules import calculate_price_band
 
@@ -28,6 +33,35 @@ class CSMARUniverseSnapshot:
     full_day_volume_available: bool = False
     fundamental_scores_available: bool = False
     news_scores_available: bool = False
+    balance_sheet_strength_available: bool = False
+    balance_sheet_strength_symbols: int = 0
+    balance_sheet_strength_excluded_symbols: int = 0
+    balance_sheet_snapshot_retrieved_at: date | None = None
+    balance_sheet_strength_reason: str = "reference_data_not_requested"
+    market_index_histories: dict[str, pd.DataFrame] = field(default_factory=dict)
+    reference_common_cutoff: date | None = None
+    reference_warnings: tuple[str, ...] = ()
+
+
+DEFAULT_CORE_INDEX_CODES = (
+    "000001",
+    "000300",
+    "000852",
+    "000905",
+    "399001",
+    "399006",
+)
+
+
+def _minimum_live_price_cutoff(decision_date: date) -> date:
+    """Conservative weekday fallback until an official calendar is connected."""
+
+    weekday = decision_date.weekday()
+    if weekday == 0:  # Monday -> previous Friday
+        return decision_date - timedelta(days=3)
+    if weekday == 6:  # Sunday -> previous Friday
+        return decision_date - timedelta(days=2)
+    return decision_date - timedelta(days=1)
 
 
 def _price_limit_rate(board: object) -> Decimal:
@@ -65,6 +99,12 @@ def load_csmar_universe(
     history_sessions: int = 320,
     minimum_median_amount_cny: float = 20_000_000.0,
     raw_return_outlier_limit: float = 0.45,
+    reference_dataset_root: str | Path | None = None,
+    decision_date: date | None = None,
+    mode: Literal["live", "historical"] = "live",
+    minimum_balance_sheet_coverage: float = 0.90,
+    balance_sheet_minimum_group_size: int = 20,
+    core_index_codes: tuple[str, ...] = DEFAULT_CORE_INDEX_CODES,
 ) -> CSMARUniverseSnapshot:
     """Return active stocks with sufficient recent history from local DuckDB.
 
@@ -83,6 +123,17 @@ def load_csmar_universe(
         raise ValueError("minimum_median_amount_cny cannot be negative")
     if not 0 < raw_return_outlier_limit < 1:
         raise ValueError("raw_return_outlier_limit must be between zero and one")
+    if mode not in {"live", "historical"}:
+        raise ValueError("mode must be live or historical")
+    if not 0.0 < minimum_balance_sheet_coverage <= 1.0:
+        raise ValueError("minimum_balance_sheet_coverage must be in (0, 1]")
+    if balance_sheet_minimum_group_size < 3:
+        raise ValueError("balance_sheet_minimum_group_size must be at least three")
+    if len(core_index_codes) < 3 or len(set(core_index_codes)) != len(core_index_codes):
+        raise ValueError("core_index_codes must contain at least three unique codes")
+    resolved_decision_date = as_of if decision_date is None else decision_date
+    if resolved_decision_date < as_of:
+        raise ValueError("decision_date cannot be earlier than as_of")
 
     root = Path(dataset_root).expanduser().resolve()
     database_path = root / "csmar.duckdb"
@@ -103,6 +154,15 @@ def load_csmar_universe(
         if cutoff_value is None:
             raise DataUnavailableError(f"CSMAR在{as_of.isoformat()}及之前没有日线数据")
         cutoff = pd.Timestamp(cutoff_value).date()
+        if mode == "live":
+            minimum_live_cutoff = _minimum_live_price_cutoff(resolved_decision_date)
+            if cutoff < minimum_live_cutoff:
+                raise DataUnavailableError(
+                    "当前研究的数据不是最新完整截面："
+                    f"决策日{resolved_decision_date.isoformat()}至少需要"
+                    f"{minimum_live_cutoff.isoformat()}收盘数据，实际只有{cutoff.isoformat()}。"
+                    "请更新本地日线，或切换历史回放。"
+                )
         master_symbols = int(
             connection.execute("SELECT count(DISTINCT symbol) FROM security_master").fetchone()[0]
         )
@@ -193,6 +253,7 @@ def load_csmar_universe(
             # the portfolio scorer disables these fields rather than inventing
             # a neutral score.
             "fundamental_score": None,
+            "balance_sheet_strength_score": None,
             "liquidity_score": float(liquidity_scores.loc[symbol]),
             "news_score": None,
             "market_regime_score": None,
@@ -207,6 +268,83 @@ def load_csmar_universe(
             "board": str(row["board"]),
         }
 
+    balance_sheet_strength_available = False
+    balance_sheet_strength_symbols = 0
+    balance_sheet_strength_excluded_symbols = 0
+    balance_sheet_snapshot_retrieved_at: date | None = None
+    balance_sheet_strength_reason = "reference_data_not_requested"
+    market_index_histories: dict[str, pd.DataFrame] = {}
+    reference_common_cutoff: date | None = None
+    reference_warnings: list[str] = []
+
+    if reference_dataset_root is not None:
+        reference = CSMARReferenceData(reference_dataset_root)
+        for index_code in core_index_codes:
+            market_index_histories[index_code] = reference.read_index_daily(
+                index_code,
+                cutoff - timedelta(days=550),
+                cutoff,
+            )
+        declared_cutoffs = {
+            pd.Timestamp(value).date()
+            for frame in market_index_histories.values()
+            for value in frame["common_cutoff_date"].dropna().unique()
+        }
+        if len(declared_cutoffs) != 1:
+            raise DataQualityError("CSMAR核心指数没有唯一的共同截止日")
+        reference_common_cutoff = next(iter(declared_cutoffs))
+        if reference_common_cutoff < cutoff:
+            raise DataQualityError("CSMAR核心指数参考库落后于个股共同截止日")
+
+        balance = reference.read_balance_sheet_snapshot()
+        retrieved = pd.to_datetime(balance["retrieved_at"], errors="coerce").dt.date
+        retrieved_values = set(retrieved.dropna().unique())
+        if len(retrieved_values) != 1 or bool(retrieved.isna().any()):
+            raise DataQualityError("CSMAR资产负债表快照没有唯一、完整的取得日期")
+        balance_sheet_snapshot_retrieved_at = next(iter(retrieved_values))
+        safe_live_date = balance_sheet_snapshot_retrieved_at + timedelta(days=1)
+
+        if mode == "historical":
+            balance_sheet_strength_reason = "historical_mode_rejects_current_snapshot"
+        elif resolved_decision_date < safe_live_date:
+            balance_sheet_strength_reason = "decision_precedes_safe_current_snapshot_use"
+        elif cutoff < balance_sheet_snapshot_retrieved_at:
+            balance_sheet_strength_reason = "price_cutoff_precedes_current_snapshot_retrieval"
+        else:
+            eligible_balance = balance.loc[balance["symbol"].astype(str).isin(histories)].copy()
+            assessed = assess_balance_sheet_strength_snapshot(
+                eligible_balance,
+                minimum_group_size=balance_sheet_minimum_group_size,
+            )
+            available = assessed.loc[assessed["available"]].copy()
+            available_symbols = set(available["symbol"].astype(str))
+            coverage = len(available_symbols) / len(histories)
+            if coverage < minimum_balance_sheet_coverage:
+                balance_sheet_strength_reason = (
+                    "balance_sheet_strength_coverage_below_minimum:"
+                    f"{len(available_symbols)}/{len(histories)}"
+                )
+            else:
+                scores = available.set_index("symbol")["score"].astype(float).to_dict()
+                missing = set(histories) - available_symbols
+                for symbol in missing:
+                    histories.pop(symbol, None)
+                    metadata.pop(symbol, None)
+                for symbol, score in scores.items():
+                    if symbol in metadata:
+                        metadata[symbol]["balance_sheet_strength_score"] = float(score)
+                balance_sheet_strength_available = True
+                balance_sheet_strength_symbols = len(histories)
+                balance_sheet_strength_excluded_symbols = len(missing)
+                balance_sheet_strength_reason = (
+                    "current_snapshot_balance_sheet_strength_enabled;"
+                    "not_complete_fundamental_quality;not_historical_pit"
+                )
+                reference_warnings.append(
+                    "资产负债表稳健度仅为当前快照窄因子，不含利润、现金流、估值或公告时点，"
+                    "不得用于历史回测。"
+                )
+
     active_symbols = int(active["symbol"].nunique())
     if active_symbols > master_symbols:
         raise DataQualityError("CSMAR当前截面证券数超过证券主表，数据库关系异常")
@@ -219,4 +357,12 @@ def load_csmar_universe(
         eligible_symbols=len(histories),
         excluded_symbols=active_symbols - len(histories),
         minimum_median_amount_cny=minimum_median_amount_cny,
+        balance_sheet_strength_available=balance_sheet_strength_available,
+        balance_sheet_strength_symbols=balance_sheet_strength_symbols,
+        balance_sheet_strength_excluded_symbols=balance_sheet_strength_excluded_symbols,
+        balance_sheet_snapshot_retrieved_at=balance_sheet_snapshot_retrieved_at,
+        balance_sheet_strength_reason=balance_sheet_strength_reason,
+        market_index_histories=market_index_histories,
+        reference_common_cutoff=reference_common_cutoff,
+        reference_warnings=tuple(reference_warnings),
     )

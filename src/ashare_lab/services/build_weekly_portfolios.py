@@ -12,7 +12,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from math import isfinite
 from typing import Any
@@ -23,6 +23,11 @@ import pandas as pd
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics.allocation import allocate_four_stocks, get_default_profile
+from ashare_lab.analytics.index_regime import (
+    IndexRegimeAssessment,
+    IndexRegimeState,
+    assess_index_regime,
+)
 from ashare_lab.analytics.market_regime import (
     MarketRegimeAssessment,
     MarketRegimeState,
@@ -130,6 +135,7 @@ class WeeklyPortfolioBatch:
     annual_return_ambition_pct: int | None = None
     factor_coverage: tuple[FactorCoverage, ...] = ()
     market_regime: MarketRegimeAssessment | None = None
+    index_regime: IndexRegimeAssessment | None = None
     disclaimer: str = NON_PROMISE_NOTICE
 
     def for_profile(self, profile: RiskProfileName | str) -> WeeklyPortfolioResult:
@@ -147,6 +153,7 @@ class _Candidate:
     industry: str
     returns: pd.Series
     fundamentals: float | None
+    balance_sheet_strength: float | None
     liquidity: float | None
     news: float | None
     sector_context: float | None
@@ -341,6 +348,10 @@ def _candidate_from_input(
             "fundamental_score",
             legacy_key="quality_score",
         )
+        balance_sheet_strength = _optional_unit_metadata_score(
+            metadata,
+            "balance_sheet_strength_score",
+        )
         liquidity = _optional_unit_metadata_score(metadata, "liquidity_score")
         news = _optional_unit_metadata_score(
             metadata,
@@ -384,6 +395,7 @@ def _candidate_from_input(
             industry=industry,
             returns=returns,
             fundamentals=fundamentals,
+            balance_sheet_strength=balance_sheet_strength,
             liquidity=liquidity,
             news=news,
             sector_context=sector_context,
@@ -403,6 +415,7 @@ def _percentile_scores(values: list[float]) -> list[float]:
 
 _OPTIONAL_FACTOR_ATTRIBUTES = {
     "fundamentals": "fundamentals",
+    "balance_sheet_strength": "balance_sheet_strength",
     "liquidity": "liquidity",
     "news": "news",
     "sector_context": "sector_context",
@@ -472,6 +485,11 @@ def _score_candidates(
             "risk_adjusted_return": weights.risk_adjusted_return,
             "expected_return": weights.expected_return,
             "fundamentals": weights.fundamentals + 0.50 * weights.quality_liquidity,
+            # The current CSMAR extract contains only a balance sheet.  It may
+            # contribute a deliberately smaller weight than a complete,
+            # announcement-timed fundamental factor, and never replaces one.
+            "balance_sheet_strength": 0.50
+            * (weights.fundamentals + 0.50 * weights.quality_liquidity),
             "liquidity": weights.liquidity + 0.50 * weights.quality_liquidity,
             "trend": weights.trend + 0.70 * weights.trend_catalyst,
             "news": weights.news + 0.30 * weights.trend_catalyst,
@@ -704,12 +722,15 @@ def _factor_warnings(
     by_name = {item.factor: item for item in coverage}
     configured = {
         "fundamentals": profile.scoring.fundamentals + 0.50 * profile.scoring.quality_liquidity,
+        "balance_sheet_strength": 0.50
+        * (profile.scoring.fundamentals + 0.50 * profile.scoring.quality_liquidity),
         "liquidity": profile.scoring.liquidity + 0.50 * profile.scoring.quality_liquidity,
         "news": profile.scoring.news + 0.30 * profile.scoring.trend_catalyst,
         "sector_context": profile.scoring.market_sector,
     }
     labels = {
         "fundamentals": "财务基本面",
+        "balance_sheet_strength": "资产负债表稳健度（当前快照）",
         "liquidity": "流动性",
         "news": "公司新闻/公告",
         "sector_context": "板块环境",
@@ -740,6 +761,7 @@ def build_weekly_portfolios(
     beam_width: int = 256,
     exclude_formation_limit_up: bool = True,
     exclude_overheated_acceleration: bool = True,
+    market_index_histories: Mapping[str, pd.DataFrame] | None = None,
 ) -> WeeklyPortfolioBatch:
     """Build conservative, balanced and aggressive weekly research portfolios.
 
@@ -747,7 +769,10 @@ def build_weekly_portfolios(
     Optional normalized scores ``fundamental_score``, ``liquidity_score``,
     ``news_score`` and ``sector_score`` are in [0, 1].  The portfolio-level
     market regime is derived independently from common-cutoff cross-sectional
-    breadth and is never treated as a per-stock ranking factor.
+    breadth and is never treated as a per-stock ranking factor.  When
+    ``market_index_histories`` is supplied, all core indices must pass the same
+    cutoff and data-quality checks; an unavailable or risk-off confirmation
+    pauses new portfolio formation.
     An optional factor is enabled only with complete eligible-universe coverage;
     missing values are reported and never filled with an invented neutral score.
     Legacy ``quality_score``/``catalyst_score`` aliases remain accepted.
@@ -802,6 +827,11 @@ def build_weekly_portfolios(
         )
 
     market_regime = assess_market_regime(normalized_histories, cutoff)
+    index_regime = (
+        None
+        if market_index_histories is None
+        else assess_index_regime(market_index_histories, cutoff)
+    )
 
     candidates: list[_Candidate] = []
     exclusions: list[ExcludedStock] = []
@@ -827,15 +857,32 @@ def build_weekly_portfolios(
     factor_coverage = _factor_coverage(candidates)
     enabled_factors = frozenset(item.factor for item in factor_coverage if item.enabled)
 
+    regime_block_reason: str | None = None
+    regime_warning: str | None = None
     if market_regime.state == MarketRegimeState.RISK_OFF:
+        regime_block_reason = "market_regime_risk_off_new_entries_paused"
+        regime_warning = (
+            "全市场共同截止日宽度处于risk-off；低回撤规则暂停建立新的四股组合，保留现金。"
+        )
+    elif index_regime is not None and index_regime.state == IndexRegimeState.UNAVAILABLE:
+        regime_block_reason = "core_index_regime_unavailable_new_entries_paused"
+        regime_warning = (
+            "核心指数确认数据不完整或与个股截止日不一致；低回撤规则暂停建立新的四股组合，保留现金。"
+        )
+    elif index_regime is not None and index_regime.state == IndexRegimeState.RISK_OFF:
+        regime_block_reason = "core_index_regime_risk_off_new_entries_paused"
+        regime_warning = (
+            "核心指数趋势与下行风险处于risk-off；低回撤规则暂停建立新的四股组合，保留现金。"
+        )
+
+    if regime_block_reason is not None:
+        assert regime_warning is not None
         unavailable = tuple(
             WeeklyPortfolioResult(
                 profile=profile,
                 status=WeeklyPortfolioStatus.UNAVAILABLE,
-                reasons=("market_regime_risk_off_new_entries_paused",),
-                risk_warnings=(
-                    "全市场共同截止日宽度处于risk-off；低回撤规则暂停建立新的四股组合，保留现金。",
-                ),
+                reasons=(regime_block_reason,),
+                risk_warnings=(regime_warning,),
             )
             for profile in RiskProfileName
         )
@@ -847,6 +894,7 @@ def build_weekly_portfolios(
             annual_return_ambition_pct=validated_ambition,
             factor_coverage=factor_coverage,
             market_regime=market_regime,
+            index_regime=index_regime,
         )
 
     results: list[WeeklyPortfolioResult] = []
@@ -928,6 +976,7 @@ def build_weekly_portfolios(
         annual_return_ambition_pct=validated_ambition,
         factor_coverage=factor_coverage,
         market_regime=market_regime,
+        index_regime=index_regime,
     )
 
 
@@ -935,6 +984,8 @@ def archive_weekly_portfolios(
     batch: WeeklyPortfolioBatch,
     histories: Mapping[str, pd.DataFrame],
     repository: SQLiteRepository,
+    *,
+    requested_as_of: date | None = None,
 ) -> str | None:
     """Archive selected memberships; uncalibrated metrics remain NULL."""
 
@@ -964,7 +1015,7 @@ def archive_weekly_portfolios(
                 "first_at": pd.Timestamp(dates.min()).date(),
                 "last_at": pd.Timestamp(dates.max()).date(),
                 "row_count": len(frame),
-                "adjustment": "qfq",
+                "adjustment": "none",
                 "unit_json": {"volume_shares": "share", "amount_cny": "CNY"},
                 "checksum": checksum,
                 "retrieved_at": retrieved,
@@ -973,7 +1024,7 @@ def archive_weekly_portfolios(
         )
     data_hash = hashlib.sha256(json.dumps(frame_hashes, sort_keys=True).encode("utf-8")).hexdigest()
     config_payload = (
-        f"weekly-3-2-2-1-v0.3.0|holding_weeks={batch.holding_weeks}|"
+        f"ashare-medium-v0.4.0|holding_weeks={batch.holding_weeks}|"
         f"annual_ambition={batch.annual_return_ambition_pct or 'none'}"
     )
     config_hash = hashlib.sha256(config_payload.encode("utf-8")).hexdigest()
@@ -1017,14 +1068,14 @@ def archive_weekly_portfolios(
         {
             "id": run_id,
             "run_type": "weekly_portfolios",
-            "as_of": batch.data_cutoff.date(),
+            "as_of": requested_as_of or batch.data_cutoff.date(),
             "data_cutoff": batch.data_cutoff.date(),
             "created_at": created_at,
-            "strategy_version": "weekly-3-2-2-1-v0.2.0",
+            "strategy_version": "ashare-medium-v0.4.0",
             "model_id": None,
             "config_hash": config_hash,
             "data_hash": data_hash,
-            "status": "completed" if len(ready) == 3 else "partial",
+            "status": "completed" if len(ready) == len(batch.portfolios) else "partial",
             "warning_json": [
                 NON_PROMISE_NOTICE,
                 "当前组合统计为历史重叠描述；预测收益/波动/回撤字段保持空值，"

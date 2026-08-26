@@ -15,6 +15,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -57,6 +58,7 @@ class MCPSettings:
 
     csmar_cache_dir: Path
     research_db: Path
+    csmar_reference_dir: Path | None = None
     allow_licensed_derived_results: bool = False
     host: str = "127.0.0.1"
     port: int = 8765
@@ -70,6 +72,12 @@ class MCPSettings:
         ).expanduser()
         research_db = Path(
             os.getenv("ASHARE_RESEARCH_DB", str(default_data_dir / "research.db"))
+        ).expanduser()
+        reference_dir = Path(
+            os.getenv(
+                "ASHARE_CSMAR_REFERENCE_DIR",
+                str(default_data_dir / "cache" / "csmar_reference"),
+            )
         ).expanduser()
         host = os.getenv("ASHARE_MCP_HOST", "127.0.0.1").strip()
         if host not in {"127.0.0.1", "localhost", "::1"}:
@@ -89,6 +97,7 @@ class MCPSettings:
         return cls(
             csmar_cache_dir=cache_dir.resolve(),
             research_db=research_db.resolve(),
+            csmar_reference_dir=reference_dir.resolve(),
             allow_licensed_derived_results=_environment_flag(
                 "ASHARE_MCP_ALLOW_LICENSED_DERIVED_RESULTS"
             ),
@@ -108,10 +117,17 @@ class ReadOnlyResearchTools:
         """Report readiness without returning paths, credentials, or source rows."""
 
         catalog_available = (self.settings.csmar_cache_dir / "csmar.duckdb").is_file()
+        reference_available = bool(
+            self.settings.csmar_reference_dir is not None
+            and (self.settings.csmar_reference_dir / "csmar_reference.duckdb").is_file()
+        )
         return {
             "status": "ready" if catalog_available else "unavailable",
             "csmar_catalog_available": catalog_available,
             "research_archive_available": self.settings.research_db.is_file(),
+            "core_index_pit_catalog_available": reference_available,
+            "balance_sheet_current_snapshot_available": reference_available,
+            "balance_sheet_historical_pit_available": False,
             "derived_results_over_mcp_enabled": self.settings.allow_licensed_derived_results,
             "raw_data_exposed": False,
             "trading_actions_available": False,
@@ -123,6 +139,7 @@ class ReadOnlyResearchTools:
         *,
         as_of: str | None = None,
         holding_weeks: int = 13,
+        mode: Literal["live", "historical"] = "live",
     ) -> dict[str, Any]:
         """Compute a portfolio from the local catalog without archiving it."""
 
@@ -130,16 +147,40 @@ class ReadOnlyResearchTools:
         if holding_weeks not in ALLOWED_HOLDING_WEEKS:
             allowed = ", ".join(str(item) for item in sorted(ALLOWED_HOLDING_WEEKS))
             raise ValueError(f"holding_weeks must be one of: {allowed}")
-        cutoff = date.today() if as_of is None else date.fromisoformat(as_of)
-        if cutoff > date.today():
+        if mode not in {"live", "historical"}:
+            raise ValueError("mode must be live or historical")
+        shanghai_today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        cutoff = shanghai_today if as_of is None else date.fromisoformat(as_of)
+        if cutoff > shanghai_today:
             raise ValueError("as_of cannot be in the future")
+        if mode == "live" and cutoff != shanghai_today:
+            raise ValueError("live mode requires today's Shanghai decision date")
 
-        snapshot = load_csmar_universe(self.settings.csmar_cache_dir, as_of=cutoff)
+        reference_root = (
+            self.settings.csmar_reference_dir
+            if self.settings.csmar_reference_dir is not None
+            and (self.settings.csmar_reference_dir / "csmar_reference.duckdb").is_file()
+            else None
+        )
+        snapshot = load_csmar_universe(
+            self.settings.csmar_cache_dir,
+            as_of=cutoff,
+            reference_dataset_root=reference_root,
+            decision_date=cutoff,
+            mode=mode,
+        )
         kwargs: dict[str, Any] = {
             "as_of": snapshot.data_cutoff,
             "holding_weeks": holding_weeks,
         }
-        batch = build_weekly_portfolios(snapshot.histories, snapshot.metadata, **kwargs)
+        batch = build_weekly_portfolios(
+            snapshot.histories,
+            snapshot.metadata,
+            market_index_histories=(
+                snapshot.market_index_histories if reference_root is not None else None
+            ),
+            **kwargs,
+        )
         portfolio = batch.for_profile("balanced")
 
         response: dict[str, Any] = {
@@ -151,6 +192,7 @@ class ReadOnlyResearchTools:
             ),
             "holding_weeks": holding_weeks,
             "profile": "balanced_single_objective",
+            "mode": mode,
             "universe": {
                 "master_symbols": snapshot.master_symbols,
                 "active_symbols": snapshot.active_symbols,
@@ -159,6 +201,19 @@ class ReadOnlyResearchTools:
             },
             "factor_coverage": _jsonable(batch.factor_coverage),
             "market_regime": _jsonable(batch.market_regime),
+            "index_regime": _jsonable(batch.index_regime),
+            "balance_sheet_strength": {
+                "enabled": snapshot.balance_sheet_strength_available,
+                "provided": snapshot.balance_sheet_strength_symbols,
+                "excluded": snapshot.balance_sheet_strength_excluded_symbols,
+                "retrieved_at": (
+                    None
+                    if snapshot.balance_sheet_snapshot_retrieved_at is None
+                    else snapshot.balance_sheet_snapshot_retrieved_at.isoformat()
+                ),
+                "reason": snapshot.balance_sheet_strength_reason,
+                "historical_point_in_time": False,
+            },
             "warnings": list(portfolio.risk_warnings),
             "disclaimer": portfolio.disclaimer,
             "raw_data_exposed": False,
@@ -422,10 +477,12 @@ def build_server(settings: MCPSettings | None = None) -> Any:
     def generate_portfolio(
         as_of: str | None = None,
         holding_weeks: Literal[1, 4, 13, 26, 52] = 13,
+        mode: Literal["live", "historical"] = "live",
     ) -> dict[str, Any]:
         return tools.generate_portfolio(
             as_of=as_of,
             holding_weeks=holding_weeks,
+            mode=mode,
         )
 
     @server.tool(

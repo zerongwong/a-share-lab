@@ -64,15 +64,25 @@ st.info(
     "再过滤 ST/退市标记、历史不足、低流动性和异常原始价格跳变。"
 )
 st.warning(
-    "当前 CSMAR 导出是未复权价格，缺少全日成交量、财务报表、公告与新闻因子。"
-    "缺失因子会明确禁用并重新分配权重，不会用0.5等中性常数冒充真实基本面；"
-    "因此结果仍是价格/成交额层面的研究候选，不是样本外证明的最优组合或收益承诺。"
+    "当前个股日线仍是未复权价格且缺少全日成交量。资产负债表参考库只有当前快照，"
+    "没有利润表、现金流量表和普通财报实际公告日；只有在决策日与价格截止均通过时点门后，"
+    "才会以较低权重启用“资产负债表稳健度”，绝不冒充完整基本面或历史PIT因子。"
 )
 
 CSMAR_ROOT = application_data_dir() / "cache" / "csmar"
+CSMAR_REFERENCE_ROOT = application_data_dir() / "cache" / "csmar_reference"
 
 with st.form("weekly-portfolio-form"):
-    as_of = st.date_input("分析截止日", value=date.today(), max_value=date.today())
+    mode_label = st.radio(
+        "研究模式",
+        options=("当前研究", "历史回放"),
+        horizontal=True,
+        help="历史回放永远不会使用今天取得的资产负债表快照。",
+    )
+    mode = "live" if mode_label == "当前研究" else "historical"
+    as_of = st.date_input(
+        "决策日（系统另行显示实际完整数据截止日）", value=date.today(), max_value=date.today()
+    )
     holding_weeks = st.selectbox(
         "研究与计划持有周期",
         options=HOLDING_PERIOD_OPTIONS,
@@ -89,7 +99,13 @@ with st.form("weekly-portfolio-form"):
 if submitted:
     try:
         with st.spinner("正在读取本机 CSMAR 全市场数据库并计算风险收益排序…"):
-            snapshot = load_csmar_universe(CSMAR_ROOT, as_of=as_of)
+            snapshot = load_csmar_universe(
+                CSMAR_ROOT,
+                as_of=as_of,
+                reference_dataset_root=CSMAR_REFERENCE_ROOT,
+                decision_date=as_of,
+                mode=mode,
+            )
             histories = snapshot.histories
             metadata = snapshot.metadata
             batch = build_weekly_portfolios(
@@ -97,6 +113,7 @@ if submitted:
                 metadata,
                 as_of=snapshot.data_cutoff,
                 holding_weeks=holding_weeks,
+                market_index_histories=snapshot.market_index_histories,
             )
             batch = replace(batch, portfolios=(batch.for_profile("balanced"),))
             selected_symbols = {
@@ -107,8 +124,9 @@ if submitted:
             }
             run_id = archive_weekly_portfolios(
                 batch,
-                selected_histories,
+                histories,
                 build_repository(),
+                requested_as_of=as_of,
             )
             level_plans: dict[str, HorizonLevels] = {}
             level_failures: dict[str, str] = {}
@@ -132,6 +150,23 @@ if submitted:
                 "eligible_symbols": snapshot.eligible_symbols,
                 "excluded_symbols": snapshot.excluded_symbols,
                 "minimum_median_amount_cny": snapshot.minimum_median_amount_cny,
+                "requested_as_of": as_of.isoformat(),
+                "mode": mode,
+                "reference_common_cutoff": (
+                    None
+                    if snapshot.reference_common_cutoff is None
+                    else snapshot.reference_common_cutoff.isoformat()
+                ),
+                "balance_sheet_strength_available": snapshot.balance_sheet_strength_available,
+                "balance_sheet_strength_symbols": snapshot.balance_sheet_strength_symbols,
+                "balance_sheet_strength_excluded_symbols": snapshot.balance_sheet_strength_excluded_symbols,
+                "balance_sheet_snapshot_retrieved_at": (
+                    None
+                    if snapshot.balance_sheet_snapshot_retrieved_at is None
+                    else snapshot.balance_sheet_snapshot_retrieved_at.isoformat()
+                ),
+                "balance_sheet_strength_reason": snapshot.balance_sheet_strength_reason,
+                "reference_warnings": snapshot.reference_warnings,
             }
     except Exception as exc:
         st.error(f"全市场研究未生成：{exc}")
@@ -150,6 +185,7 @@ if batch:
     )
     factor_labels = {
         "fundamentals": "财务基本面",
+        "balance_sheet_strength": "资产负债表稳健度（当前快照）",
         "liquidity": "流动性",
         "news": "公司新闻/公告",
         "sector_context": "板块环境",
@@ -168,6 +204,51 @@ if batch:
             f"{regime.median_return_20:.1%}，60日中位数{regime.median_return_60:.1%}。"
             "这是组合级风险门，不作为单只股票加分项。"
         )
+    index_regime = batch.index_regime
+    if index_regime is not None:
+        index_labels = {
+            "risk_on": "偏多",
+            "neutral": "中性",
+            "risk_off": "风险规避",
+            "unavailable": "不可用",
+        }
+        st.markdown("#### 核心指数确认")
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("指数状态", index_labels.get(index_regime.state.value, index_regime.state.value))
+        i2.metric(
+            "站上60日均线",
+            "—"
+            if index_regime.breadth_above_ma60 is None
+            else f"{index_regime.breadth_above_ma60:.1%}",
+        )
+        i3.metric(
+            "60日收益中位数",
+            "—"
+            if index_regime.median_return_60 is None
+            else f"{index_regime.median_return_60:.1%}",
+        )
+        i4.metric(
+            "120日最差回撤",
+            "—"
+            if index_regime.worst_max_drawdown_120 is None
+            else f"{index_regime.worst_max_drawdown_120:.1%}",
+        )
+        st.caption(
+            f"核心指数覆盖 {index_regime.eligible_indices}/{index_regime.required_indices}；"
+            "它只作组合级风险确认，不给任何单只股票加分。"
+        )
+    st.markdown("#### 财务快照时点")
+    finance_status = (
+        f"已启用，覆盖{universe_stats.get('balance_sheet_strength_symbols', 0)}只"
+        if universe_stats.get("balance_sheet_strength_available")
+        else "未进入本轮评分"
+    )
+    st.write(
+        f"资产负债表取得日：{universe_stats.get('balance_sheet_snapshot_retrieved_at') or '—'}；"
+        f"状态：{finance_status}；原因：{universe_stats.get('balance_sheet_strength_reason', '—')}。"
+    )
+    for warning in universe_stats.get("reference_warnings", ()):
+        st.warning(warning)
     if batch.factor_coverage:
         st.markdown("#### 本轮评分因子覆盖")
         st.dataframe(

@@ -47,6 +47,8 @@ Never use a report period as its publication date. Never backfill today's revise
 
 Use a transparent deterministic rank ensemble before any language-model review. The language model may explain and challenge structured evidence but must not manufacture factor values.
 
+The cross-stock breadth gate and the core-index gate are independent. If either is explicitly risk-off, pause new portfolio formation. If configured index evidence is stale or unavailable, fail closed rather than silently dropping the confirmation layer. A current-only balance-sheet rank is a narrow solvency/liquidity proxy, not the complete fundamentals layer, and is forbidden in historical replay.
+
 ## Validation before claiming a production result
 
 - Use purged walk-forward evaluation with an embargo at least as long as the decision-to-execution gap.

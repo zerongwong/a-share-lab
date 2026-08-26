@@ -183,6 +183,54 @@ class WeeklyPortfolioTests(unittest.TestCase):
             self.assertEqual(result.status, WeeklyPortfolioStatus.UNAVAILABLE)
             self.assertIn("market_regime_risk_off_new_entries_paused", result.reasons)
 
+    def test_risk_off_core_indices_pause_even_when_stock_breadth_is_not_risk_off(self) -> None:
+        histories, metadata = _valid_universe()
+        falling = np.linspace(150.0, 90.0, len(DATES))
+        index_histories = {
+            code: pd.DataFrame(
+                {
+                    "trade_date": DATES,
+                    "close": falling,
+                    "historical_backtest_eligible": True,
+                    "common_cutoff_date": DATES[-1],
+                }
+            )
+            for code in ("000001", "000300", "000905")
+        }
+
+        batch = build_weekly_portfolios(
+            histories,
+            metadata,
+            as_of=DATES[-1],
+            market_index_histories=index_histories,
+        )
+
+        assert batch.market_regime is not None
+        assert batch.index_regime is not None
+        self.assertNotEqual(batch.market_regime.state.value, "risk_off")
+        self.assertEqual(batch.index_regime.state.value, "risk_off")
+        for result in batch.portfolios:
+            self.assertEqual(result.status, WeeklyPortfolioStatus.UNAVAILABLE)
+            self.assertIn("core_index_regime_risk_off_new_entries_paused", result.reasons)
+
+    def test_current_balance_sheet_strength_is_separate_from_full_fundamentals(self) -> None:
+        histories, metadata = _valid_universe()
+        for index, item in enumerate(metadata.values()):
+            item.pop("quality_score")
+            item["balance_sheet_strength_score"] = index / (len(metadata) - 1)
+
+        batch = build_weekly_portfolios(histories, metadata, as_of=DATES[-1])
+        coverage = {item.factor: item for item in batch.factor_coverage}
+
+        self.assertFalse(coverage["fundamentals"].enabled)
+        self.assertTrue(coverage["balance_sheet_strength"].enabled)
+        selected = batch.for_profile("balanced").selected
+        self.assertTrue(selected)
+        for stock in selected:
+            components = {name for name, _ in stock.component_scores}
+            self.assertIn("balance_sheet_strength", components)
+            self.assertNotIn("fundamentals", components)
+
     def test_partial_factor_coverage_is_disabled_for_the_whole_universe(self) -> None:
         histories, metadata = _valid_universe()
         metadata["SAFE.SH"].pop("quality_score")

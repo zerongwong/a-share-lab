@@ -9,10 +9,10 @@ Read [references/model-contract.md](references/model-contract.md) before produci
 
 ## Workflow
 
-1. Resolve the latest common data cutoff. Never combine a newer index observation with an older stock universe without marking and correcting the mismatch.
+1. Resolve the latest common data cutoff. In live mode, refuse to present a stale stock cutoff as current. Never combine a newer index observation with an older stock universe without marking and correcting the mismatch.
 2. Run the deterministic full-market screen first. Do not let an LLM invent prices, indicators, scores, probabilities, Sharpe ratios, or drawdowns.
 3. Apply all hard eligibility, data-quality, execution, and late-stage acceleration gates. Returning no portfolio is valid.
-4. Use current fundamentals, LongBridge read-only data, official announcements, and web news only after the quantitative screen has reduced the universe. Treat current snapshots as current evidence, not historical point-in-time data.
+4. Use current fundamentals, LongBridge read-only data, official announcements, and web news only after the quantitative screen has reduced the universe. Treat current snapshots as current evidence, not historical point-in-time data. A balance-sheet snapshot may enter only after both the decision date and price cutoff pass its conservative retrieval-time gate.
 5. Review the finalists with explicit bull, bear, data-quality, and portfolio-risk checks. Resolve conflicts from primary evidence rather than by majority vote.
 6. Produce at most one four-stock portfolio. Use total-account weights 30%, 20%, 20%, and 10%, retain 20% cash, use no financing, and never place orders.
 7. Archive the cutoff, input hashes, strategy version, exclusions, evidence links, factor coverage, and output before presenting the result.
