@@ -51,6 +51,5 @@ CSMAR*/
 *.db-shm
 *.db-wal
 
-# Keep small deterministic fixtures under version control.
-!sample_data/
-!sample_data/**
+# 测试夹具放在 tests/ 内并使用合成数据；不要为任何 sample_data 目录解除忽略，
+# 避免误提交可逆的授权数据切片。

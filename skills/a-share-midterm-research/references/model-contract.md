@@ -2,9 +2,9 @@
 
 ## Objective
 
-Select one diversified four-stock research portfolio that maximizes the lower-confidence bound of net risk-adjusted return subject to hard drawdown, liquidity, execution, concentration, and data-quality constraints. Do not optimize raw return alone and do not ask the user to choose an annual return target.
+Select one diversified 3-to-5-stock research portfolio that maximizes the lower-confidence bound of net holding-period return subject to hard downside-volatility, rolling-drawdown, five-day expected-shortfall, down-correlation, risk-contribution, liquidity, execution, concentration, and data-quality constraints. Do not optimize raw return alone and do not ask the user to choose an annual return target.
 
-Default allocation is 30% / 20% / 20% / 10% of account equity plus 20% cash. Financing is zero.
+Four holdings are the attention default. Three holdings use 70% stock exposure, four use 80%, and five use 85%; the remainder is cash. Weights are generated from inverse downside volatility with a bounded signal tilt and explicit position/industry caps. Financing is zero. The legacy fixed 30% / 20% / 20% / 10% allocation is compatibility-only.
 
 ## Horizons
 
@@ -61,4 +61,4 @@ The cross-stock breadth gate and the core-index gate are independent. If either 
 
 Return either `DATA_NOT_READY`, `VALIDATION_NOT_READY`, `NO_ELIGIBLE_PORTFOLIO`, or `RESEARCH_ONLY`.
 
-Only `RESEARCH_ONLY` may contain four securities. For each security include role, weight, thesis by horizon, entry condition, structural invalidation, reduction conditions, evidence, principal risks, and data confidence. For the portfolio include 20% cash, zero borrowing, historical and out-of-sample metrics separately, scenario ranges, factor coverage, strategy/data versions, and the next scheduled review condition.
+Only `RESEARCH_ONLY` may contain three to five securities. For each security include rank, automatic weight, thesis by horizon, entry condition, structural invalidation, reduction conditions, evidence, principal risks, and data confidence. For the portfolio include cash, zero borrowing, historical and out-of-sample metrics separately, scenario ranges, evidence coverage, strategy/data versions, and the next scheduled review condition.

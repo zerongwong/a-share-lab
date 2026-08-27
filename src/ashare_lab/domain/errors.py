@@ -16,3 +16,7 @@ class InsufficientHistoryError(AShareLabError):
 
 class FeatureDisabledError(AShareLabError):
     """A feature is deliberately disabled until its safety gate is met."""
+
+
+class NotificationDeliveryError(AShareLabError):
+    """A notification could not be delivered through a configured channel."""

@@ -5,6 +5,8 @@ timezone = "Asia/Shanghai"
 default_symbol = "600150"
 minimum_daily_bars = 120
 
+# 仅供旧版单股手动研究页使用。当前“中期主升组合”主入口读取本机已导入的
+# CSMAR/DuckDB 数据，不会把 AKShare 或 Yahoo 当作全市场正式数据源。
 [data]
 provider = "akshare"
 adjust = "qfq"
@@ -15,4 +17,3 @@ auto_trading = false
 margin_enabled = false
 limit_watchlist_enabled = false
 research_only = true
-

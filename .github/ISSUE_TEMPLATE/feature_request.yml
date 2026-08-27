@@ -1,0 +1,28 @@
+name: Feature request
+description: Propose an auditable research capability
+title: "[Feature] "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Research use case
+      description: What decision should this improve?
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Data, timing, and failure conditions
+      description: State the point-in-time fields, legal source, and when the feature must return unavailable.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Boundaries
+      options:
+        - label: This proposal does not add automatic trading or hidden leverage.
+          required: true
+        - label: This proposal can be tested without committing licensed data or credentials.
+          required: true

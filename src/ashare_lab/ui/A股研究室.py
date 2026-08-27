@@ -26,11 +26,17 @@ def _existing_page(prefix: str) -> Path:
 # codebase for a future separate project, but are intentionally not registered.
 pages = [
     st.Page(
-        _existing_page("02"),
-        title="中线四股组合",
-        icon="🧺",
-        url_path="four-stock-portfolio",
+        _existing_page("08"),
+        title="中期主升组合",
+        icon="📈",
+        url_path="midterm-maintrend-portfolio",
         default=True,
+    ),
+    st.Page(
+        _existing_page("07"),
+        title="通知设置",
+        icon="🔔",
+        url_path="notification-settings",
     ),
 ]
 
@@ -40,8 +46,8 @@ with st.sidebar:
     st.caption("本地个人研究版 · 不连接券商 · 不自动下单")
     with st.expander("当前主模块", expanded=False):
         st.markdown(
-            "**中线四股组合：历史研究可用。** 已接入本机CSMAR全市场日线，"
-            "可从共同截止日的合格股票中生成四股研究组合。默认研究3个月；"
+            "**中期主升组合：研究版。** 先筛主升趋势与明确介入点，再自动比较"
+            "3、4、5只组合并计算风险约束权重。默认研究3个月；"
             "1周只观察入场节奏，1–3个月是核心持有期，6–12个月用于长期验证。"
         )
     with st.expander("证据与研究留档", expanded=False):
@@ -51,9 +57,9 @@ with st.sidebar:
         )
 
 st.info(
-    "当前状态：CSMAR全市场日线、核心指数风险确认和资产负债表当前快照已接入。"
-    "财务快照只有通过决策日/价格截止时点门后才作为窄因子使用；结果仍基于未复权日线，"
-    "尚缺利润表、现金流、普通财报公告日、公司新闻和严格walk-forward样本外验证。"
+    "当前状态：主升趋势、量价介入门和3–5股下行风险优化已进入主流程。"
+    "财务与公告仍有证据缺口时会醒目标注；结果仍基于未复权日线，且尚未完成严格"
+    "walk-forward样本外验证。"
 )
 
 current_page.run()

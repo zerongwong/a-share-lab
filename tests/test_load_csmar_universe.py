@@ -11,6 +11,11 @@ import pytest
 from ashare_lab.domain.errors import DataUnavailableError
 from ashare_lab.services.load_csmar_universe import load_csmar_universe
 
+SMALL_FIXTURE_MARKET = {
+    "minimum_active_symbols": 4,
+    "minimum_eligible_symbols": 3,
+}
+
 
 def _build_catalog(root: Path, *, end: date = date(2026, 8, 24)) -> None:
     connection = duckdb.connect(str(root / "csmar.duckdb"))
@@ -83,6 +88,7 @@ def test_loads_active_current_universe_without_fabricated_optional_factors(tmp_p
         as_of=date(2026, 8, 25),
         minimum_sessions=121,
         history_sessions=125,
+        **SMALL_FIXTURE_MARKET,
     )
 
     assert snapshot.data_cutoff == date(2026, 8, 24)
@@ -102,6 +108,18 @@ def test_loads_active_current_universe_without_fabricated_optional_factors(tmp_p
     assert snapshot.news_scores_available is False
 
 
+def test_tiny_fixture_cannot_claim_full_market_with_production_defaults(tmp_path: Path) -> None:
+    _build_catalog(tmp_path)
+
+    with pytest.raises(DataUnavailableError, match="不足以称为全市场"):
+        load_csmar_universe(
+            tmp_path,
+            as_of=date(2026, 8, 25),
+            minimum_sessions=121,
+            history_sessions=125,
+        )
+
+
 def test_live_mode_rejects_a_stale_previous_session_instead_of_silent_fallback(
     tmp_path: Path,
 ) -> None:
@@ -114,6 +132,7 @@ def test_live_mode_rejects_a_stale_previous_session_instead_of_silent_fallback(
             decision_date=date(2026, 8, 26),
             minimum_sessions=121,
             history_sessions=125,
+            **SMALL_FIXTURE_MARKET,
         )
 
     replay = load_csmar_universe(
@@ -123,6 +142,7 @@ def test_live_mode_rejects_a_stale_previous_session_instead_of_silent_fallback(
         mode="historical",
         minimum_sessions=121,
         history_sessions=125,
+        **SMALL_FIXTURE_MARKET,
     )
     assert replay.data_cutoff == date(2026, 8, 24)
 
@@ -188,6 +208,7 @@ def test_current_balance_snapshot_is_rejected_before_safe_price_and_decision_cut
         minimum_sessions=121,
         history_sessions=125,
         balance_sheet_minimum_group_size=3,
+        **SMALL_FIXTURE_MARKET,
     )
 
     assert snapshot.balance_sheet_strength_available is False
@@ -214,6 +235,7 @@ def test_current_balance_snapshot_can_enter_only_after_safe_live_cutoffs(
         minimum_sessions=121,
         history_sessions=125,
         balance_sheet_minimum_group_size=3,
+        **SMALL_FIXTURE_MARKET,
     )
 
     assert snapshot.data_cutoff == date(2026, 8, 25)
@@ -245,6 +267,7 @@ def test_historical_mode_never_uses_current_balance_snapshot(
         minimum_sessions=121,
         history_sessions=125,
         balance_sheet_minimum_group_size=3,
+        **SMALL_FIXTURE_MARKET,
     )
 
     assert snapshot.balance_sheet_strength_available is False

@@ -13,6 +13,7 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "duckdb>=1.4,<2",
     "httpx>=0.28,<1",
+    "keyring>=25,<26",
     "numpy>=2.0,<3",
     "openpyxl>=3.1,<4",
     "pandas>=2.2,<3.1",
@@ -27,6 +28,7 @@ dependencies = [
 ]
 
 [project.scripts]
+ashare-lab = "ashare_lab.cli.app:main"
 ashare-import-csmar = "ashare_lab.cli.import_csmar:main"
 ashare-import-csmar-reference = "ashare_lab.cli.import_csmar_reference:main"
 ashare-mcp = "ashare_lab.mcp_server:main"
@@ -43,6 +45,12 @@ dev = [
     "pytest-cov>=6,<8",
     "ruff>=0.9,<1",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zerongwong/a-share-lab"
+Documentation = "https://github.com/zerongwong/a-share-lab/tree/main/docs"
+Issues = "https://github.com/zerongwong/a-share-lab/issues"
+Source = "https://github.com/zerongwong/a-share-lab"
 
 [tool.setuptools.packages.find]
 where = ["src"]

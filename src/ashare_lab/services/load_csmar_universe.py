@@ -97,6 +97,10 @@ def load_csmar_universe(
     as_of: date,
     minimum_sessions: int = 252,
     history_sessions: int = 320,
+    minimum_active_symbols: int = 4_500,
+    minimum_active_master_coverage: float = 0.85,
+    minimum_eligible_symbols: int = 1_000,
+    minimum_eligible_active_coverage: float = 0.70,
     minimum_median_amount_cny: float = 20_000_000.0,
     raw_return_outlier_limit: float = 0.45,
     reference_dataset_root: str | Path | None = None,
@@ -119,6 +123,14 @@ def load_csmar_universe(
         raise ValueError("minimum_sessions must be at least 121")
     if history_sessions < minimum_sessions:
         raise ValueError("history_sessions cannot be shorter than minimum_sessions")
+    if minimum_active_symbols < 4 or minimum_eligible_symbols < 3:
+        raise ValueError("full-market symbol minimums are too small")
+    for name, value in {
+        "minimum_active_master_coverage": minimum_active_master_coverage,
+        "minimum_eligible_active_coverage": minimum_eligible_active_coverage,
+    }.items():
+        if not 0.0 < value <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1]")
     if minimum_median_amount_cny < 0:
         raise ValueError("minimum_median_amount_cny cannot be negative")
     if not 0 < raw_return_outlier_limit < 1:
@@ -185,6 +197,18 @@ def load_csmar_universe(
         ).fetchdf()
         if active.empty:
             raise DataUnavailableError(f"CSMAR在{cutoff.isoformat()}没有可交易证券截面")
+        active_symbols = int(active["symbol"].nunique())
+        active_master_coverage = active_symbols / master_symbols if master_symbols else 0.0
+        if (
+            active_symbols < minimum_active_symbols
+            or active_master_coverage < minimum_active_master_coverage
+        ):
+            raise DataUnavailableError(
+                "CSMAR当前截面不足以称为全市场："
+                f"当日有行情{active_symbols}只/证券主表{master_symbols}只，"
+                f"最低要求{minimum_active_symbols}只且覆盖率"
+                f"{minimum_active_master_coverage:.0%}。"
+            )
 
         # A calendar buffer is cheaper than one query per stock.  The final
         # per-symbol tail is trimmed below, so every stock gets the same maximum
@@ -234,8 +258,17 @@ def load_csmar_universe(
         histories[str(symbol)] = frame
         liquidity_values[str(symbol)] = median_amount
 
-    if len(histories) < 4:
-        raise DataUnavailableError(f"CSMAR当前只有{len(histories)}只通过全市场资格门")
+    eligible_active_coverage = len(histories) / active_symbols
+    if (
+        len(histories) < minimum_eligible_symbols
+        or eligible_active_coverage < minimum_eligible_active_coverage
+    ):
+        raise DataUnavailableError(
+            "CSMAR通过资格门的样本不足以支持全市场研究："
+            f"合格{len(histories)}只/当日有行情{active_symbols}只，"
+            f"最低要求{minimum_eligible_symbols}只且覆盖率"
+            f"{minimum_eligible_active_coverage:.0%}。"
+        )
 
     liquidity = pd.Series(liquidity_values, dtype=float)
     liquidity_scores = liquidity.rank(method="average", pct=True)
@@ -345,7 +378,15 @@ def load_csmar_universe(
                     "不得用于历史回测。"
                 )
 
-    active_symbols = int(active["symbol"].nunique())
+    final_eligible_coverage = len(histories) / active_symbols
+    if (
+        len(histories) < minimum_eligible_symbols
+        or final_eligible_coverage < minimum_eligible_active_coverage
+    ):
+        raise DataUnavailableError(
+            "参考证据合并后样本不足以支持全市场研究："
+            f"合格{len(histories)}只/当日有行情{active_symbols}只。"
+        )
     if active_symbols > master_symbols:
         raise DataQualityError("CSMAR当前截面证券数超过证券主表，数据库关系异常")
     return CSMARUniverseSnapshot(

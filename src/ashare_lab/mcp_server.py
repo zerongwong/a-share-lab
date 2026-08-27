@@ -21,10 +21,7 @@ import numpy as np
 import pandas as pd
 from platformdirs import user_data_path
 
-from ashare_lab.services.build_weekly_portfolios import (
-    WeeklyPortfolioStatus,
-    build_weekly_portfolios,
-)
+from ashare_lab.services.build_midterm_portfolio import build_midterm_portfolio
 from ashare_lab.services.load_csmar_universe import load_csmar_universe
 
 ALLOWED_HOLDING_WEEKS = frozenset({1, 4, 13, 26, 52})
@@ -162,36 +159,36 @@ class ReadOnlyResearchTools:
             and (self.settings.csmar_reference_dir / "csmar_reference.duckdb").is_file()
             else None
         )
+        holding_sessions = holding_weeks * 5
+        minimum_sessions = max(252, holding_sessions * 8 + 1)
         snapshot = load_csmar_universe(
             self.settings.csmar_cache_dir,
             as_of=cutoff,
+            minimum_sessions=minimum_sessions,
+            history_sessions=minimum_sessions + 70,
             reference_dataset_root=reference_root,
             decision_date=cutoff,
             mode=mode,
         )
-        kwargs: dict[str, Any] = {
-            "as_of": snapshot.data_cutoff,
-            "holding_weeks": holding_weeks,
-        }
-        batch = build_weekly_portfolios(
+        portfolio = build_midterm_portfolio(
             snapshot.histories,
             snapshot.metadata,
+            as_of=snapshot.data_cutoff,
+            holding_weeks=holding_weeks,
             market_index_histories=(
                 snapshot.market_index_histories if reference_root is not None else None
             ),
-            **kwargs,
         )
-        portfolio = batch.for_profile("balanced")
 
         response: dict[str, Any] = {
             "status": portfolio.status.value,
             "data_cutoff": (
                 None
-                if batch.data_cutoff is None
-                else pd.Timestamp(batch.data_cutoff).date().isoformat()
+                if portfolio.data_cutoff is None
+                else pd.Timestamp(portfolio.data_cutoff).date().isoformat()
             ),
             "holding_weeks": holding_weeks,
-            "profile": "balanced_single_objective",
+            "profile": "adaptive_3_to_5_maintrend",
             "mode": mode,
             "universe": {
                 "master_symbols": snapshot.master_symbols,
@@ -199,9 +196,11 @@ class ReadOnlyResearchTools:
                 "eligible_symbols": snapshot.eligible_symbols,
                 "excluded_symbols": snapshot.excluded_symbols,
             },
-            "factor_coverage": _jsonable(batch.factor_coverage),
-            "market_regime": _jsonable(batch.market_regime),
-            "index_regime": _jsonable(batch.index_regime),
+            "entry_ready_count": portfolio.entry_ready_count,
+            "search_pool_count": portfolio.search_pool_count,
+            "evaluated_portfolio_count": portfolio.evaluated_portfolio_count,
+            "market_regime": _jsonable(portfolio.market_regime),
+            "index_regime": _jsonable(portfolio.index_regime),
             "balance_sheet_strength": {
                 "enabled": snapshot.balance_sheet_strength_available,
                 "provided": snapshot.balance_sheet_strength_symbols,
@@ -214,32 +213,43 @@ class ReadOnlyResearchTools:
                 "reason": snapshot.balance_sheet_strength_reason,
                 "historical_point_in_time": False,
             },
-            "warnings": list(portfolio.risk_warnings),
+            "warnings": list(portfolio.warnings),
+            "evidence_review_required": portfolio.evidence_review_required,
             "disclaimer": portfolio.disclaimer,
             "raw_data_exposed": False,
         }
-        if portfolio.status != WeeklyPortfolioStatus.READY or portfolio.allocation is None:
+        if not portfolio.positions or portfolio.evaluation is None:
             response["reasons"] = list(portfolio.reasons)
             response["portfolio"] = None
             return response
 
-        selected = {item.symbol: item for item in portfolio.selected}
+        if portfolio.reasons:
+            response["reasons"] = list(portfolio.reasons)
         response["portfolio"] = {
-            "cash_ratio": portfolio.allocation.cash_ratio,
-            "margin_debt_ratio": portfolio.allocation.margin_debt_ratio,
+            "evidence_complete": not portfolio.evidence_review_required,
+            "final_buy_list": False,
+            "stock_count": len(portfolio.positions),
+            "stock_exposure": portfolio.stock_exposure,
+            "cash_ratio": portfolio.cash_weight,
+            "margin_debt_ratio": 0.0,
             "positions": [
                 {
-                    "rank": rank,
-                    "symbol": position.ticker,
-                    "name": selected[position.ticker].name,
-                    "industry": selected[position.ticker].industry,
+                    "rank": position.rank,
+                    "symbol": position.symbol,
+                    "name": position.name,
+                    "industry": position.industry,
                     "weight": position.weight,
-                    "ranking_score_not_probability": selected[position.ticker].score,
+                    "entry_pattern": position.entry_pattern.value,
+                    "breakout_line": position.breakout_line,
+                    "days_since_breakout": position.days_since_breakout,
+                    "ranking_score_not_probability": position.signal_score,
+                    "downside_risk_contribution": position.downside_risk_contribution,
+                    "evidence_unknown": list(position.evidence_unknown),
                 }
-                for rank, position in enumerate(portfolio.allocation.positions, start=1)
+                for position in portfolio.positions
             ],
-            "historical_risk": _jsonable(portfolio.historical_risk),
-            "historical_scenario": _jsonable(portfolio.historical_scenario),
+            "historical_downside_risk": _jsonable(portfolio.evaluation.metrics),
+            "risk_budget": _jsonable(portfolio.evaluation.risk_budget),
         }
         return response
 
@@ -467,9 +477,9 @@ def build_server(settings: MCPSettings | None = None) -> Any:
 
     @server.tool(
         name="generate_portfolio",
-        title="生成中期四股研究组合",
+        title="生成中期主升研究组合",
         description=(
-            "从本机已规范化的A股数据临时计算3:2:2:1四股研究组合。"
+            "从本机已规范化的A股数据临时计算3至5股主升趋势研究组合和自动权重。"
             "只返回精简衍生结果，不归档、不下单；持有期可选1、4、13、26或52周。"
         ),
         annotations=read_only,
