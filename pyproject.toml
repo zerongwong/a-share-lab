@@ -39,7 +39,7 @@ ashare-sync-daily = "ashare_lab.cli.sync_daily:main"
 # but every call must remain behind a data-provider adapter so a licensed feed
 # can replace it without changing the analysis code.
 akshare = ["akshare>=1.16,<2"]
-mcp = ["mcp>=1.26,<2"]
+mcp = ["mcp>=1.26,<3"]
 dev = [
     "hypothesis>=6.120,<7",
     "pytest>=8.3,<9",
