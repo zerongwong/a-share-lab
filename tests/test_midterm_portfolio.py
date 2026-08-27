@@ -232,8 +232,7 @@ def test_unknown_execution_eligibility_produces_provisional_positions() -> None:
     assert result.status == MidtermPortfolioStatus.VALIDATION_NOT_READY
     assert result.positions
     assert all(
-        "formation_execution_evidence_unknown" in item.evidence_unknown
-        for item in result.positions
+        "formation_execution_evidence_unknown" in item.evidence_unknown for item in result.positions
     )
 
 

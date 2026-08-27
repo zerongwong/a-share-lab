@@ -61,4 +61,11 @@ The cross-stock breadth gate and the core-index gate are independent. If either 
 
 Return either `DATA_NOT_READY`, `VALIDATION_NOT_READY`, `NO_ELIGIBLE_PORTFOLIO`, or `RESEARCH_ONLY`.
 
-Only `RESEARCH_ONLY` may contain three to five securities. For each security include rank, automatic weight, thesis by horizon, entry condition, structural invalidation, reduction conditions, evidence, principal risks, and data confidence. For the portfolio include cash, zero borrowing, historical and out-of-sample metrics separately, scenario ranges, evidence coverage, strategy/data versions, and the next scheduled review condition.
+Only `RESEARCH_ONLY` may contain a final actionable list of three to five securities.
+`VALIDATION_NOT_READY` may expose provisional machine candidates solely for evidence review when
+they are clearly marked non-actionable and `final_buy_list=false`; it must never phrase them as a
+recommendation. For each security include rank, automatic weight, thesis by horizon, entry
+condition, structural invalidation, reduction conditions, evidence, principal risks, and data
+confidence. For the portfolio include cash, zero borrowing, historical and out-of-sample metrics
+separately, scenario ranges, evidence coverage, strategy/data versions, and the next scheduled
+review condition.

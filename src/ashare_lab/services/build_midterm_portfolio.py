@@ -361,9 +361,7 @@ def build_midterm_portfolio(
             signal_score=position.signal_score,
             entry_pattern=selected_by_symbol[position.symbol].entry.pattern,
             breakout_line=float(selected_by_symbol[position.symbol].entry.breakout_line),
-            days_since_breakout=int(
-                selected_by_symbol[position.symbol].entry.days_since_breakout
-            ),
+            days_since_breakout=int(selected_by_symbol[position.symbol].entry.days_since_breakout),
             annual_downside_volatility=position.annual_downside_volatility,
             downside_risk_contribution=position.downside_risk_contribution,
             evidence_unknown=selected_by_symbol[position.symbol].evidence_unknown,
@@ -461,7 +459,10 @@ def _metadata_hard_gate(
         reasons.append("industry_missing")
     if item.get("fundamental_veto") is True or _gate_value(item.get("fundamental_gate")) == "veto":
         reasons.append("fundamental_veto")
-    if item.get("announcement_veto") is True or _gate_value(item.get("announcement_gate")) == "veto":
+    if (
+        item.get("announcement_veto") is True
+        or _gate_value(item.get("announcement_gate")) == "veto"
+    ):
         reasons.append("official_announcement_veto")
     balance = item.get("balance_sheet_strength_score")
     if balance is not None:
@@ -485,9 +486,15 @@ def _unknown_evidence(item: Mapping[str, Any]) -> tuple[str, ...]:
     unknown: list[str] = []
     if item.get("is_buyable_at_cutoff") is not True:
         unknown.append("formation_execution_evidence_unknown")
-    if item.get("fundamental_veto") is not True and _gate_value(item.get("fundamental_gate")) != "pass":
+    if (
+        item.get("fundamental_veto") is not True
+        and _gate_value(item.get("fundamental_gate")) != "pass"
+    ):
         unknown.append("fundamental_evidence_unknown")
-    if item.get("announcement_veto") is not True and _gate_value(item.get("announcement_gate")) != "pass":
+    if (
+        item.get("announcement_veto") is not True
+        and _gate_value(item.get("announcement_gate")) != "pass"
+    ):
         unknown.append("official_announcement_evidence_unknown")
     return tuple(unknown)
 
@@ -528,9 +535,7 @@ def _rank_candidates(
             np.sqrt(np.mean(np.square(downside))) * math.sqrt(252)
         )
         equity = (1.0 + returns).cumprod()
-        features["max_drawdown"] = abs(
-            float((equity / equity.cummax() - 1.0).min())
-        )
+        features["max_drawdown"] = abs(float((equity / equity.cummax() - 1.0).min()))
         features["entry"] = entry.score
         raw.append(features)
     if any(not all(math.isfinite(value) for value in item.values()) for item in raw):
@@ -681,9 +686,7 @@ def _select_stock_count(
     if best_four:
         baseline = best_four[0]
         for five_stock_row in viable_by_count.get(5, []):
-            if _five_stock_diversification_is_material(
-                baseline[1], five_stock_row[1]
-            ):
+            if _five_stock_diversification_is_material(baseline[1], five_stock_row[1]):
                 return five_stock_row
         return baseline
     if best_five:
@@ -702,15 +705,13 @@ def _five_stock_diversification_is_material(
     if five_metrics.holding_period_return_lcb <= four_metrics.holding_period_return_lcb:
         return False
     path_and_tail_not_worse = (
-        five_metrics.annual_downside_volatility
-        <= four_metrics.annual_downside_volatility + 0.005
+        five_metrics.annual_downside_volatility <= four_metrics.annual_downside_volatility + 0.005
         and five_metrics.rolling_max_drawdown_60_p90
         <= four_metrics.rolling_max_drawdown_60_p90 + 0.005
         and five_metrics.es95_5d <= four_metrics.es95_5d + 0.005
     )
     diversification_improved = (
-        five_metrics.max_down_period_correlation
-        <= four_metrics.max_down_period_correlation - 0.05
+        five_metrics.max_down_period_correlation <= four_metrics.max_down_period_correlation - 0.05
         or five_metrics.max_position_downside_risk_contribution
         <= four_metrics.max_position_downside_risk_contribution - 0.03
     )

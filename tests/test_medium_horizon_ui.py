@@ -41,3 +41,12 @@ def test_portfolio_page_uses_named_horizons_and_no_visible_return_target() -> No
     assert "3、4、5只组合" in source
     assert "融资为0" in source
     assert "历史代理" in source
+
+
+def test_portfolio_page_uses_hybrid_baseline_and_verified_increment() -> None:
+    source = (UI_ROOT / "pages" / "08_中期主升组合.py").read_text(encoding="utf-8")
+
+    assert "load_hybrid_universe" in source
+    assert 'OVERLAY_ROOT = application_data_dir() / "cache" / "market_overlay"' in source
+    for label in ("历史基线截止", "自动增量截止", "共同截止", "来源"):
+        assert label in source

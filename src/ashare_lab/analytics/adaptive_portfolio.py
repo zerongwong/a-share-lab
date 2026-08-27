@@ -574,9 +574,7 @@ def _evaluate_prepared(
     drawdown_magnitudes = _rolling_drawdown_magnitudes(portfolio_returns)
     drawdown_p90 = float(np.quantile(drawdown_magnitudes, 0.90))
 
-    five_day_returns = _non_overlapping_portfolio_returns(
-        returns, weights, FIVE_DAY_SESSIONS
-    )
+    five_day_returns = _non_overlapping_portfolio_returns(returns, weights, FIVE_DAY_SESSIONS)
     five_day_cutoff = float(np.quantile(five_day_returns, 0.05))
     five_day_tail = five_day_returns[five_day_returns <= five_day_cutoff + 1e-15]
     es95_5d = max(0.0, -float(five_day_tail.mean()))
@@ -600,8 +598,8 @@ def _evaluate_prepared(
 
     industry_totals: dict[str, float] = {}
     for candidate, weight in zip(candidates, weights, strict=True):
-        industry_totals[candidate.industry] = (
-            industry_totals.get(candidate.industry, 0.0) + float(weight)
+        industry_totals[candidate.industry] = industry_totals.get(candidate.industry, 0.0) + float(
+            weight
         )
 
     metrics_values = (
@@ -667,8 +665,7 @@ def _risk_budget_result(
             metrics.annual_downside_volatility <= budget.max_annual_downside_volatility + 1e-12
         ),
         "rolling_drawdown_60_p90": (
-            metrics.rolling_max_drawdown_60_p90
-            <= budget.max_rolling_drawdown_60_p90 + 1e-12
+            metrics.rolling_max_drawdown_60_p90 <= budget.max_rolling_drawdown_60_p90 + 1e-12
         ),
         "es95_5d": metrics.es95_5d <= budget.max_es95_5d + 1e-12,
         "down_period_correlation": (
