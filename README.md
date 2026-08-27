@@ -288,8 +288,11 @@ SendKey 和 Bark 设备 Key 只通过密码输入框在本机录入，并保存�
 ├── cache/
 │   ├── csmar/
 │   │   └── csmar.duckdb
-│   └── csmar_reference/
-│       └── csmar_reference.duckdb
+│   ├── csmar_reference/
+│   │   └── csmar_reference.duckdb
+│   └── market_overlay/
+│       ├── verified_manifest.parquet
+│       └── source=infoway/adjust=none/
 └── reports/
 ```
 
@@ -297,6 +300,7 @@ SendKey 和 Bark 设备 Key 只通过密码输入框在本机录入，并保存�
 
 - `csmar.duckdb` 是用户在本机生成的标准化研究库；
 - `csmar_reference.duckdb` 保存独立的核心指数PIT日线和资产负债表当前快照；
+- `market_overlay` 保存通过覆盖率、单位、连续交易日和六指数共同截止校验的沪深每日增量；
 - `research.db` 保存不可篡改研究档案与后续结果；
 - 原始 ZIP、Excel、Parquet、DuckDB、SQLite、新闻正文和生成报告均被 `.gitignore`
   排除；
@@ -312,6 +316,23 @@ SendKey 和 Bark 设备 Key 只通过密码输入框在本机录入，并保存�
 
 资产负债表若缺少普通财报实际公告日，只标记为取得日的当前快照，禁止回填历史回测；
 指数记录若原始OHLC关系不可能，会被隔离并在导入报告中计数，不会被程序擅自修复。
+
+### 自动补齐最新收盘数据
+
+主导航的“自动数据更新”页可以从 macOS 钥匙串读取用户自己的 Infoway API Key，并自动
+补齐 CSMAR 截止日之后缺失的沪深 A 股和六个核心指数。盘中不会把今天的累计行情写成
+完整日线；16:15 前只尝试补到上一日期，再由中国交易日历确认真正交易日。
+
+也可以运行同一条无密钥参数的命令：
+
+```bash
+.venv/bin/ashare-sync-daily
+```
+
+CSMAR 数据库始终只读。新数据先进入独立 staging；当日股票覆盖率至少 98%、六个指数
+齐全且所有质量门通过后才原子登记。失败批次进入本机 quarantine，不推进截止日。当前
+Infoway 清单只明确覆盖沪深，北交所不会被冒充为已更新。密钥曾出现在聊天、截图或日志
+中时，必须先在 Infoway 后台轮换，再只保存新密钥。
 
 不要把学校、公司或个人账户取得的数据发到 GitHub。另一台电脑使用时，应由使用者自己
 取得合法数据权限、在本机导入，并配置自己的数据接口凭据。

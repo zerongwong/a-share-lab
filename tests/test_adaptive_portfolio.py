@@ -107,9 +107,7 @@ def test_equal_risk_candidates_receive_a_bounded_signal_tilt() -> None:
 
 
 def test_industry_projection_caps_a_high_priority_group_at_forty_percent() -> None:
-    candidates = list(
-        _candidate_set(4, industries=("科技", "科技", "金融", "消费"))
-    )
+    candidates = list(_candidate_set(4, industries=("科技", "科技", "金融", "消费")))
     for index in (0, 1):
         original = candidates[index]
         candidates[index] = AdaptiveCandidate(
@@ -148,14 +146,12 @@ def test_metrics_match_the_documented_formulas() -> None:
     weights = np.full(4, 0.20)
     daily_portfolio = returns @ weights
 
-    expected_downside_volatility = (
-        np.sqrt(np.mean(np.square(np.minimum(daily_portfolio, 0.0)))) * np.sqrt(252)
-    )
+    expected_downside_volatility = np.sqrt(
+        np.mean(np.square(np.minimum(daily_portfolio, 0.0)))
+    ) * np.sqrt(252)
     drawdowns = []
     for start in range(len(daily_portfolio) - 60 + 1):
-        equity = np.concatenate(
-            ([1.0], np.cumprod(1.0 + daily_portfolio[start : start + 60]))
-        )
+        equity = np.concatenate(([1.0], np.cumprod(1.0 + daily_portfolio[start : start + 60])))
         drawdowns.append(max(0.0, -float((equity / np.maximum.accumulate(equity) - 1).min())))
 
     five_day_blocks = returns.reshape(52, 5, 4)
@@ -167,9 +163,7 @@ def test_metrics_match_the_documented_formulas() -> None:
     holding_returns = (np.prod(1.0 + holding_blocks, axis=1) - 1.0) @ weights - 0.001
     expected_lcb = float(
         holding_returns.mean()
-        - NormalDist().inv_cdf(0.90)
-        * holding_returns.std(ddof=1)
-        / math.sqrt(len(holding_returns))
+        - NormalDist().inv_cdf(0.90) * holding_returns.std(ddof=1) / math.sqrt(len(holding_returns))
     )
 
     downside = np.minimum(returns, 0.0)
@@ -181,14 +175,12 @@ def test_metrics_match_the_documented_formulas() -> None:
     assert metrics.annual_downside_volatility == pytest.approx(expected_downside_volatility)
     assert metrics.rolling_max_drawdown_60_p90 == pytest.approx(np.quantile(drawdowns, 0.90))
     assert metrics.es95_5d == pytest.approx(expected_es)
-    assert metrics.max_position_downside_risk_contribution == pytest.approx(
-        contributions.max()
-    )
+    assert metrics.max_position_downside_risk_contribution == pytest.approx(contributions.max())
     assert metrics.holding_period_return_mean == pytest.approx(holding_returns.mean())
     assert metrics.holding_period_return_lcb == pytest.approx(expected_lcb)
-    assert sum(position.downside_risk_contribution for position in result.positions) == pytest.approx(
-        1.0
-    )
+    assert sum(
+        position.downside_risk_contribution for position in result.positions
+    ) == pytest.approx(1.0)
 
 
 def test_cost_deduction_lowers_mean_and_lcb_one_for_one() -> None:

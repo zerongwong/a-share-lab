@@ -38,6 +38,12 @@ pages = [
         icon="🔔",
         url_path="notification-settings",
     ),
+    st.Page(
+        _existing_page("09"),
+        title="自动数据更新",
+        icon="🔄",
+        url_path="automatic-daily-update",
+    ),
 ]
 
 current_page = st.navigation(pages, position="sidebar", expanded=True)

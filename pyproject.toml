@@ -32,6 +32,7 @@ ashare-lab = "ashare_lab.cli.app:main"
 ashare-import-csmar = "ashare_lab.cli.import_csmar:main"
 ashare-import-csmar-reference = "ashare_lab.cli.import_csmar_reference:main"
 ashare-mcp = "ashare_lab.mcp_server:main"
+ashare-sync-daily = "ashare_lab.cli.sync_daily:main"
 
 [project.optional-dependencies]
 # AKShare is deliberately optional. It is useful for a personal research MVP,

@@ -11,7 +11,7 @@ from ashare_lab.services.build_midterm_portfolio import (
     MidtermPortfolioStatus,
     build_midterm_portfolio,
 )
-from ashare_lab.services.load_csmar_universe import load_csmar_universe
+from ashare_lab.services.load_hybrid_universe import load_hybrid_universe
 
 HOLDING_PERIOD_OPTIONS = (1, 4, 13, 26, 52)
 HOLDING_PERIOD_LABELS = {
@@ -56,6 +56,7 @@ st.warning(
 
 CSMAR_ROOT = application_data_dir() / "cache" / "csmar"
 REFERENCE_ROOT = application_data_dir() / "cache" / "csmar_reference"
+OVERLAY_ROOT = application_data_dir() / "cache" / "market_overlay"
 
 with st.form("midterm-maintrend-form"):
     mode_label = st.radio(
@@ -93,8 +94,9 @@ if submitted:
         minimum_sessions = max(252, holding_sessions * 8 + 1)
         history_sessions = minimum_sessions + 70
         with st.spinner("正在读取共同截止日全市场，识别主升突破并计算3–5股风险组合…"):
-            snapshot = load_csmar_universe(
+            hybrid = load_hybrid_universe(
                 CSMAR_ROOT,
+                overlay_root=OVERLAY_ROOT,
                 as_of=as_of,
                 minimum_sessions=minimum_sessions,
                 history_sessions=history_sessions,
@@ -102,6 +104,7 @@ if submitted:
                 decision_date=as_of,
                 mode=mode,
             )
+            snapshot = hybrid.snapshot
             result = build_midterm_portfolio(
                 snapshot.histories,
                 snapshot.metadata,
@@ -115,6 +118,14 @@ if submitted:
                 "active": snapshot.active_symbols,
                 "eligible": snapshot.eligible_symbols,
                 "cutoff": snapshot.data_cutoff.isoformat(),
+                "historical_baseline_cutoff": hybrid.historical_baseline_cutoff.isoformat(),
+                "automatic_increment_cutoff": (
+                    hybrid.automatic_increment_cutoff.isoformat()
+                    if hybrid.automatic_increment_cutoff is not None
+                    else "—"
+                ),
+                "common_cutoff": hybrid.common_cutoff.isoformat(),
+                "sources": " + ".join(hybrid.sources),
                 "mode": mode,
             }
     except Exception as exc:
@@ -128,6 +139,12 @@ if result is not None:
         f"共同截止日：{result.data_cutoff.date() if result.data_cutoff is not None else '—'}｜"
         f"证券主表：{universe.get('master', '—')}｜当日有行情：{universe.get('active', '—')}｜"
         f"数据资格门后：{universe.get('eligible', '—')}"
+    )
+    st.caption(
+        f"历史基线截止：{universe.get('historical_baseline_cutoff', '—')}｜"
+        f"自动增量截止：{universe.get('automatic_increment_cutoff', '—')}｜"
+        f"共同截止：{universe.get('common_cutoff', universe.get('cutoff', '—'))}｜"
+        f"来源：{universe.get('sources', '—')}"
     )
     if result.reasons:
         st.warning("；".join(result.reasons))

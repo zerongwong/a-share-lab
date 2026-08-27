@@ -190,7 +190,9 @@ def assess_entry_readiness(
     breakout_line = float(prior_high_60.iloc[event_position])
     event_atr = float(atr14.iloc[event_position])
     event_amount_ratio = float(amount_ratio.iloc[event_position])
-    if not all(isfinite(value) and value > 0 for value in (breakout_line, event_atr, event_amount_ratio)):
+    if not all(
+        isfinite(value) and value > 0 for value in (breakout_line, event_atr, event_amount_ratio)
+    ):
         return _failure(
             "breakout_evidence_unavailable",
             stage=stage.stage,
@@ -289,18 +291,16 @@ def _classify_pattern(
     post = prepared.iloc[event_position + 1 :]
     post_atr = atr14.iloc[event_position + 1 :]
     previous_close = prepared["close"].shift(1).iloc[event_position + 1 :]
-    reclaimed = (
-        (post["close"] >= breakout_line + 0.05 * post_atr)
-        & (previous_close < breakout_line)
+    reclaimed = (post["close"] >= breakout_line + 0.05 * post_atr) & (
+        previous_close < breakout_line
     )
     if bool(reclaimed.any()) and float(post.iloc[-1]["close"]) >= breakout_line:
         return EntryPattern.BREAKOUT_RECLAIM
 
     touched = float(post["low"].min()) <= breakout_line + 0.50 * event_atr
     held = float(post["close"].min()) >= breakout_line - 0.50 * event_atr
-    latest_near_line = (
-        float(post.iloc[-1]["close"])
-        <= breakout_line + 1.50 * float(post_atr.iloc[-1])
+    latest_near_line = float(post.iloc[-1]["close"]) <= breakout_line + 1.50 * float(
+        post_atr.iloc[-1]
     )
     if touched and held and latest_near_line:
         return EntryPattern.HEALTHY_PULLBACK

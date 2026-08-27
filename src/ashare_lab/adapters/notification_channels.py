@@ -68,9 +68,7 @@ class ServerChanNotificationChannel:
             # The original httpx exception may include the credential-bearing
             # request URL.  Suppress chaining so background tracebacks cannot
             # leak the SendKey into logs.
-            raise NotificationDeliveryError(
-                "Server酱通知发送失败，请检查网络和SendKey。"
-            ) from None
+            raise NotificationDeliveryError("Server酱通知发送失败，请检查网络和SendKey。") from None
 
         if not isinstance(document, dict) or document.get("code") != 0:
             raise NotificationDeliveryError("Server酱未接受通知，请检查通道状态和额度。")
