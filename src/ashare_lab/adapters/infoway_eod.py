@@ -44,6 +44,9 @@ _EOD_MINIMUM_INTERVAL_SECONDS = 1.2
 _MAX_429_RETRIES = 2
 _MIN_429_DELAY_SECONDS = 2.0
 _MAX_429_DELAY_SECONDS = 30.0
+_HISTORICAL_AMOUNT_MULTIPLIER_TO_CNY = Decimal("1")
+_SAME_SESSION_PROVISIONAL_AMOUNT_MULTIPLIER_TO_CNY = Decimal("100")
+_VERSION_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,9 @@ class InfowayEodUnitContract:
     volume_multiplier_to_shares: Decimal
     amount_field: str
     amount_multiplier_to_cny: Decimal
+    provisional_amount_multiplier_to_cny: Decimal
+    contract_version: str
+    resolution_method_version: str
     verified_reference: str
     volume_semantics: str = "shares"
     amount_semantics: str = "turnover_value_cny"
@@ -68,12 +74,20 @@ class InfowayEodUnitContract:
         try:
             volume_multiplier = Decimal(str(self.volume_multiplier_to_shares))
             amount_multiplier = Decimal(str(self.amount_multiplier_to_cny))
+            provisional_multiplier = Decimal(str(self.provisional_amount_multiplier_to_cny))
         except InvalidOperation as exc:
             raise ValueError("unit multipliers must be finite decimal values") from exc
         if not volume_multiplier.is_finite() or volume_multiplier <= 0:
             raise ValueError("volume_multiplier_to_shares must be positive and finite")
         if not amount_multiplier.is_finite() or amount_multiplier <= 0:
             raise ValueError("amount_multiplier_to_cny must be positive and finite")
+        if amount_multiplier != _HISTORICAL_AMOUNT_MULTIPLIER_TO_CNY:
+            raise ValueError("historical amount_multiplier_to_cny must be explicitly 1")
+        if (
+            not provisional_multiplier.is_finite()
+            or provisional_multiplier != _SAME_SESSION_PROVISIONAL_AMOUNT_MULTIPLIER_TO_CNY
+        ):
+            raise ValueError("provisional_amount_multiplier_to_cny must be explicitly 100")
         if self.amount_field not in {"vw", "vm"}:
             raise ValueError("amount_field must be explicitly verified as 'vw' or 'vm'")
         if self.volume_semantics != "shares":
@@ -82,8 +96,38 @@ class InfowayEodUnitContract:
             raise ValueError("amount_semantics must explicitly be 'turnover_value_cny'")
         if not self.verified_reference.strip():
             raise ValueError("verified_reference is required; units cannot be guessed")
+        for name, value in (
+            ("contract_version", self.contract_version),
+            ("resolution_method_version", self.resolution_method_version),
+        ):
+            if not value.strip() or _VERSION_TOKEN.fullmatch(value.strip()) is None:
+                raise ValueError(f"{name} must be a non-empty audit-safe version token")
         object.__setattr__(self, "volume_multiplier_to_shares", volume_multiplier)
         object.__setattr__(self, "amount_multiplier_to_cny", amount_multiplier)
+        object.__setattr__(
+            self,
+            "provisional_amount_multiplier_to_cny",
+            provisional_multiplier,
+        )
+        object.__setattr__(self, "contract_version", self.contract_version.strip())
+        object.__setattr__(
+            self,
+            "resolution_method_version",
+            self.resolution_method_version.strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedTargetBar:
+    provider_symbol: str
+    target_date: date
+    open_price: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    previous_close: Decimal
+    volume_shares: Decimal
+    amount_raw: Decimal
 
 
 class InfowayEodMarketData(InfowayRealtimeMarketData):
@@ -108,6 +152,7 @@ class InfowayEodMarketData(InfowayRealtimeMarketData):
         )
         self._unit_contract = unit_contract
         self._retry_sleeper = sleeper
+        self._resolved_amount_multiplier_by_date: dict[date, Decimal] = {}
 
     def _request_json(
         self,
@@ -240,8 +285,7 @@ class InfowayEodMarketData(InfowayRealtimeMarketData):
         if sessions != (target_date,):
             raise DataQualityError("Infoway交易日历未确认目标日期为CN交易日。")
 
-        rows: list[dict[str, object]] = []
-        received: list[str] = []
+        prepared_rows: list[_PreparedTargetBar] = []
         trace_ids: list[str] = []
         for batch in _chunks(requested, _MAX_BATCH):
             payload, trace_id = self._request_json(
@@ -259,37 +303,108 @@ class InfowayEodMarketData(InfowayRealtimeMarketData):
                 bars = grouped.get(symbol, ())
                 if not bars:
                     continue
-                row = _normalize_target_bar(
+                prepared = _prepare_target_bar(
                     symbol,
                     bars,
                     target_date=target_date,
                     contract=contract,
-                    retrieved_at=fetched_at,
-                    asset_kind=normalized_asset_kind,
                 )
-                if row is None:
+                if prepared is None:
                     # An empty, stale-only or explicit zero-trade response is
                     # normal for a suspended security.  Keep it out of the
                     # frame and let the caller's market-coverage gate decide.
                     continue
-                rows.append(row)
-                received.append(symbol)
+                prepared_rows.append(prepared)
             if trace_id:
                 trace_ids.append(trace_id)
 
-        if not rows:
+        if not prepared_rows:
             raise DataUnavailableError(f"Infoway没有返回{target_date.isoformat()}的已完成CN日线。")
+        amount_multiplier = self._resolve_batch_amount_multiplier(
+            prepared_rows,
+            target_date=target_date,
+            fetched_at=fetched_at,
+            asset_kind=normalized_asset_kind,
+            contract=contract,
+        )
+        rows = [
+            _normalize_prepared_bar(
+                prepared,
+                amount_multiplier_to_cny=amount_multiplier,
+                retrieved_at=fetched_at,
+                asset_kind=normalized_asset_kind,
+            )
+            for prepared in prepared_rows
+        ]
+        # The per-date decision becomes reusable only after the complete batch
+        # has passed parsing, uniqueness and cross-symbol consistency checks.
+        self._resolved_amount_multiplier_by_date[target_date] = amount_multiplier
         frame = pd.DataFrame(rows, columns=["symbol", *CANONICAL_DAILY_COLUMNS])
         return DailyIncrementBatch(
             frame=frame.sort_values("symbol").reset_index(drop=True),
             target_date=target_date,
             requested_symbols=requested,
-            received_symbols=tuple(received),
+            received_symbols=tuple(row.provider_symbol for row in prepared_rows),
             fetched_at=fetched_at,
             trace_ids=tuple(trace_ids),
             provider=self.provider,
             cutoff_timestamp=cutoff,
+            unit_contract_version=contract.contract_version,
+            unit_resolution_method_version=contract.resolution_method_version,
+            amount_multiplier_to_cny=str(amount_multiplier),
         )
+
+    def _resolve_batch_amount_multiplier(
+        self,
+        rows: Sequence[_PreparedTargetBar],
+        *,
+        target_date: date,
+        fetched_at: datetime,
+        asset_kind: AssetKind,
+        contract: InfowayEodUnitContract,
+    ) -> Decimal:
+        local_fetch = fetched_at.astimezone(_CN_TIMEZONE)
+        same_session_after_close = (
+            target_date == local_fetch.date()
+            and local_fetch.time().replace(tzinfo=None) >= _CN_CLOSE
+        )
+        if asset_kind == "indices":
+            if not same_session_after_close:
+                return contract.amount_multiplier_to_cny
+            inherited = self._resolved_amount_multiplier_by_date.get(target_date)
+            if inherited is None:
+                raise DataQualityError(
+                    "Infoway同日指数成交额倍率尚未由完整股票批次唯一锁定，拒绝单独猜测。"
+                )
+            return inherited
+
+        allowed = [contract.amount_multiplier_to_cny]
+        if same_session_after_close:
+            allowed.append(contract.provisional_amount_multiplier_to_cny)
+        decisions: dict[str, Decimal] = {}
+        for row in rows:
+            matches = tuple(
+                multiplier
+                for multiplier in allowed
+                if _amount_volume_is_consistent(
+                    volume_shares=row.volume_shares,
+                    amount_cny=row.amount_raw * multiplier,
+                    low=row.low,
+                    high=row.high,
+                )
+            )
+            if len(matches) != 1:
+                raise DataQualityError(
+                    f"Infoway {row.provider_symbol} 成交额倍率无法由量价区间唯一判定，"
+                    "整批单位合同验证失败。"
+                )
+            decisions[row.provider_symbol] = matches[0]
+        selected = set(decisions.values())
+        if len(selected) != 1:
+            raise DataQualityError(
+                "Infoway股票批次出现不同成交额倍率，拒绝混用历史与同日临时口径。"
+            )
+        return next(iter(selected))
 
     def _require_unit_contract(self) -> InfowayEodUnitContract:
         if self._unit_contract is None:
@@ -456,15 +571,13 @@ def _unwrap_kline_envelope(payload: object) -> object:
     raise DataQualityError("Infoway 日K包装层级异常。")
 
 
-def _normalize_target_bar(
+def _prepare_target_bar(
     provider_symbol: str,
     bars: Sequence[Mapping[str, object]],
     *,
     target_date: date,
     contract: InfowayEodUnitContract,
-    retrieved_at: datetime,
-    asset_kind: AssetKind,
-) -> dict[str, object] | None:
+) -> _PreparedTargetBar | None:
     dated: list[tuple[int, date, Mapping[str, object]]] = []
     seen_timestamps: set[int] = set()
     for bar in bars:
@@ -496,13 +609,12 @@ def _normalize_target_bar(
         raise DataQualityError(f"Infoway {provider_symbol} 日K成交额字段与已验证单位合同不一致。")
     amount_raw = _nonnegative_decimal(target.get(contract.amount_field), "amount", provider_symbol)
     volume_shares = volume_raw * contract.volume_multiplier_to_shares
-    amount_cny = amount_raw * contract.amount_multiplier_to_cny
-    if volume_shares == 0 and amount_cny == 0:
+    if volume_shares == 0 and amount_raw == 0:
         # Some vendors emit a same-date placeholder for suspended securities.
         # Its price fields are not a tradable daily bar and must not enter the
         # research history, even if they repeat the previous close.
         return None
-    if volume_shares == 0 or amount_cny == 0:
+    if volume_shares == 0 or amount_raw == 0:
         raise DataQualityError(f"Infoway {provider_symbol} 成交量与成交额零值不一致，数据损坏。")
 
     previous = [item for item in dated if item[0] < target_timestamp]
@@ -523,27 +635,39 @@ def _normalize_target_bar(
     if high < max(open_price, low, close) or low > min(open_price, high, close):
         raise DataQualityError(f"Infoway {provider_symbol} 日K开高低收关系无效。")
 
-    if asset_kind == "stocks":
-        _validate_amount_volume_consistency(
-            provider_symbol,
-            volume_shares=volume_shares,
-            amount_cny=amount_cny,
-            low=low,
-            high=high,
-        )
+    return _PreparedTargetBar(
+        provider_symbol=provider_symbol,
+        target_date=target_date,
+        open_price=open_price,
+        high=high,
+        low=low,
+        close=close,
+        previous_close=previous_close,
+        volume_shares=volume_shares,
+        amount_raw=amount_raw,
+    )
 
-    code = _PROVIDER_SYMBOL.fullmatch(provider_symbol)
+
+def _normalize_prepared_bar(
+    prepared: _PreparedTargetBar,
+    *,
+    amount_multiplier_to_cny: Decimal,
+    retrieved_at: datetime,
+    asset_kind: AssetKind,
+) -> dict[str, object]:
+    code = _PROVIDER_SYMBOL.fullmatch(prepared.provider_symbol)
     if code is None:  # Already validated; keep this branch fail-closed.
         raise DataQualityError("Infoway 日K证券代码无法标准化。")
+    amount_cny = prepared.amount_raw * amount_multiplier_to_cny
     return {
         "symbol": code.group("code"),
-        "trade_date": target_date,
-        "open": float(open_price),
-        "high": float(high),
-        "low": float(low),
-        "close": float(close),
-        "prev_close": float(previous_close),
-        "volume_shares": float(volume_shares),
+        "trade_date": prepared.target_date,
+        "open": float(prepared.open_price),
+        "high": float(prepared.high),
+        "low": float(prepared.low),
+        "close": float(prepared.close),
+        "prev_close": float(prepared.previous_close),
+        "volume_shares": float(prepared.volume_shares),
         "amount_cny": float(amount_cny),
         "turnover_pct": math.nan,
         "source": _SOURCE_LABELS[asset_kind],
@@ -593,25 +717,18 @@ def _decimal(value: object, field: str, symbol: str) -> Decimal:
     return parsed
 
 
-def _validate_amount_volume_consistency(
-    symbol: str,
+def _amount_volume_is_consistent(
     *,
     volume_shares: Decimal,
     amount_cny: Decimal,
     low: Decimal,
     high: Decimal,
-) -> None:
-    if volume_shares == 0:
-        if amount_cny != 0:
-            raise DataQualityError(f"Infoway {symbol} 零成交量却有成交额，单位不可验证。")
-        return
-    if amount_cny == 0:
-        raise DataQualityError(f"Infoway {symbol} 有成交量但成交额为零，单位不可验证。")
+) -> bool:
+    if volume_shares <= 0 or amount_cny <= 0:
+        return False
     implied_price = amount_cny / volume_shares
     tolerance = Decimal("0.005")
-    if implied_price < low * (Decimal(1) - tolerance) or implied_price > high * (
-        Decimal(1) + tolerance
-    ):
-        raise DataQualityError(
-            f"Infoway {symbol} 成交额/成交量无法落入日内价格区间，单位不可验证。"
-        )
+    return not (
+        implied_price < low * (Decimal(1) - tolerance)
+        or implied_price > high * (Decimal(1) + tolerance)
+    )

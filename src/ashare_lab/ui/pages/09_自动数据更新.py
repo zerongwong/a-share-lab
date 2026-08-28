@@ -11,7 +11,8 @@ from ashare_lab.adapters.macos_keychain import (
 )
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.bootstrap import application_data_dir
-from ashare_lab.domain.errors import AShareLabError
+from ashare_lab.domain.errors import AShareLabError, DataUnavailableError
+from ashare_lab.services.daily_update_lock import daily_update_lock
 from ashare_lab.services.run_daily_update import (
     DailyUpdateReport,
     latest_complete_cn_candidate,
@@ -21,6 +22,7 @@ from ashare_lab.services.run_daily_update import (
 
 CSMAR_ROOT = application_data_dir() / "cache" / "csmar"
 OVERLAY_ROOT = application_data_dir() / "cache" / "market_overlay"
+SCHEDULED_SYNC_LOCK = application_data_dir() / "scheduler" / "daily-sync.lock"
 _FLASH_KEY = "daily_update_flash"
 
 
@@ -68,10 +70,13 @@ def _save_key(value: str) -> None:
 
 
 def _run_update() -> None:
-    report = run_daily_update(
-        csmar_root=CSMAR_ROOT,
-        overlay_root=OVERLAY_ROOT,
-    )
+    with daily_update_lock(SCHEDULED_SYNC_LOCK) as acquired:
+        if not acquired:
+            raise DataUnavailableError("收盘数据更新正在另一个进程中运行，请稍后再试。")
+        report = run_daily_update(
+            csmar_root=CSMAR_ROOT,
+            overlay_root=OVERLAY_ROOT,
+        )
     st.session_state["latest_daily_update_report"] = report
 
 
@@ -120,16 +125,18 @@ def render() -> None:
         st.success(str(flash))
 
     st.info(
-        "盘中不会把今天的累计行情当成完整日线：上海时间16:15前只补到上一日期，"
-        "再由Infoway中国交易日历排除周末和法定休市日。"
+        "盘中不会把今天的累计行情当成完整日线：上海时间15:30前只补到上一日期。"
+        "15:30后当日只进入收盘候选，仍需通过Infoway中国交易日历、全量覆盖和行质量校验；"
+        "不完整数据会被隔离，18:30再复核。"
     )
     st.warning(
         "Infoway当前股票清单只覆盖沪深A股，不含北交所。北交所股票不会被伪造或静默补齐，"
         "在混合研究样本中会明确排除。"
     )
     st.caption(
-        "本页提供一键追平和状态检查；当前不会安装LaunchAgent或后台常驻任务。"
-        "命令行入口可供后续经过确认的定时调度使用。"
+        "本页提供一键追平和状态检查。项目另附独立LaunchAgent安装脚本；"
+        "只有使用者主动运行安装脚本后，才会在每日15:30首次同步、18:30质量复核。"
+        "该任务不依赖本网页，不会常驻、连接券商或自动下单。"
     )
 
     try:

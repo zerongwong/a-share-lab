@@ -36,6 +36,9 @@ def _units(
         volume_multiplier_to_shares=Decimal(volume_multiplier),
         amount_field=amount_field,
         amount_multiplier_to_cny=Decimal(amount_multiplier),
+        provisional_amount_multiplier_to_cny=Decimal("100"),
+        contract_version="test-contract-v1",
+        resolution_method_version="test-batch-price-band-v1",
         verified_reference="account-data-dictionary-2026-08-27",
     )
 
@@ -273,7 +276,197 @@ def test_daily_increment_accepts_flat_records_and_explicit_cutoff() -> None:
     assert result.frame.loc[0, "symbol"] == "600000"
 
 
-def test_realistic_index_scale_uses_explicit_kind_and_skips_stock_vwap_check() -> None:
+def test_same_session_after_close_uses_unique_provisional_vw_multiplier() -> None:
+    same_day = date(2026, 8, 27)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/trading_days"):
+            return _calendar_response(same_day)
+        return httpx.Response(
+            200,
+            json={
+                "ret": 200,
+                "traceId": "same-session-trace",
+                "data": [
+                    {
+                        "s": "600000.SH",
+                        "respList": [
+                            _bar(TARGET, close="10.10", amount="10100"),
+                            _bar(same_day, close="10.50", amount="10500"),
+                        ],
+                    }
+                ],
+            },
+        )
+
+    api = InfowayEodMarketData(
+        "same-session-secret",
+        unit_contract=_units(volume_multiplier="100"),
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    result = api.fetch_daily_increment(["600000.SH"], same_day)
+
+    row = result.frame.iloc[0]
+    assert row["volume_shares"] == pytest.approx(100_000)
+    assert row["amount_cny"] == pytest.approx(1_050_000)
+    assert result.amount_multiplier_to_cny == "100"
+    assert result.unit_contract_version == "test-contract-v1"
+    assert result.unit_resolution_method_version == "test-batch-price-band-v1"
+
+
+def test_historical_day_never_considers_same_session_provisional_multiplier() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/trading_days"):
+            return _calendar_response(TARGET)
+        return httpx.Response(
+            200,
+            json={
+                "ret": 200,
+                "data": [
+                    {
+                        "s": "600000.SH",
+                        "respList": [
+                            _bar(date(2026, 8, 25), close="10.10"),
+                            _bar(TARGET, close="10.50", amount="10500"),
+                        ],
+                    }
+                ],
+            },
+        )
+
+    api = InfowayEodMarketData(
+        "historical-secret",
+        unit_contract=_units(volume_multiplier="100"),
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    with pytest.raises(DataQualityError, match="无法由量价区间唯一判定"):
+        api.fetch_daily_increment(["600000.SH"], TARGET)
+
+
+def test_same_session_rejects_ambiguous_multiplier() -> None:
+    same_day = date(2026, 8, 27)
+    ambiguous = {
+        **_bar(same_day, close="10.50", amount="10500"),
+        "h": "1100.00",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/trading_days"):
+            return _calendar_response(same_day)
+        return httpx.Response(
+            200,
+            json={
+                "ret": 200,
+                "data": [
+                    {
+                        "s": "600000.SH",
+                        "respList": [_bar(TARGET, close="10.10"), ambiguous],
+                    }
+                ],
+            },
+        )
+
+    api = InfowayEodMarketData(
+        "ambiguous-secret",
+        unit_contract=_units(),
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    with pytest.raises(DataQualityError, match="无法由量价区间唯一判定") as exc_info:
+        api.fetch_daily_increment(["600000.SH"], same_day)
+    assert "ambiguous-secret" not in str(exc_info.value)
+
+
+def test_same_session_rejects_mixed_multipliers_across_http_chunks() -> None:
+    same_day = date(2026, 8, 27)
+    symbols = tuple(f"{value:06d}.SZ" for value in range(1, 102))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/trading_days"):
+            return _calendar_response(same_day)
+        body = json.loads(request.content)
+        records = []
+        for symbol in body["codes"].split(","):
+            amount = "1050000" if symbol == symbols[-1] else "10500"
+            records.append(
+                {
+                    "s": symbol,
+                    "respList": [
+                        _bar(TARGET, close="10.10"),
+                        _bar(same_day, close="10.50", amount=amount),
+                    ],
+                }
+            )
+        return httpx.Response(200, json={"ret": 200, "data": records})
+
+    api = InfowayEodMarketData(
+        "mixed-secret",
+        unit_contract=_units(volume_multiplier="100"),
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    with pytest.raises(DataQualityError, match="不同成交额倍率") as exc_info:
+        api.fetch_daily_increment(symbols, same_day)
+    assert "mixed-secret" not in str(exc_info.value)
+
+
+def test_same_session_index_must_inherit_stock_batch_multiplier() -> None:
+    same_day = date(2026, 8, 27)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/trading_days"):
+            return _calendar_response(same_day)
+        body = json.loads(request.content)
+        symbol = body["codes"]
+        return httpx.Response(
+            200,
+            json={
+                "ret": 200,
+                "data": [
+                    {
+                        "s": symbol,
+                        "respList": [
+                            _bar(TARGET, close="10.10"),
+                            _bar(same_day, close="10.50", amount="10500"),
+                        ],
+                    }
+                ],
+            },
+        )
+
+    contract = _units(volume_multiplier="100")
+    direct_index = InfowayEodMarketData(
+        "direct-index-secret",
+        unit_contract=contract,
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    with pytest.raises(DataQualityError, match="完整股票批次唯一锁定"):
+        direct_index.fetch_daily_increment(["000300.SH"], same_day, asset_kind="indices")
+
+    api = InfowayEodMarketData(
+        "inherited-index-secret",
+        unit_contract=contract,
+        client=_client(handler),
+        minimum_interval_seconds=0,
+        utcnow=lambda: NOW,
+    )
+    stock_batch = api.fetch_daily_increment(["600000.SH"], same_day, asset_kind="stocks")
+    index_batch = api.fetch_daily_increment(["000300.SH"], same_day, asset_kind="indices")
+
+    assert stock_batch.amount_multiplier_to_cny == "100"
+    assert index_batch.amount_multiplier_to_cny == "100"
+    assert index_batch.frame.loc[0, "amount_cny"] == pytest.approx(1_050_000)
+
+
+def test_synthetic_index_scale_uses_explicit_kind_and_skips_stock_vwap_check() -> None:
     previous = {
         "t": str(_timestamp(date(2026, 8, 25))),
         "o": "4500.00",
@@ -289,6 +482,7 @@ def test_realistic_index_scale_uses_explicit_kind_and_skips_stock_vwap_check() -
         "h": "4612.00",
         "l": "4530.00",
         "c": "4600.00",
+        # Deliberately round synthetic magnitudes; no provider row belongs in tests.
         "v": "123456700",
         "vw": "456789000000.00",
     }
@@ -321,7 +515,7 @@ def test_realistic_index_scale_uses_explicit_kind_and_skips_stock_vwap_check() -
 
     # The same suffix does not silently identify an index.  The default stock
     # path retains the strict amount/volume-implied-price validation.
-    with pytest.raises(DataQualityError, match="单位不可验证"):
+    with pytest.raises(DataQualityError, match="唯一判定"):
         api.fetch_daily_increment(["000300.SH"], TARGET)
 
 
@@ -516,11 +710,11 @@ def test_no_unit_contract_fails_before_network_and_never_reveals_key() -> None:
             "同时包含vw与vm",
         ),
         (_bar(TARGET, close="10.50", amount_field="vm"), _units(), "字段.*不一致"),
-        (_bar(TARGET, close="10.50", amount="10.50"), _units(), "单位不可验证"),
+        (_bar(TARGET, close="10.50", amount="10.50"), _units(), "唯一判定"),
         (
             _bar(TARGET, close="10.50", amount="10500"),
             _units(volume_multiplier="100"),
-            "单位不可验证",
+            "唯一判定",
         ),
     ],
 )

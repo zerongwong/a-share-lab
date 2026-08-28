@@ -13,6 +13,7 @@ from ashare_lab.services.run_daily_update import (
     DEFAULT_INFOWAY_CORE_INDICES,
     INFOWAY_EOD_UNIT_CONTRACT,
     INFOWAY_EOD_UNIT_CONTRACT_VERSION,
+    INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION,
     latest_complete_cn_candidate,
     run_daily_update,
 )
@@ -102,19 +103,28 @@ class FakeProvider:
 
 def test_intraday_never_treats_today_as_a_completed_daily_bar() -> None:
     assert latest_complete_cn_candidate(NOW) == DAY_26
-    after_ready = datetime(2026, 8, 27, 8, 15, tzinfo=UTC)  # 16:15 Shanghai
-    assert latest_complete_cn_candidate(after_ready) == date(2026, 8, 27)
+    just_before_ready = datetime(2026, 8, 27, 7, 29, 59, tzinfo=UTC)
+    at_ready = datetime(2026, 8, 27, 7, 30, tzinfo=UTC)  # 15:30 Shanghai
+    assert latest_complete_cn_candidate(just_before_ready) == DAY_26
+    assert latest_complete_cn_candidate(at_ready) == date(2026, 8, 27)
 
 
 def test_explicit_versioned_public_unit_contract_never_guesses_vm() -> None:
-    assert INFOWAY_EOD_UNIT_CONTRACT_VERSION == "infoway-cn-eod-v2-2026-08-27"
+    assert INFOWAY_EOD_UNIT_CONTRACT_VERSION == "infoway-cn-eod-v3-2026-08-27"
+    assert INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION == "batch-price-band-v1"
     assert INFOWAY_EOD_UNIT_CONTRACT.volume_multiplier_to_shares == 100
     assert INFOWAY_EOD_UNIT_CONTRACT.amount_field == "vw"
     assert INFOWAY_EOD_UNIT_CONTRACT.amount_multiplier_to_cny == 1
+    assert INFOWAY_EOD_UNIT_CONTRACT.provisional_amount_multiplier_to_cny == 100
+    assert (
+        INFOWAY_EOD_UNIT_CONTRACT.resolution_method_version
+        == INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION
+    )
     assert "low*volume_shares<=amount_cny<=high*volume_shares" in (
         INFOWAY_EOD_UNIT_CONTRACT.verified_reference
     )
-    assert "SYNTHETIC.SH 2000-01-03" in INFOWAY_EOD_UNIT_CONTRACT.verified_reference
+    assert "raw rows are deliberately not stored" in (INFOWAY_EOD_UNIT_CONTRACT.verified_reference)
+    assert "600000.SH" not in INFOWAY_EOD_UNIT_CONTRACT.verified_reference
     assert "100-share lots" in INFOWAY_EOD_UNIT_CONTRACT.verified_reference
 
 
@@ -150,6 +160,8 @@ def test_keychain_only_update_appends_25_and_26_without_mutating_csmar(tmp_path:
     assert report.quarantined_failures == ()
     assert report.current_through_latest_complete_session is True
     assert report.csmar_mutated is False
+    assert report.unit_contract_version == INFOWAY_EOD_UNIT_CONTRACT_VERSION
+    assert report.unit_resolution_method_version == INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION
     assert "不含北交所" in report.market_scope
     assert SECRET not in repr(report)
     assert providers[0].received_secret == SECRET

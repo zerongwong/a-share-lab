@@ -15,14 +15,22 @@ where ``signal_score`` must be in ``[0, 1]`` and daily downside volatility is
 ``sqrt(mean(min(return, 0)^2)) * sqrt(252)``.  The signal multiplier is therefore
 bounded to ``[0.75, 1.25]`` and cannot overwhelm the inverse-risk term.  Priorities
 are projected first to industry totals and then to individual weights with a
-deterministic box-simplex projection.  Total-account limits are:
+deterministic box-simplex projection.  These continuous total-account weights
+remain the audit target.  Their limits are:
 
 * 3 stocks: 70% stock exposure, 15%--35% per stock;
 * 4 stocks: 80% stock exposure, 10%--30% per stock;
 * 5 stocks: 85% stock exposure, 8%--25% per stock.
 
-Unallocated capital is cash, borrowing is always zero, and every industry is
-capped at 40% of account equity (or a stricter caller-supplied cap).
+The operational stock sleeve is then selected by exhaustive search on a 10%
+integer grid.  Three-stock sleeves permit 20%--50% per name, four-stock sleeves
+10%--40%, and five-stock sleeves 10%--30%.  The grid must sum to 100% of the
+stock sleeve and must still respect the total-account industry cap.  All risk
+and return metrics use these operational weights, not the continuous target.
+The nearest structurally feasible grid is chosen before risk evaluation; if
+that grid breaches a risk budget, the candidate group fails.  The optimizer
+does not search a farther grid allocation merely to rescue the group.
+Unallocated capital is cash and borrowing is always zero.
 
 Risk formulas
 -------------
@@ -59,6 +67,11 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from ashare_lab.analytics.weight_quantization import (
+    WEIGHT_QUANTIZATION_METHOD_VERSION,
+    quantize_stock_sleeve_weights,
+)
+
 ANNUAL_SESSIONS = 252
 ROLLING_DRAWDOWN_SESSIONS = 60
 FIVE_DAY_SESSIONS = 5
@@ -68,12 +81,33 @@ SIGNAL_TILT_FLOOR = 0.75
 SIGNAL_TILT_CEILING = 1.25
 INDUSTRY_WEIGHT_HARD_CAP = 0.40
 
-# Limits are total-account weights, not fractions of the stock sleeve.
+# Limits are total-account weights, not fractions of the stock sleeve.  They
+# describe the normal-regime defaults.  A cycle policy may lower total exposure
+# through ``AdaptiveRiskBudget.maximum_stock_exposure``; the position box is
+# then scaled proportionally instead of changing the stock-sleeve geometry.
 POSITION_LIMITS: dict[int, tuple[float, float, float]] = {
     3: (0.70, 0.15, 0.35),
     4: (0.80, 0.10, 0.30),
     5: (0.85, 0.08, 0.25),
 }
+
+# Bounds are fractions of the stock sleeve, not total-account weights.
+OPERATION_STOCK_SLEEVE_LIMITS: dict[int, tuple[float, float]] = {
+    3: (0.20, 0.50),
+    4: (0.10, 0.40),
+    5: (0.10, 0.30),
+}
+OPERATION_STOCK_SLEEVE_STEP = 0.10
+CONTINUOUS_TARGET_OPERATION_METHOD = (
+    "inverse downside volatility x bounded signal tilt; continuous bounded target; "
+    "nearest structurally feasible exhaustive 10% stock-sleeve grid selected before risk; "
+    "operational-weight historical risk evaluation; no farther-grid risk rescue"
+)
+DIRECT_OPERATION_METHOD = (
+    "caller-supplied operational total-account weights; validated 10% stock-sleeve grid; "
+    "direct historical risk evaluation without quantization"
+)
+OPERATIONAL_WEIGHT_VALIDATION_METHOD_VERSION = "direct-operational-stock-sleeve-validation-v1.0.0"
 
 
 class AdaptivePortfolioDataError(ValueError):
@@ -133,6 +167,7 @@ class AdaptiveRiskBudget:
     minimum_observations: int = 160
     minimum_down_periods: int = 20
     minimum_holding_period_samples: int = 8
+    maximum_stock_exposure: float | None = None
 
     def __post_init__(self) -> None:
         positive: dict[str, object] = {
@@ -173,6 +208,16 @@ class AdaptiveRiskBudget:
             raise ValueError("max_down_period_correlation must be in [-1, 1]")
         if self.industry_weight_limit > INDUSTRY_WEIGHT_HARD_CAP:
             raise ValueError("industry_weight_limit cannot exceed 40%")
+        if self.maximum_stock_exposure is not None:
+            if isinstance(self.maximum_stock_exposure, bool):
+                raise ValueError("maximum_stock_exposure must be in (0, 0.85]")
+            try:
+                maximum_exposure = float(self.maximum_stock_exposure)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("maximum_stock_exposure must be in (0, 0.85]") from exc
+            if not math.isfinite(maximum_exposure) or not 0.0 < maximum_exposure <= 0.85:
+                raise ValueError("maximum_stock_exposure must be in (0, 0.85]")
+            object.__setattr__(self, "maximum_stock_exposure", maximum_exposure)
         if isinstance(self.holding_period_sessions, bool) or not isinstance(
             self.holding_period_sessions, int
         ):
@@ -251,10 +296,12 @@ class AdaptivePortfolioEvaluation:
     industry_weights: tuple[tuple[str, float], ...]
     metrics: AdaptivePortfolioMetrics
     risk_budget: AdaptiveRiskBudgetResult
-    method: str = (
-        "inverse downside volatility x bounded signal tilt; deterministic bounded projection; "
-        "historical downside-risk evaluation"
-    )
+    method: str = CONTINUOUS_TARGET_OPERATION_METHOD
+    # Appended defaults preserve compatibility for older positional construction
+    # while retaining the pre-quantization target for audit and reproduction.
+    exact_target_weights: tuple[tuple[str, float], ...] = ()
+    stock_sleeve_weight_step: float | None = None
+    weight_quantization_method_version: str | None = None
 
 
 DEFAULT_RISK_BUDGET = AdaptiveRiskBudget()
@@ -265,11 +312,16 @@ def optimize_adaptive_portfolio(
     *,
     budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
 ) -> AdaptivePortfolioEvaluation:
-    """Allocate and evaluate one 3--5 stock candidate set without side effects."""
+    """Allocate and evaluate one 3--5 stock candidate set without side effects.
+
+    The nearest structurally and industry-feasible grid is fixed before risk
+    metrics are evaluated.  A risk-budget failure rejects this candidate set;
+    no farther grid point is searched as a risk-aware rescue.
+    """
 
     prepared, returns = _prepare_candidates(candidates, budget)
     stock_count = len(prepared)
-    exposure, lower, upper = POSITION_LIMITS[stock_count]
+    exposure, lower, upper = _position_limits(stock_count, budget)
     individual_downside = _individual_downside_volatility(returns)
     priorities = np.asarray(
         [
@@ -282,7 +334,7 @@ def optimize_adaptive_portfolio(
         ],
         dtype=float,
     )
-    weights = _allocate_with_industry_caps(
+    exact_target_weights = _allocate_with_industry_caps(
         prepared,
         priorities,
         exposure=exposure,
@@ -290,7 +342,20 @@ def optimize_adaptive_portfolio(
         upper=upper,
         industry_cap=budget.industry_weight_limit,
     )
-    return _evaluate_prepared(prepared, returns, weights, individual_downside, budget)
+    operational_weights = _operationalize_weights(
+        prepared,
+        exact_target_weights,
+        exposure=exposure,
+        industry_cap=budget.industry_weight_limit,
+    )
+    return _evaluate_prepared(
+        prepared,
+        returns,
+        operational_weights,
+        individual_downside,
+        budget,
+        exact_target_weights=exact_target_weights,
+    )
 
 
 def evaluate_adaptive_portfolio(
@@ -299,32 +364,19 @@ def evaluate_adaptive_portfolio(
     *,
     budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
 ) -> AdaptivePortfolioEvaluation:
-    """Evaluate caller-supplied total-account weights with the same pure risk engine.
+    """Evaluate a caller-supplied continuous target with the same pure risk engine.
 
-    Symbols must exactly match the candidate set, weights must sum to the exposure
-    assigned to that candidate count, and every weight must respect the same
-    transparent per-position bounds used by :func:`optimize_adaptive_portfolio`.
-    Industry concentration is returned as a risk-budget result rather than hidden.
+    Symbols must exactly match the candidate set, target weights must sum to the
+    exposure assigned to that candidate count, and every target must respect the
+    same continuous per-position bounds used by :func:`optimize_adaptive_portfolio`.
+    The target is retained for audit, then mapped to the nearest feasible 10%
+    stock-sleeve grid.  Industry concentration and all reported metrics use the
+    operational grid weights rather than the caller's continuous target.
     """
 
     prepared, returns = _prepare_candidates(candidates, budget)
-    exposure, lower, upper = POSITION_LIMITS[len(prepared)]
-    normalized_weights: dict[str, float] = {}
-    for raw_symbol, raw_weight in weights.items():
-        symbol = str(raw_symbol).strip().upper()
-        if not symbol or symbol in normalized_weights:
-            raise AdaptivePortfolioDataError("weight symbols must be unique and non-blank")
-        try:
-            value = float(raw_weight)
-        except (TypeError, ValueError) as exc:
-            raise AdaptivePortfolioDataError(f"{symbol}: weight must be numeric") from exc
-        if not math.isfinite(value):
-            raise AdaptivePortfolioDataError(f"{symbol}: weight must be finite")
-        normalized_weights[symbol] = value
-    symbols = {candidate.symbol for candidate in prepared}
-    if set(normalized_weights) != symbols:
-        raise AdaptivePortfolioDataError("weight symbols must exactly match candidate symbols")
-    ordered = np.asarray([normalized_weights[candidate.symbol] for candidate in prepared])
+    exposure, lower, upper = _position_limits(len(prepared), budget)
+    ordered = _ordered_total_account_weights(prepared, weights)
     if bool((ordered < lower - 1e-12).any()) or bool((ordered > upper + 1e-12).any()):
         raise AdaptivePortfolioDataError(
             f"each {len(prepared)}-stock weight must be in [{lower:.2f}, {upper:.2f}]"
@@ -333,8 +385,103 @@ def evaluate_adaptive_portfolio(
         raise AdaptivePortfolioDataError(
             f"{len(prepared)}-stock weights must sum to exposure {exposure:.2f}"
         )
+    operational_weights = _operationalize_weights(
+        prepared,
+        ordered,
+        exposure=exposure,
+        industry_cap=budget.industry_weight_limit,
+    )
     individual_downside = _individual_downside_volatility(returns)
-    return _evaluate_prepared(prepared, returns, ordered, individual_downside, budget)
+    return _evaluate_prepared(
+        prepared,
+        returns,
+        operational_weights,
+        individual_downside,
+        budget,
+        exact_target_weights=ordered,
+    )
+
+
+def evaluate_operational_adaptive_portfolio(
+    candidates: Sequence[AdaptiveCandidate],
+    weights: Mapping[str, float],
+    *,
+    budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
+) -> AdaptivePortfolioEvaluation:
+    """Validate and directly evaluate caller-supplied operational weights.
+
+    ``weights`` are total-account weights.  Their stock-sleeve fractions must
+    already be exact 10% units, sum to 100% of the count-specific stock
+    exposure, satisfy the 3/4/5-name operational bounds, and respect the
+    total-account industry cap.  This function never quantizes or substitutes
+    another grid point.
+    """
+
+    prepared, returns = _prepare_candidates(candidates, budget)
+    exposure = _position_limits(len(prepared), budget)[0]
+    ordered = _ordered_total_account_weights(prepared, weights)
+    _validate_operational_weights(
+        prepared,
+        ordered,
+        exposure=exposure,
+        industry_cap=budget.industry_weight_limit,
+    )
+    individual_downside = _individual_downside_volatility(returns)
+    return _evaluate_prepared(
+        prepared,
+        returns,
+        ordered,
+        individual_downside,
+        budget,
+        exact_target_weights=ordered,
+        evaluation_method=DIRECT_OPERATION_METHOD,
+        weight_method_version=OPERATIONAL_WEIGHT_VALIDATION_METHOD_VERSION,
+    )
+
+
+def _position_limits(
+    stock_count: int,
+    budget: AdaptiveRiskBudget,
+) -> tuple[float, float, float]:
+    """Return exposure and a proportionally scaled per-name allocation box."""
+
+    base_exposure, base_lower, base_upper = POSITION_LIMITS[stock_count]
+    if budget.maximum_stock_exposure is None:
+        return base_exposure, base_lower, base_upper
+    exposure = min(base_exposure, budget.maximum_stock_exposure)
+    scale = exposure / base_exposure
+    return exposure, base_lower * scale, base_upper * scale
+
+
+def _ordered_total_account_weights(
+    candidates: tuple[AdaptiveCandidate, ...],
+    weights: Mapping[str, float],
+) -> np.ndarray:
+    """Normalize and order a complete total-account weight mapping."""
+
+    if not isinstance(weights, Mapping):
+        raise AdaptivePortfolioDataError("weights must be a symbol-to-weight mapping")
+    normalized_weights: dict[str, float] = {}
+    for raw_symbol, raw_weight in weights.items():
+        symbol = str(raw_symbol).strip().upper()
+        if not symbol or symbol in normalized_weights:
+            raise AdaptivePortfolioDataError("weight symbols must be unique and non-blank")
+        if isinstance(raw_weight, bool):
+            raise AdaptivePortfolioDataError(f"{symbol}: weight must be numeric")
+        try:
+            value = float(raw_weight)
+        except (TypeError, ValueError) as exc:
+            raise AdaptivePortfolioDataError(f"{symbol}: weight must be numeric") from exc
+        if not math.isfinite(value):
+            raise AdaptivePortfolioDataError(f"{symbol}: weight must be finite")
+        normalized_weights[symbol] = value
+    symbols = {candidate.symbol for candidate in candidates}
+    if set(normalized_weights) != symbols:
+        raise AdaptivePortfolioDataError("weight symbols must exactly match candidate symbols")
+    return np.asarray(
+        [normalized_weights[candidate.symbol] for candidate in candidates],
+        dtype=float,
+    )
 
 
 def _prepare_candidates(
@@ -505,6 +652,87 @@ def _allocate_with_industry_caps(
     return result
 
 
+def _operationalize_weights(
+    candidates: tuple[AdaptiveCandidate, ...],
+    exact_target_weights: np.ndarray,
+    *,
+    exposure: float,
+    industry_cap: float,
+) -> np.ndarray:
+    """Return the nearest structurally and industry-feasible 10% sleeve grid."""
+
+    stock_count = len(candidates)
+    minimum_sleeve, maximum_sleeve = OPERATION_STOCK_SLEEVE_LIMITS[stock_count]
+    if not math.isclose(float(exact_target_weights.sum()), exposure, abs_tol=1e-10):
+        raise AdaptivePortfolioDataError("continuous target does not preserve stock exposure")
+    exact_sleeve = exact_target_weights / exposure
+    sleeve_industry_cap = min(1.0, industry_cap / exposure)
+    try:
+        operational_sleeve = quantize_stock_sleeve_weights(
+            tuple(float(value) for value in exact_sleeve),
+            step=OPERATION_STOCK_SLEEVE_STEP,
+            minimum_weight=minimum_sleeve,
+            maximum_weight=maximum_sleeve,
+            group_labels=tuple(candidate.industry for candidate in candidates),
+            maximum_group_weight=sleeve_industry_cap,
+        )
+    except ValueError as exc:
+        raise AdaptivePortfolioDataError(
+            "no structurally and industry-feasible 10% stock-sleeve grid"
+        ) from exc
+
+    operational = np.asarray(operational_sleeve, dtype=float) * exposure
+    _validate_operational_weights(
+        candidates,
+        operational,
+        exposure=exposure,
+        industry_cap=industry_cap,
+    )
+    return operational
+
+
+def _validate_operational_weights(
+    candidates: tuple[AdaptiveCandidate, ...],
+    weights: np.ndarray,
+    *,
+    exposure: float,
+    industry_cap: float,
+) -> None:
+    """Fail closed unless weights already form the exact operational grid."""
+
+    if weights.shape != (len(candidates),) or not bool(np.isfinite(weights).all()):
+        raise AdaptivePortfolioDataError("operational weights must be finite and complete")
+    if not math.isclose(float(weights.sum()), exposure, abs_tol=1e-10):
+        raise AdaptivePortfolioDataError(
+            f"{len(candidates)}-stock operational weights must sum to exposure {exposure:.2f}"
+        )
+
+    minimum_sleeve, maximum_sleeve = OPERATION_STOCK_SLEEVE_LIMITS[len(candidates)]
+    sleeve = weights / exposure
+    if not math.isclose(float(sleeve.sum()), 1.0, abs_tol=1e-10):
+        raise AdaptivePortfolioDataError("operational stock-sleeve weights must sum to 1.0")
+    if bool((sleeve < minimum_sleeve - 1e-12).any()) or bool(
+        (sleeve > maximum_sleeve + 1e-12).any()
+    ):
+        raise AdaptivePortfolioDataError(
+            f"each {len(candidates)}-stock operational sleeve weight must be in "
+            f"[{minimum_sleeve:.2f}, {maximum_sleeve:.2f}]"
+        )
+    units = sleeve / OPERATION_STOCK_SLEEVE_STEP
+    if not bool(np.isclose(units, np.rint(units), rtol=0.0, atol=1e-10).all()):
+        raise AdaptivePortfolioDataError(
+            "operational stock-sleeve weights must be exact 10% increments"
+        )
+
+    industry_totals: dict[str, float] = {}
+    for candidate, weight in zip(candidates, weights, strict=True):
+        industry_totals[candidate.industry] = industry_totals.get(candidate.industry, 0.0) + float(
+            weight
+        )
+    if max(industry_totals.values()) > industry_cap + 1e-12:
+        raise AdaptivePortfolioDataError("operational weights breached the industry cap")
+
+
 def _non_overlapping_portfolio_returns(
     returns: np.ndarray,
     weights: np.ndarray,
@@ -564,6 +792,10 @@ def _evaluate_prepared(
     weights: np.ndarray,
     individual_downside: np.ndarray,
     budget: AdaptiveRiskBudget,
+    *,
+    exact_target_weights: np.ndarray,
+    evaluation_method: str = CONTINUOUS_TARGET_OPERATION_METHOD,
+    weight_method_version: str = WEIGHT_QUANTIZATION_METHOD_VERSION,
 ) -> AdaptivePortfolioEvaluation:
     portfolio_returns = returns @ weights
     portfolio_downside = np.minimum(portfolio_returns, 0.0)
@@ -643,7 +875,7 @@ def _evaluate_prepared(
         )
         for index, (candidate, weight) in enumerate(zip(candidates, weights, strict=True))
     )
-    exposure = POSITION_LIMITS[len(candidates)][0]
+    exposure = _position_limits(len(candidates), budget)[0]
     return AdaptivePortfolioEvaluation(
         positions=positions,
         stock_exposure=exposure,
@@ -652,6 +884,13 @@ def _evaluate_prepared(
         industry_weights=tuple(sorted(industry_totals.items())),
         metrics=metrics,
         risk_budget=risk_result,
+        method=evaluation_method,
+        exact_target_weights=tuple(
+            (candidate.symbol, float(weight))
+            for candidate, weight in zip(candidates, exact_target_weights, strict=True)
+        ),
+        stock_sleeve_weight_step=OPERATION_STOCK_SLEEVE_STEP,
+        weight_quantization_method_version=weight_method_version,
     )
 
 

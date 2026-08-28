@@ -36,6 +36,9 @@ class DailyIncrementBatch:
     trace_ids: tuple[str, ...]
     provider: str
     cutoff_timestamp: int
+    unit_contract_version: str = ""
+    unit_resolution_method_version: str = ""
+    amount_multiplier_to_cny: str = ""
 
     @property
     def coverage_ratio(self) -> float:

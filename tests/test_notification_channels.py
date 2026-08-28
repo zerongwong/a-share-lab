@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 
 import httpx
@@ -13,6 +14,7 @@ from ashare_lab.adapters.notification_channels import (
 )
 from ashare_lab.domain.errors import NotificationDeliveryError
 from ashare_lab.ports.notifications import (
+    MAX_COMPACT_NOTIFICATION_BODY_BYTES,
     NotificationMessage,
     NotificationReceipt,
     NotificationUrgency,
@@ -34,7 +36,10 @@ def test_serverchan_posts_expected_fields_and_accepts_success() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         seen["url"] = str(request.url)
         seen["body"] = request.read().decode()
-        return httpx.Response(200, json={"code": 0, "data": {"pushid": "one"}})
+        return httpx.Response(
+            200,
+            json={"code": 0, "message": "SUCCESS", "data": {"pushid": "one"}},
+        )
 
     channel = ServerChanNotificationChannel(
         "SCTabcdefgh12345678",
@@ -42,7 +47,13 @@ def test_serverchan_posts_expected_fields_and_accepts_success() -> None:
     )
     receipt = channel.send(_message())
 
-    assert receipt == NotificationReceipt(channel="serverchan", accepted=True)
+    assert receipt == NotificationReceipt(
+        channel="serverchan",
+        accepted=True,
+        provider_status="provider_accepted",
+        provider_receipt_id=hashlib.sha256(b"one").hexdigest()[:16],
+    )
+    assert "one" not in repr(receipt)
     assert str(seen["url"]).endswith("/SCTabcdefgh12345678.send")
     assert "title=" in str(seen["body"])
     assert "desp=" in str(seen["body"])
@@ -59,6 +70,38 @@ def test_serverchan_never_reveals_sendkey_in_errors() -> None:
         channel.send(_message())
     assert secret not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"code": 1, "message": "quota"},
+        {"code": "0", "message": "SUCCESS"},
+        {"code": True, "message": "SUCCESS"},
+        {"code": 0},
+        {"code": 0, "message": 0},
+        ["not", "an", "object"],
+    ],
+)
+def test_serverchan_requires_the_official_success_contract(document: object) -> None:
+    channel = ServerChanNotificationChannel(
+        "SCTabcdefgh12345678",
+        client=_client(lambda _: httpx.Response(200, json=document)),
+    )
+
+    with pytest.raises(NotificationDeliveryError, match="未接受"):
+        channel.send(_message())
+
+
+@pytest.mark.parametrize("title", ["第一行\n第二行", "第一行\r第二行", "长" * 33])
+def test_serverchan_rejects_unsafe_titles_before_network(title: str) -> None:
+    channel = ServerChanNotificationChannel(
+        "SCTabcdefgh12345678",
+        client=_client(lambda _: (_ for _ in ()).throw(AssertionError("must not send"))),
+    )
+
+    with pytest.raises(ValueError, match="标题"):
+        channel.send(NotificationMessage(title, "正文"))
 
 
 @pytest.mark.parametrize(
@@ -108,7 +151,11 @@ def test_bark_accepts_official_url_and_sends_time_sensitive_payload() -> None:
     )
     receipt = channel.send(_message(NotificationUrgency.TIME_SENSITIVE))
 
-    assert receipt == NotificationReceipt(channel="bark", accepted=True)
+    assert receipt == NotificationReceipt(
+        channel="bark",
+        accepted=True,
+        provider_status="provider_accepted",
+    )
     assert seen["url"] == "https://api.day.app/push"
     assert seen["payload"] == {
         "device_key": "barkDevice123",
@@ -172,3 +219,11 @@ def test_message_rejects_empty_and_overlong_content() -> None:
         NotificationMessage(" ", "正文")
     with pytest.raises(ValueError, match="8000"):
         NotificationMessage("标题", "x" * 8_001)
+    with pytest.raises(ValueError, match="紧凑通知正文不能为空"):
+        NotificationMessage("标题", "正文", compact_body=" ")
+    with pytest.raises(ValueError, match="UTF-8字节"):
+        NotificationMessage(
+            "标题",
+            "正文",
+            compact_body="中" * (MAX_COMPACT_NOTIFICATION_BODY_BYTES // 3 + 1),
+        )

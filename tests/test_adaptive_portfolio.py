@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import fields
 from statistics import NormalDist
 
 import numpy as np
@@ -12,6 +13,7 @@ from ashare_lab.analytics.adaptive_portfolio import (
     AdaptivePortfolioDataError,
     AdaptiveRiskBudget,
     evaluate_adaptive_portfolio,
+    evaluate_operational_adaptive_portfolio,
     optimize_adaptive_portfolio,
 )
 
@@ -55,27 +57,30 @@ def _lax_budget(**overrides: object) -> AdaptiveRiskBudget:
 
 
 @pytest.mark.parametrize(
-    ("count", "exposure", "cash", "lower", "upper"),
+    ("count", "exposure", "cash", "sleeve_lower", "sleeve_upper"),
     (
-        (3, 0.70, 0.30, 0.15, 0.35),
-        (4, 0.80, 0.20, 0.10, 0.30),
-        (5, 0.85, 0.15, 0.08, 0.25),
+        (3, 0.70, 0.30, 0.20, 0.50),
+        (4, 0.80, 0.20, 0.10, 0.40),
+        (5, 0.85, 0.15, 0.10, 0.30),
     ),
 )
-def test_optimizer_uses_count_specific_exposure_and_position_limits(
+def test_optimizer_uses_count_specific_exposure_and_operational_sleeve_limits(
     count: int,
     exposure: float,
     cash: float,
-    lower: float,
-    upper: float,
+    sleeve_lower: float,
+    sleeve_upper: float,
 ) -> None:
     result = optimize_adaptive_portfolio(_candidate_set(count), budget=_lax_budget())
 
     weights = [position.weight for position in result.positions]
+    sleeve_weights = [weight / exposure for weight in weights]
     assert len(weights) == count
     assert sum(weights) == pytest.approx(exposure)
-    assert min(weights) >= lower - 1e-12
-    assert max(weights) <= upper + 1e-12
+    assert min(sleeve_weights) >= sleeve_lower - 1e-12
+    assert max(sleeve_weights) <= sleeve_upper + 1e-12
+    assert all(math.isclose(weight * 10, round(weight * 10)) for weight in sleeve_weights)
+    assert sum(sleeve_weights) == pytest.approx(1.0)
     assert result.stock_exposure == exposure
     assert result.cash_weight == pytest.approx(cash)
     assert result.borrowed_weight == 0.0
@@ -104,6 +109,44 @@ def test_equal_risk_candidates_receive_a_bounded_signal_tilt() -> None:
     assert weights[-1] > weights[0]
     assert weights[0] >= 0.10
     assert weights[-1] <= 0.30
+
+
+def test_cycle_exposure_cap_scales_positions_and_keeps_remainder_in_cash() -> None:
+    result = optimize_adaptive_portfolio(
+        _candidate_set(4),
+        budget=_lax_budget(maximum_stock_exposure=0.30),
+    )
+
+    assert result.stock_exposure == pytest.approx(0.30)
+    assert result.cash_weight == pytest.approx(0.70)
+    assert sum(item.weight for item in result.positions) == pytest.approx(0.30)
+    sleeve_weights = [item.weight / result.stock_exposure for item in result.positions]
+    assert all(0.10 <= weight <= 0.40 for weight in sleeve_weights)
+    assert all(math.isclose(weight * 10, round(weight * 10)) for weight in sleeve_weights)
+
+
+@pytest.mark.parametrize("count", (3, 5))
+def test_cycle_exposure_cap_scales_three_and_five_stock_operational_sleeves(
+    count: int,
+) -> None:
+    result = optimize_adaptive_portfolio(
+        _candidate_set(count),
+        budget=_lax_budget(maximum_stock_exposure=0.30),
+    )
+
+    assert result.stock_exposure == pytest.approx(0.30)
+    assert result.cash_weight == pytest.approx(0.70)
+    sleeve_weights = [item.weight / result.stock_exposure for item in result.positions]
+    lower, upper = {3: (0.20, 0.50), 5: (0.10, 0.30)}[count]
+    assert sum(sleeve_weights) == pytest.approx(1.0)
+    assert all(lower <= weight <= upper for weight in sleeve_weights)
+    assert all(math.isclose(weight * 10, round(weight * 10)) for weight in sleeve_weights)
+
+
+@pytest.mark.parametrize("value", (0.0, -0.1, 0.86, float("inf"), True))
+def test_invalid_cycle_exposure_cap_is_rejected(value: object) -> None:
+    with pytest.raises(ValueError, match="maximum_stock_exposure"):
+        _lax_budget(maximum_stock_exposure=value)
 
 
 def test_industry_projection_caps_a_high_priority_group_at_forty_percent() -> None:
@@ -135,6 +178,189 @@ def test_infeasible_industry_mix_fails_closed() -> None:
         optimize_adaptive_portfolio(candidates, budget=_lax_budget())
 
 
+def test_no_industry_feasible_ten_percent_grid_fails_without_fallback() -> None:
+    candidates = _candidate_set(4)
+
+    with pytest.raises(AdaptivePortfolioDataError, match="10% stock-sleeve grid"):
+        optimize_adaptive_portfolio(
+            candidates,
+            budget=_lax_budget(industry_weight_limit=0.21),
+        )
+
+
+def test_evaluation_keeps_continuous_target_and_audits_grid_method() -> None:
+    candidates = _candidate_set(4)
+    target = {
+        candidates[0].symbol: 0.22,
+        candidates[1].symbol: 0.21,
+        candidates[2].symbol: 0.19,
+        candidates[3].symbol: 0.18,
+    }
+
+    result = evaluate_adaptive_portfolio(candidates, target, budget=_lax_budget())
+
+    assert dict(result.exact_target_weights) == pytest.approx(target)
+    assert result.stock_sleeve_weight_step == pytest.approx(0.10)
+    assert result.weight_quantization_method_version == ("exhaustive-stock-sleeve-grid-v1.0.0")
+    operation = {position.symbol: position.weight for position in result.positions}
+    assert operation != pytest.approx(target)
+    assert sum(operation.values()) == pytest.approx(result.stock_exposure)
+    assert all(
+        math.isclose(
+            weight / result.stock_exposure * 10, round(weight / result.stock_exposure * 10)
+        )
+        for weight in operation.values()
+    )
+
+
+def test_direct_operational_evaluation_never_calls_quantizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidates = _candidate_set(4)
+    operation = {
+        candidates[0].symbol: 0.24,
+        candidates[1].symbol: 0.24,
+        candidates[2].symbol: 0.16,
+        candidates[3].symbol: 0.16,
+    }
+
+    def fail_if_called(*args: object, **kwargs: object) -> tuple[float, ...]:
+        raise AssertionError("operational evaluation must not quantize")
+
+    monkeypatch.setattr(
+        "ashare_lab.analytics.adaptive_portfolio.quantize_stock_sleeve_weights",
+        fail_if_called,
+    )
+    result = evaluate_operational_adaptive_portfolio(
+        candidates,
+        operation,
+        budget=_lax_budget(),
+    )
+
+    assert {position.symbol: position.weight for position in result.positions} == pytest.approx(
+        operation
+    )
+    assert dict(result.exact_target_weights) == pytest.approx(operation)
+    assert "without quantization" in result.method
+    assert result.weight_quantization_method_version == (
+        "direct-operational-stock-sleeve-validation-v1.0.0"
+    )
+
+
+def test_direct_and_continuous_evaluators_recompute_identical_metrics_for_same_grid() -> None:
+    candidates = _candidate_set(4)
+    operation = {
+        candidates[0].symbol: 0.24,
+        candidates[1].symbol: 0.24,
+        candidates[2].symbol: 0.16,
+        candidates[3].symbol: 0.16,
+    }
+    budget = _lax_budget(holding_period_cost_rate=0.001)
+
+    continuous = evaluate_adaptive_portfolio(candidates, operation, budget=budget)
+    direct = evaluate_operational_adaptive_portfolio(candidates, operation, budget=budget)
+
+    for direct_position, continuous_position in zip(
+        direct.positions, continuous.positions, strict=True
+    ):
+        assert direct_position.symbol == continuous_position.symbol
+        assert direct_position.industry == continuous_position.industry
+        assert direct_position.signal_score == continuous_position.signal_score
+        assert direct_position.weight == pytest.approx(continuous_position.weight)
+        assert direct_position.annual_downside_volatility == pytest.approx(
+            continuous_position.annual_downside_volatility
+        )
+        assert direct_position.downside_risk_contribution == pytest.approx(
+            continuous_position.downside_risk_contribution
+        )
+    assert dict(direct.industry_weights) == pytest.approx(dict(continuous.industry_weights))
+    for field in fields(direct.metrics):
+        direct_value = getattr(direct.metrics, field.name)
+        continuous_value = getattr(continuous.metrics, field.name)
+        if isinstance(direct_value, float):
+            assert direct_value == pytest.approx(continuous_value)
+        else:
+            assert direct_value == continuous_value
+    assert direct.risk_budget == continuous.risk_budget
+    assert direct.method != continuous.method
+
+
+@pytest.mark.parametrize(
+    ("count", "accepted_sleeve", "rejected_sleeve"),
+    (
+        (3, (0.50, 0.30, 0.20), (0.60, 0.20, 0.20)),
+        (4, (0.40, 0.20, 0.20, 0.20), (0.50, 0.20, 0.20, 0.10)),
+        (5, (0.30, 0.20, 0.20, 0.20, 0.10), (0.40, 0.20, 0.20, 0.10, 0.10)),
+    ),
+)
+def test_direct_operational_grid_enforces_count_specific_boundaries(
+    count: int,
+    accepted_sleeve: tuple[float, ...],
+    rejected_sleeve: tuple[float, ...],
+) -> None:
+    candidates = _candidate_set(count)
+    exposure = {3: 0.70, 4: 0.80, 5: 0.85}[count]
+    accepted = {
+        candidate.symbol: exposure * sleeve
+        for candidate, sleeve in zip(candidates, accepted_sleeve, strict=True)
+    }
+    rejected = {
+        candidate.symbol: exposure * sleeve
+        for candidate, sleeve in zip(candidates, rejected_sleeve, strict=True)
+    }
+
+    result = evaluate_operational_adaptive_portfolio(
+        candidates,
+        accepted,
+        budget=_lax_budget(),
+    )
+    assert [position.weight / exposure for position in result.positions] == pytest.approx(
+        accepted_sleeve
+    )
+    with pytest.raises(AdaptivePortfolioDataError, match="operational sleeve weight must be in"):
+        evaluate_operational_adaptive_portfolio(candidates, rejected, budget=_lax_budget())
+
+
+def test_direct_operational_grid_rejects_non_grid_and_wrong_exposure() -> None:
+    candidates = _candidate_set(4)
+
+    with pytest.raises(AdaptivePortfolioDataError, match="exact 10% increments"):
+        evaluate_operational_adaptive_portfolio(
+            candidates,
+            {candidate.symbol: 0.20 for candidate in candidates},
+            budget=_lax_budget(),
+        )
+    with pytest.raises(AdaptivePortfolioDataError, match="must sum to exposure"):
+        evaluate_operational_adaptive_portfolio(
+            candidates,
+            {candidate.symbol: 0.16 for candidate in candidates},
+            budget=_lax_budget(),
+        )
+
+
+def test_direct_operational_grid_enforces_total_account_industry_cap_at_boundary() -> None:
+    candidates = _candidate_set(4, industries=("科技", "科技", "金融", "消费"))
+    at_cap = dict(
+        zip(
+            (candidate.symbol for candidate in candidates),
+            (0.24, 0.16, 0.24, 0.16),
+            strict=True,
+        )
+    )
+    above_cap = dict(
+        zip(
+            (candidate.symbol for candidate in candidates),
+            (0.24, 0.24, 0.16, 0.16),
+            strict=True,
+        )
+    )
+
+    result = evaluate_operational_adaptive_portfolio(candidates, at_cap, budget=_lax_budget())
+    assert dict(result.industry_weights)["科技"] == pytest.approx(0.40)
+    with pytest.raises(AdaptivePortfolioDataError, match="industry cap"):
+        evaluate_operational_adaptive_portfolio(candidates, above_cap, budget=_lax_budget())
+
+
 def test_metrics_match_the_documented_formulas() -> None:
     candidates = _candidate_set(4, periods=260)
     weights_by_symbol = {candidate.symbol: 0.20 for candidate in candidates}
@@ -143,7 +369,9 @@ def test_metrics_match_the_documented_formulas() -> None:
     result = evaluate_adaptive_portfolio(candidates, weights_by_symbol, budget=budget)
     ordered = tuple(sorted(candidates, key=lambda item: item.symbol))
     returns = np.column_stack([item.returns.to_numpy() for item in ordered])
-    weights = np.full(4, 0.20)
+    weights = np.asarray([position.weight for position in result.positions])
+    exact_target = np.asarray([weight for _symbol, weight in result.exact_target_weights])
+    assert not np.array_equal(weights, exact_target)
     daily_portfolio = returns @ weights
 
     expected_downside_volatility = np.sqrt(
@@ -201,7 +429,7 @@ def test_cost_deduction_lowers_mean_and_lcb_one_for_one() -> None:
     )
 
 
-def test_risk_budget_reports_each_breach_instead_of_loosening_limits() -> None:
+def test_risk_budget_reports_metric_breaches_without_loosening_limits() -> None:
     candidates = _candidate_set(4)
     weights = {candidate.symbol: 0.20 for candidate in candidates}
     budget = AdaptiveRiskBudget(
@@ -210,7 +438,7 @@ def test_risk_budget_reports_each_breach_instead_of_loosening_limits() -> None:
         max_es95_5d=0.0001,
         max_down_period_correlation=-0.99,
         max_position_downside_risk_contribution=0.20,
-        industry_weight_limit=0.19,
+        industry_weight_limit=0.40,
     )
 
     result = evaluate_adaptive_portfolio(candidates, weights, budget=budget)
@@ -218,8 +446,12 @@ def test_risk_budget_reports_each_breach_instead_of_loosening_limits() -> None:
     assert not result.risk_budget.passed
     assert "annual_downside_volatility" in result.risk_budget.violations
     assert "position_downside_risk_contribution" in result.risk_budget.violations
-    assert "industry_concentration" in result.risk_budget.violations
-    assert not result.risk_budget.industry_concentration_passed
+    assert "industry_concentration" not in result.risk_budget.violations
+    assert result.risk_budget.industry_concentration_passed
+    assert [position.weight for position in result.positions] == pytest.approx(
+        (0.24, 0.24, 0.16, 0.16)
+    )
+    assert "no farther-grid risk rescue" in result.method
 
 
 def test_optimizer_is_deterministic_and_invariant_to_candidate_order() -> None:

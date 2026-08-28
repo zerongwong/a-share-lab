@@ -10,6 +10,7 @@ from pathlib import Path
 
 from ashare_lab.bootstrap import application_data_dir
 from ashare_lab.domain.errors import AShareLabError
+from ashare_lab.services.daily_update_lock import daily_update_lock
 from ashare_lab.services.run_daily_update import run_daily_update
 
 
@@ -38,10 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        report = run_daily_update(
-            csmar_root=args.csmar_root,
-            overlay_root=args.overlay_root,
-        )
+        with daily_update_lock() as acquired:
+            if not acquired:
+                print("自动数据更新未执行：另一个收盘数据更新正在运行。", file=sys.stderr)
+                return 75
+            report = run_daily_update(
+                csmar_root=args.csmar_root,
+                overlay_root=args.overlay_root,
+            )
     except (AShareLabError, ValueError) as exc:
         print(f"自动数据更新未完成：{exc}", file=sys.stderr)
         return 2

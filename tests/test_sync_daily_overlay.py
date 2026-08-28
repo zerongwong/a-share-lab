@@ -96,6 +96,9 @@ class FakeDailyIncrementProvider:
             trace_ids=(f"trace-{target_date.isoformat()}",),
             provider=self.provider,
             cutoff_timestamp=cutoff_timestamp or 1_777_777_777,
+            unit_contract_version="test-contract-v1",
+            unit_resolution_method_version="test-batch-price-band-v1",
+            amount_multiplier_to_cny="1",
         )
 
 
@@ -133,6 +136,10 @@ def test_protocol_and_range_add_25_and_26_after_24_baseline(tmp_path: Path) -> N
     receipt = json.loads(str(manifest.iloc[-1]["receipt_json"]))
     assert receipt["stocks"]["asset_kind"] == "stocks"
     assert receipt["indices"]["asset_kind"] == "indices"
+    assert receipt["stocks"]["unit_contract_version"] == "test-contract-v1"
+    assert receipt["stocks"]["unit_resolution_method_version"] == ("test-batch-price-band-v1")
+    assert receipt["stocks"]["amount_multiplier_to_cny"] == "1"
+    assert receipt["indices"]["amount_multiplier_to_cny"] == "1"
     assert [pd.Timestamp(value).date() for value in manifest["trade_date"]] == [
         DAY_25,
         DAY_26,
@@ -169,6 +176,41 @@ def test_partial_index_fetch_failure_is_quarantined_and_cutoff_does_not_advance(
     quarantine = Path(result.quarantine_path)
     assert (quarantine / "stocks.parquet").is_file()
     assert not (quarantine / "indices.parquet").exists()
+    assert store.read_verified_manifest().empty
+
+
+def test_stock_and_index_unit_audit_mismatch_is_quarantined(tmp_path: Path) -> None:
+    class MismatchedUnitProvider(FakeDailyIncrementProvider):
+        def fetch_daily_increment(self, *args, **kwargs):
+            batch = super().fetch_daily_increment(*args, **kwargs)
+            if kwargs.get("asset_kind") != "indices":
+                return batch
+            return DailyIncrementBatch(
+                frame=batch.frame,
+                target_date=batch.target_date,
+                requested_symbols=batch.requested_symbols,
+                received_symbols=batch.received_symbols,
+                fetched_at=batch.fetched_at,
+                trace_ids=batch.trace_ids,
+                provider=batch.provider,
+                cutoff_timestamp=batch.cutoff_timestamp,
+                unit_contract_version=batch.unit_contract_version,
+                unit_resolution_method_version=batch.unit_resolution_method_version,
+                amount_multiplier_to_cny="100",
+            )
+
+    store = MarketOverlayStore(tmp_path / "overlay")
+    result = sync_daily_overlay(
+        MismatchedUnitProvider(),
+        store,
+        target_date=DAY_25,
+        previous_trade_date=BASELINE,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert result.status is DailyOverlaySyncStatus.FAILED
+    assert "unit audit metadata do not match" in result.reason
     assert store.read_verified_manifest().empty
 
 

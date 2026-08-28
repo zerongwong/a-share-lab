@@ -24,8 +24,11 @@ _FLASH_KEY = "notification_settings_flash"
 
 def _test_message(channel: str) -> NotificationMessage:
     return NotificationMessage(
-        title="A股研究室通知测试成功",
-        body=(f"{channel}通道已经连接。本消息只验证通知，不包含股票建议，也不会触发任何交易。"),
+        title="A股研究室通知受理测试",
+        body=(
+            f"{channel}服务商已受理本次测试请求；这不等于终端已经送达。"
+            "本消息不包含股票建议，也不会触发任何交易。"
+        ),
         urgency=NotificationUrgency.NORMAL,
     )
 
@@ -99,8 +102,8 @@ def render() -> None:
     _show_flash()
 
     st.info(
-        "本页当前只负责保存凭据和发送测试消息。每日20:30行动单与次日08:50异常复核"
-        "将在后续定时任务完成后启用；系统不会自动下单。"
+        "本页负责保存凭据和测试服务商是否受理。测试成功不代表微信或iPhone终端已经送达；"
+        "周日至周四21:00晚报需要另行安装本机定时任务，系统不会自动下单。"
     )
 
     serverchan_configured = _configured_status(serverchan_key_is_configured)
@@ -109,6 +112,10 @@ def render() -> None:
     with st.container(border=True):
         st.subheader("Server酱 · 个人微信提醒")
         st.write("状态：" + _status_label(serverchan_configured))
+        st.caption(
+            "测试通过只表示Server酱服务商已受理，微信终端送达未确认。若微信没有收到，"
+            "请到Server酱查看推送日志，并检查微信通道的关注或绑定状态。"
+        )
         sendkey = st.text_input(
             "Server酱 Turbo SendKey或官方推送地址",
             type="password",
@@ -120,7 +127,10 @@ def render() -> None:
         if save_column.button("保存到钥匙串", key="save_serverchan", use_container_width=True):
             _run_action(lambda: _save_serverchan(sendkey), "Server酱配置已保存。")
         if test_column.button("发送微信测试", key="test_serverchan", use_container_width=True):
-            _run_action(_test_serverchan, "Server酱测试消息已发送。")
+            _run_action(
+                _test_serverchan,
+                "Server酱服务商已受理测试消息；微信终端送达未确认。",
+            )
         docs_column.link_button(
             "打开Server酱",
             "https://sct.ftqq.com/sendkey",
@@ -133,6 +143,7 @@ def render() -> None:
         st.caption(
             "在iPhone的Bark首页找到任意一张测试推送卡片，点“复制”；把复制出的完整"
             " https://api.day.app/… 地址直接粘贴到下面即可，无需自己寻找或截取Key。"
+            "Bark与Server酱彼此独立，可作为微信通道的独立兜底。"
         )
         bark_value = st.text_input(
             "Bark设备Key或官方推送地址",
@@ -145,14 +156,21 @@ def render() -> None:
         if save_column.button("保存到钥匙串", key="save_bark", use_container_width=True):
             _run_action(lambda: _save_bark(bark_value), "Bark配置已保存。")
         if test_column.button("发送iPhone测试", key="test_bark", use_container_width=True):
-            _run_action(_test_bark, "Bark测试消息已发送。")
+            _run_action(
+                _test_bark,
+                "Bark服务商已受理测试消息；iPhone终端送达未确认。",
+            )
         docs_column.link_button(
             "查看Bark说明",
             "https://github.com/Finb/Bark",
             use_container_width=True,
         )
 
-    st.warning("通知只发送衍生行动摘要。CSMAR原始数据、API凭据和完整持仓金额不会发送给第三方通道。")
+    st.info(
+        "晚报会分别尝试每个已配置通道；Server酱与Bark彼此独立，至少一个服务商受理后"
+        "才登记去重状态。服务商受理不等于终端送达确认。"
+    )
+    st.warning("通知只提交衍生行动摘要。CSMAR原始数据、API凭据和完整持仓金额不会提交给第三方通道。")
 
 
 render()

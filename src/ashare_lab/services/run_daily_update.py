@@ -33,32 +33,38 @@ from ashare_lab.services.sync_daily_overlay import (
 )
 
 CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
-SAFE_EOD_READY_TIME = time(16, 15)
+SAFE_EOD_READY_TIME = time(15, 30)
 
 # Versioned, explicit contract requested by the application owner.  Infoway's
 # public China A-share overview and batch-kline example identify ``v`` as trade
-# volume and ``vw`` as turnover value.  A deliberately synthetic calibration of
-# SYNTHETIC.SH's 2000-01-03 response uses v=123456 and vw=112345000 at prices
-# 9.00--9.20.  Turnover divided by price and v is approximately 100, confirming
-# that this response's v is lots (100 shares) while vw is already CNY.  The
+# volume and ``vw`` as turnover value.  A private, read-only account calibration
+# confirmed that historical responses use 100-share lots for ``v`` and CNY for
+# ``vw``.  No provider row or reversible raw value is retained in this source
+# repository.  The
 # adapter independently enforces
 # low * volume <= amount <= high * volume for every row.  A response that uses
 # only ``vm``, contains both fields, or violates the invariant is rejected and
 # quarantined; the code never tries another field or guesses a multiplier.
-INFOWAY_EOD_UNIT_CONTRACT_VERSION = "infoway-cn-eod-v2-2026-08-27"
+INFOWAY_EOD_UNIT_CONTRACT_VERSION = "infoway-cn-eod-v3-2026-08-27"
+INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION = "batch-price-band-v1"
 INFOWAY_EOD_UNIT_REFERENCE = (
     "Infoway official China A-Shares Data API overview and POST batch candlestick example "
     "(https://docs.infoway.io/en-docs/readme/china-a-shares-data-api; "
     "https://docs.infoway.io/en-docs/rest-api/market-data/post-candlestick), "
-    "plus a deliberately synthetic calibration: SYNTHETIC.SH 2000-01-03 v=123456, "
-    "vw=112345000, low=9.00, high=9.20; turnover/price implies v is 100-share lots "
-    "and vw is CNY; contract version infoway-cn-eod-v2-2026-08-27; runtime invariant "
+    "plus a private read-only account calibration whose raw rows are deliberately not "
+    "stored in the repository: historical v is 100-share lots and historical vw is CNY; "
+    "same-session calibration found that provisional "
+    "vw requires x100 while v remains 100-share lots; contract version "
+    "infoway-cn-eod-v3-2026-08-27; method batch-price-band-v1; runtime invariant "
     "low*volume_shares<=amount_cny<=high*volume_shares"
 )
 INFOWAY_EOD_UNIT_CONTRACT = InfowayEodUnitContract(
     volume_multiplier_to_shares=Decimal("100"),
     amount_field="vw",
     amount_multiplier_to_cny=Decimal("1"),
+    provisional_amount_multiplier_to_cny=Decimal("100"),
+    contract_version=INFOWAY_EOD_UNIT_CONTRACT_VERSION,
+    resolution_method_version=INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION,
     verified_reference=INFOWAY_EOD_UNIT_REFERENCE,
 )
 
@@ -93,6 +99,7 @@ class DailyUpdateReport:
     provider_contract_changed: bool
     current_through_latest_complete_session: bool
     unit_contract_version: str
+    unit_resolution_method_version: str
     market_scope: str
     csmar_mutated: bool
     range_report: DailyOverlayRangeReport
@@ -101,9 +108,12 @@ class DailyUpdateReport:
 def latest_complete_cn_candidate(now: datetime) -> date:
     """Return the latest calendar date that may contain a finalized CN close.
 
-    Before 16:15 Asia/Shanghai, today's accumulating quote is never treated as
-    a completed bar.  Weekends and statutory holidays are resolved later by the
-    provider's official CN trading calendar, rather than guessed here.
+    Before 15:30 Asia/Shanghai, today's accumulating quote is never treated as
+    a completed-bar candidate.  At and after 15:30 the existing trading-calendar,
+    completeness and row-quality gates still decide whether the date can advance;
+    an incomplete provider snapshot is quarantined rather than accepted.  Weekends
+    and statutory holidays are resolved later by the provider's official CN trading
+    calendar, rather than guessed here.
     """
 
     if now.tzinfo is None or now.utcoffset() is None:
@@ -240,6 +250,7 @@ def run_daily_update(
         provider_contract_changed=contract_changed,
         current_through_latest_complete_session=(common_cutoff == latest_session),
         unit_contract_version=INFOWAY_EOD_UNIT_CONTRACT_VERSION,
+        unit_resolution_method_version=INFOWAY_EOD_UNIT_RESOLUTION_METHOD_VERSION,
         market_scope="沪深A股及配置的沪深核心指数；Infoway当前清单不含北交所",
         csmar_mutated=False,
         range_report=range_report,

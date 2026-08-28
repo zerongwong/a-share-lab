@@ -1,4 +1,4 @@
-"""Point-in-time A-share market breadth regime for portfolio-level risk control."""
+"""Point-in-time A-share breadth evidence for portfolio-level risk posture."""
 
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ def assess_market_regime(
         reason = "mixed_market_participation_requires_selectivity_and_cash_reserve"
     else:
         state = MarketRegimeState.RISK_OFF
-        reason = "weak_breadth_pauses_new_four_stock_portfolio_formation"
+        reason = "weak_breadth_requires_defensive_exposure_and_stricter_entry_confirmation"
     return MarketRegimeAssessment(
         state=state,
         score=score,

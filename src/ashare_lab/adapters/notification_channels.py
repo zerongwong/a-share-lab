@@ -7,6 +7,7 @@ errors because either may contain a credential-bearing request URL.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 from urllib.parse import urlparse
@@ -55,6 +56,10 @@ class ServerChanNotificationChannel:
         self.close()
 
     def send(self, message: NotificationMessage) -> NotificationReceipt:
+        if "\n" in message.title or "\r" in message.title:
+            raise ValueError("Server酱标题不能包含换行符")
+        if len(message.title) > 32:
+            raise ValueError("Server酱标题不能超过32个字符")
         # ServerChan's documented endpoint embeds the SendKey in the request
         # path. Never log the request URL or include provider text in errors.
         try:
@@ -70,9 +75,21 @@ class ServerChanNotificationChannel:
             # leak the SendKey into logs.
             raise NotificationDeliveryError("Server酱通知发送失败，请检查网络和SendKey。") from None
 
-        if not isinstance(document, dict) or document.get("code") != 0:
+        if (
+            not isinstance(document, dict)
+            or type(document.get("code")) is not int
+            or document.get("code") != 0
+            or not isinstance(document.get("message"), str)
+        ):
             raise NotificationDeliveryError("Server酱未接受通知，请检查通道状态和额度。")
-        return NotificationReceipt(channel=self.channel_name, accepted=True)
+        # ``code == 0`` confirms provider ingestion only.  ServerChan's
+        # downstream WeChat/Bark channel may still fail after this response.
+        return NotificationReceipt(
+            channel=self.channel_name,
+            accepted=True,
+            provider_status="provider_accepted",
+            provider_receipt_id=_serverchan_receipt_id(document.get("data")),
+        )
 
 
 class BarkNotificationChannel:
@@ -125,7 +142,25 @@ class BarkNotificationChannel:
 
         if not isinstance(document, dict) or document.get("code") != 200:
             raise NotificationDeliveryError("Bark未接受通知，请检查App注册状态。")
-        return NotificationReceipt(channel=self.channel_name, accepted=True)
+        return NotificationReceipt(
+            channel=self.channel_name,
+            accepted=True,
+            provider_status="provider_accepted",
+        )
+
+
+def _serverchan_receipt_id(data: object) -> str | None:
+    """Return an irreversible identifier without retaining provider response data."""
+
+    if not isinstance(data, dict):
+        return None
+    pushid = data.get("pushid")
+    if not isinstance(pushid, (str, int)) or isinstance(pushid, bool):
+        return None
+    normalized = str(pushid).strip()
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 def normalize_bark_device_key(value: str) -> str:

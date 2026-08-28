@@ -19,6 +19,14 @@ def test_notification_page_keeps_credentials_masked_and_local() -> None:
     assert "把复制出的完整" in source
     assert "钥匙串暂时无法读取" in source
     assert "不会自动下单" in source
+    assert "Server酱服务商已受理测试消息；微信终端送达未确认" in source
+    assert "Bark服务商已受理测试消息；iPhone终端送达未确认" in source
+    assert "至少一个服务商受理后" in source
+    assert "才登记去重状态" in source
+    assert "推送日志" in source
+    assert "关注或绑定状态" in source
+    assert "独立兜底" in source
+    assert "测试消息已发送" not in source
     assert "os.environ" not in source
     assert "st.write(sendkey)" not in source
     assert "st.write(device_key)" not in source

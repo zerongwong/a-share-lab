@@ -11,7 +11,10 @@ flowchart TB
     P["Ports\n行情·财务·公告·通知"] --> A["Adapters\nCSMAR·授权行情·SQLite·Keychain"]
     A --> Q["Quality Gate\n共同截止·单位·PIT·权利范围"]
     H --> Q
-    Q --> S["Research Services\n候选硬门·组合优化·行动单"]
+    Q --> CYC["Cycle Policy\n价格周期·风险姿态"]
+    Q --> SEC["Security Screen\n主升硬门·候选排序"]
+    CYC --> S["Research Services\n行动标签·组合优化·行动单"]
+    SEC --> S
     S --> R["Immutable Research Archive"]
     S --> U["Streamlit UI"]
     S --> M["Read-only MCP"]
@@ -23,7 +26,7 @@ flowchart TB
 - `domain/`：不可变模型、状态和市场规则；
 - `ports/`：供应商无关的输入/输出契约；
 - `adapters/`：读取本地库或经授权 API，标准化后立即校验；
-- `analytics/`：纯函数指标、趋势、介入点和组合风险；
+- `analytics/`：纯函数指标、趋势、介入点、价格周期政策和组合风险；
 - `services/`：编排数据门、研究漏斗、归档和通知；
 - `ui/`：只展示服务返回的结构化结果；
 - `mcp_server.py`：只读最小工具，不返回原始授权数据；
@@ -34,8 +37,29 @@ flowchart TB
 
 ## 失败策略
 
-系统 fail closed：来源失败、截止日不一致、字段漂移、单位不明、证据时点不安全或风险
-预算失败时返回明确状态，不静默换源，也不放宽门槛凑股票。
+系统 fail closed：来源失败、截止日不一致、字段漂移、单位不明或证据时点不安全时返回
+`DATA_NOT_READY`，不静默换源。个股硬门、周期介入门或组合风险预算失败时也不放宽门槛
+凑股票，但不会把已经形成的研究候选删除：页面仍可展示 3–5 只候选，而可介入数与实际
+持仓数允许为 0。
+
+## 双层决策边界
+
+- `analytics/cycle_policy.py` 只把全市场和核心指数的同日价格证据翻译成周期标签、介入
+  严格度、下行风险预算和股票敞口上限；它不读取新闻、不评估企业、不改变个股排名；
+- `services/build_midterm_portfolio.py` 独立完成个股主升/介入结构筛选和机器排序，通常展示
+  4 只研究候选，在安全门通过的标的不足时可少于 3 只且不组成组合；
+- 服务层先对研究候选搜索 3/4/5 股风险可行组合并给出研究权重；这些权重不是当前持仓；
+- 服务层再把候选标记为 `CONDITIONAL_ENTRY`、`WAIT_CONFIRMATION` 或 `OBSERVE_ONLY`。
+  只有至少 3 只通过当前介入门，才另行搜索行动层 3/4/5 股风险可行组合；否则实际持仓
+  为 0、现金为 100%；
+- 防御周期只收紧风险姿态，不停止候选发现。缺少或错位的周期证据才是数据错误。
+
+当前代码按单个共同截止日确定性输出五个可用状态：`UPTREND_EXPANSION`
+（中期上行｜短线增强）、`UPTREND_PULLBACK`（中期上行｜短线回撤或分化）、
+`TRANSITION_RECOVERY`（中期过渡｜复苏尝试或证据混合）、`DOWNTREND_REPAIR`
+（中期下行｜短线修复反弹）和 `DOWNTREND_PRESSURE`（中期下行｜短线压力）；
+`UNAVAILABLE` 表示价格周期数据不可用。当前没有跨日状态持久化或迟滞，也不是完整的
+霍华德·马克斯经济、信贷、估值与心理周期模型。
 
 ## 每日收盘增量
 
@@ -55,4 +79,4 @@ flowchart TB
 - 本地网页：面向非技术用户的主入口；
 - MCP：供 ChatGPT/Codex 在本机只读调用；
 - 通知：只发行动摘要，任何通道失败都不改变研究结论；
-- 本项目没有券商下单端口。
+- 本项目没有券商下单端口，不会自动交易。

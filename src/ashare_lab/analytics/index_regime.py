@@ -1,8 +1,9 @@
-"""Deterministic core-index confirmation for portfolio-level risk control.
+"""Deterministic core-index evidence for portfolio-level risk posture.
 
 This module deliberately produces no security-level factor.  Its result is a
-portfolio formation gate built from multiple core A-share indices observed on
-one common cutoff and one common recent-session calendar.
+cycle input built from multiple core A-share indices observed on one common
+cutoff and one common recent-session calendar.  Risk-off tightens exposure and
+entry confirmation; it does not suppress an otherwise valid stock screen.
 """
 
 from __future__ import annotations
@@ -329,7 +330,7 @@ def assess_index_regime(
     )
     if stressed or score < 0.34:
         state = IndexRegimeState.RISK_OFF
-        reason = "core_index_trend_or_downside_risk_pauses_new_portfolio_formation"
+        reason = "core_index_trend_or_downside_risk_requires_defensive_posture"
     elif confirmed:
         state = IndexRegimeState.RISK_ON
         reason = "multiple_core_indices_confirm_trend_with_controlled_volatility_and_drawdown"

@@ -16,9 +16,10 @@ from ashare_lab.services.build_weekly_portfolios import (
 )
 from ashare_lab.services.load_csmar_universe import load_csmar_universe
 
-HOLDING_PERIOD_OPTIONS = (1, 4, 13, 26, 52)
+HOLDING_PERIOD_OPTIONS = (1, 2, 4, 13, 26, 52)
 HOLDING_PERIOD_LABELS = {
     1: "1周（入场节奏）",
+    2: "2周（短中期确认）",
     4: "1个月（核心持有）",
     13: "3个月（默认核心）",
     26: "6个月（长期验证）",
@@ -26,6 +27,7 @@ HOLDING_PERIOD_LABELS = {
 }
 HOLDING_PERIOD_GUIDANCE = {
     1: "1周仅用于观察入场节奏和结构确认，不把它当作日内或高频策略。",
+    2: "2周用于确认10个交易日的短期强度是否得到1个月趋势支持，不追逐5日急涨。",
     4: "1个月属于核心持有区间，重点观察趋势延续与风险失效条件。",
     13: "3个月是默认核心周期，组合以中线趋势、分散和回撤控制为主。",
     26: "6个月用于检验中长期趋势是否持续，期间仍按风险触发条件复核。",
@@ -86,7 +88,7 @@ with st.form("weekly-portfolio-form"):
     holding_weeks = st.selectbox(
         "研究与计划持有周期",
         options=HOLDING_PERIOD_OPTIONS,
-        index=2,
+        index=3,
         format_func=_holding_period_label,
     )
     st.info(HOLDING_PERIOD_GUIDANCE[holding_weeks])

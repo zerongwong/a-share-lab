@@ -152,6 +152,7 @@ def sync_daily_overlay(
             source_id=source_id,
             asset_kind="indices",
         )
+        _validate_unit_audit_pair(stock_batch, index_batch)
         core_normalized = _normalize_configured_symbols(core_requested)
         actual_indices = set(indices["symbol"])
         missing_indices = set(core_normalized) - actual_indices
@@ -361,7 +362,7 @@ def _validate_batch(
 
 
 def _batch_receipt(batch: DailyIncrementBatch, *, asset_kind: AssetKind) -> dict[str, Any]:
-    return {
+    receipt = {
         "asset_kind": asset_kind,
         "provider": str(batch.provider),
         "target_date": batch.target_date,
@@ -372,6 +373,34 @@ def _batch_receipt(batch: DailyIncrementBatch, *, asset_kind: AssetKind) -> dict
         "trace_ids": tuple(batch.trace_ids),
         "cutoff_timestamp": int(batch.cutoff_timestamp),
     }
+    for field in (
+        "unit_contract_version",
+        "unit_resolution_method_version",
+        "amount_multiplier_to_cny",
+    ):
+        value = str(getattr(batch, field, "") or "").strip()
+        if value:
+            receipt[field] = value
+    return receipt
+
+
+def _validate_unit_audit_pair(
+    stock_batch: DailyIncrementBatch,
+    index_batch: DailyIncrementBatch,
+) -> None:
+    fields = (
+        "unit_contract_version",
+        "unit_resolution_method_version",
+        "amount_multiplier_to_cny",
+    )
+    stocks = tuple(str(getattr(stock_batch, field, "") or "").strip() for field in fields)
+    indices = tuple(str(getattr(index_batch, field, "") or "").strip() for field in fields)
+    if not any(stocks) and not any(indices):
+        return
+    if not all(stocks) or not all(indices):
+        raise DataQualityError("daily increment unit audit metadata is incomplete")
+    if stocks != indices:
+        raise DataQualityError("stock and index unit audit metadata do not match")
 
 
 def _normalize_configured_symbols(values: Sequence[str]) -> tuple[str, ...]:
