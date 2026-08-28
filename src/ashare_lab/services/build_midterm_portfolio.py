@@ -30,6 +30,10 @@ import numpy as np
 import pandas as pd
 
 from ashare_lab.analytics.adaptive_portfolio import (
+    FIVE_DAY_SESSIONS,
+    MINIMUM_FIVE_DAY_SAMPLES,
+    MINIMUM_ROLLING_DRAWDOWN_WINDOWS,
+    ROLLING_DRAWDOWN_SESSIONS,
     AdaptiveCandidate,
     AdaptivePortfolioDataError,
     AdaptivePortfolioEvaluation,
@@ -59,13 +63,25 @@ from ashare_lab.analytics.market_regime import (
     MarketRegimeState,
     assess_market_regime,
 )
+from ashare_lab.analytics.medium_term_stage import assess_medium_term_stage
+from ashare_lab.analytics.multi_timeframe import (
+    MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
+    MULTI_TIMEFRAME_METHOD_VERSION,
+    ExecutionState,
+    MultiTimeframeAssessment,
+    MultiTimeframeDataError,
+    StructureState,
+    assess_multi_timeframe,
+    horizon_contract,
+)
 
 RESEARCH_DISCLAIMER = (
     "本结果是共同截止日历史数据上的确定性研究筛选。持有期收益下界尚未经过严格的"
     "point-in-time walk-forward、费用、滑点和不可成交验证，不是未来收益预测、上涨概率、"
     "投资建议或最大回撤保证。"
 )
-MIDTERM_METHOD_VERSION = "midterm-maintrend-v0.6.0"
+MIDTERM_METHOD_VERSION = "midterm-maintrend-multitimeframe-v0.7.0"
+CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS = "partial_multiframe"
 
 
 class MidtermPortfolioStatus(StrEnum):
@@ -84,7 +100,7 @@ class CandidateAction(StrEnum):
 
 
 class ConditionalEntryPlanKind(StrEnum):
-    """One-week conditional entry level; never an unconditional buy price."""
+    """Horizon-aware daily execution level; never an unconditional buy price."""
 
     HEALTHY_PULLBACK = "healthy_pullback_range"
     RECLAIM = "reclaim_close_confirmation"
@@ -93,7 +109,7 @@ class ConditionalEntryPlanKind(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ConditionalEntryPlan:
-    """Structured one-week price plan generated at the common cutoff.
+    """Structured horizon-aware daily execution plan at the common cutoff.
 
     The containing field determines its role.  ``price_observation_plan`` is
     diagnostic only, while ``conditional_entry_plan`` additionally requires
@@ -108,6 +124,19 @@ class ConditionalEntryPlan:
     price_high: float | None = None
     trigger_price: float | None = None
     confirmation_rule: str | None = None
+    structure_timeframe: str | None = None
+    structure_cutoff: pd.Timestamp | None = None
+    execution_lookback_sessions: int | None = None
+    method_version: str = MULTI_TIMEFRAME_METHOD_VERSION
+    price_source_timeframe: str | None = None
+    primary_structure_timeframe: str | None = None
+    primary_structure_cutoff: pd.Timestamp | None = None
+    invalidation_price: float | None = None
+    reduction_review_price: float | None = None
+    entry_reference_price: float | None = None
+    primary_structure_reference_price: float | None = None
+    invalidation_source_timeframe: str | None = None
+    reduction_review_source_timeframe: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +158,15 @@ class MidtermCandidate:
     relative_strength_percentile: float
     downside_capture_ratio: float | None
     ma20_above_ma60: bool
+    timeframe: MultiTimeframeAssessment
+    horizon_absolute_return: float
+    relative_strength_sessions: int
+    # Appended for positional compatibility.  Structural qualification and
+    # deep-history risk eligibility are deliberately separate states.
+    risk_history_available: bool = True
+    risk_history_reasons: tuple[str, ...] = ()
+    risk_history_available_returns: int | None = None
+    risk_history_required_returns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,8 +177,8 @@ class MidtermResearchCandidate:
     industry: str
     signal_score: float
     entry_pattern: EntryPattern
-    breakout_line: float
-    days_since_breakout: int
+    breakout_line: float | None
+    days_since_breakout: int | None
     action: CandidateAction
     action_reasons: tuple[str, ...]
     absolute_return_60: float
@@ -154,6 +192,13 @@ class MidtermResearchCandidate:
     conditional_entry_plan: ConditionalEntryPlan | None = None
     observation_stock_sleeve_weight: float | None = None
     price_observation_plan: ConditionalEntryPlan | None = None
+    timeframe: MultiTimeframeAssessment | None = None
+    horizon_absolute_return: float | None = None
+    relative_strength_sessions: int | None = None
+    risk_history_available: bool = True
+    risk_history_reasons: tuple[str, ...] = ()
+    risk_history_available_returns: int | None = None
+    risk_history_required_returns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +219,9 @@ class MidtermSelectedPosition:
     operational_stock_sleeve_weight: float | None = None
     conditional_entry_plan: ConditionalEntryPlan | None = None
     price_observation_plan: ConditionalEntryPlan | None = None
+    timeframe: MultiTimeframeAssessment | None = None
+    horizon_absolute_return: float | None = None
+    relative_strength_sessions: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +256,30 @@ class MidtermPortfolioResult:
     action_evaluated_portfolio_count: int = 0
     observation_evaluation: AdaptivePortfolioEvaluation | None = None
     observation_rejection_reasons: tuple[str, ...] = ()
+    multi_timeframe_method_version: str = MULTI_TIMEFRAME_METHOD_VERSION
+    horizon_candidate_count: int = 0
+    risk_history_eligible_candidate_count: int = 0
+    risk_history_ineligible_candidate_count: int = 0
+    # Repository-level truth is separate from the analytics component marker.
+    # The central contract remains partial until the immutable six-horizon
+    # archive, official-calendar boundaries and validation path are complete.
+    central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateInput:
+    symbol: str
+    name: str
+    industry: str
+    entry: EntryReadinessAssessment
+    timeframe: MultiTimeframeAssessment
+    returns: pd.Series
+    evidence_unknown: tuple[str, ...]
+    risk_history_available: bool
+    risk_history_reasons: tuple[str, ...]
+    risk_history_available_returns: int
+    risk_history_required_returns: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,18 +292,6 @@ class _RejectedPortfolioEvaluation:
     normalized_overrun: float
 
 
-_MOMENTUM_WEIGHTS: dict[int, tuple[tuple[int, float], ...]] = {
-    1: ((5, 0.50), (20, 0.30), (60, 0.20)),
-    # Two weeks deliberately avoids five-session chase.  Ten-day momentum leads
-    # at 50%, while 20-day confirmation and a modest 60-day trend anchor retain
-    # 30% and 20% so one fresh move cannot erase the short/medium-term context.
-    2: ((10, 0.50), (20, 0.30), (60, 0.20)),
-    4: ((20, 0.50), (60, 0.35), (120, 0.15)),
-    13: ((20, 0.20), (60, 0.50), (120, 0.30)),
-    26: ((20, 0.10), (60, 0.35), (120, 0.55)),
-    52: ((20, 0.10), (60, 0.25), (120, 0.65)),
-}
-
 # One shared trading-session convention for the main strategy.  Month/quarter/
 # half-year/year horizons follow the research contract rather than multiplying
 # calendar weeks by five and silently turning 13 weeks into 65 sessions.
@@ -243,6 +303,52 @@ HOLDING_PERIOD_SESSIONS: dict[int, int] = {
     26: 120,
     52: 252,
 }
+
+_HORIZON_PLAN_LABELS: dict[int, str] = {
+    1: "一周",
+    2: "两周",
+    4: "一个月",
+    13: "三个月",
+    26: "六个月",
+    52: "一年",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonHistoryRequirements:
+    """Separate full-market qualification from finalist risk history depth."""
+
+    holding_weeks: int
+    holding_period_sessions: int
+    qualification_minimum_sessions: int
+    risk_minimum_price_sessions: int
+    history_read_sessions: int
+
+
+def horizon_history_requirements(holding_weeks: int) -> HorizonHistoryRequirements:
+    """Return one central, no-lookahead history contract for a holding horizon.
+
+    Qualification uses only the selected multi-timeframe core plus a 252-price
+    baseline.  Eight non-overlapping holding samples remain mandatory for the
+    downstream LCB/risk engine, while a 70-session read buffer absorbs calendar
+    and alignment differences without treating that deeper history as a
+    full-market coverage gate.
+    """
+
+    if holding_weeks not in HOLDING_PERIOD_SESSIONS:
+        raise ValueError("holding_weeks must be one of 1, 2, 4, 13, 26 or 52")
+    holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
+    contract = horizon_contract(holding_weeks)
+    qualification = max(252, contract.minimum_daily_sessions)
+    risk_minimum = max(qualification, holding_sessions * 8 + 1)
+    history_read = max(qualification + 70, holding_sessions * 8 + 71)
+    return HorizonHistoryRequirements(
+        holding_weeks=holding_weeks,
+        holding_period_sessions=holding_sessions,
+        qualification_minimum_sessions=qualification,
+        risk_minimum_price_sessions=risk_minimum,
+        history_read_sessions=history_read,
+    )
 
 
 def build_midterm_portfolio(
@@ -268,7 +374,7 @@ def build_midterm_portfolio(
     never translated into a neutral score.
     """
 
-    if holding_weeks not in _MOMENTUM_WEIGHTS:
+    if holding_weeks not in HOLDING_PERIOD_SESSIONS:
         raise ValueError("holding_weeks must be one of 1, 2, 4, 13, 26 or 52")
     if candidate_pool_size < 5:
         raise ValueError("candidate_pool_size must be at least five")
@@ -362,8 +468,14 @@ def build_midterm_portfolio(
             reasons=("price_cycle_evidence_unavailable",),
         )
 
-    raw_candidates: list[tuple[str, str, str, EntryReadinessAssessment, pd.Series, tuple[str, ...]]]
-    raw_candidates = []
+    contract = horizon_contract(holding_weeks)
+    holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
+    budget = _resolve_risk_budget(
+        price_cycle,
+        risk_budget,
+        holding_sessions=holding_sessions,
+    )
+    raw_candidates: list[_CandidateInput] = []
     exclusions: list[CandidateExclusion] = []
     for symbol, frame in sorted(normalized_histories.items()):
         item = normalized_metadata.get(symbol)
@@ -376,37 +488,75 @@ def build_midterm_portfolio(
             exclusions.append(CandidateExclusion(symbol, hard_reasons))
             continue
         assert item is not None
-        entry = assess_entry_readiness(frame, as_of=cutoff)
-        if not entry.ready:
-            exclusions.append(CandidateExclusion(symbol, entry.reasons))
+        try:
+            timeframe = assess_multi_timeframe(
+                frame,
+                as_of=cutoff,
+                holding_weeks=holding_weeks,
+            )
+        except MultiTimeframeDataError as exc:
+            exclusions.append(CandidateExclusion(symbol, (f"multi_timeframe_data:{exc}",)))
             continue
         try:
             returns = _returns_at_cutoff(frame, cutoff)
         except ValueError as exc:
             exclusions.append(CandidateExclusion(symbol, (f"invalid_returns:{exc}",)))
             continue
+        try:
+            stage = assess_medium_term_stage((1.0 + returns).cumprod())
+        except (TypeError, ValueError):
+            exclusions.append(CandidateExclusion(symbol, ("late_stage_guard_unavailable",)))
+            continue
+        if stage.hard_freeze_new_entry:
+            exclusions.append(
+                CandidateExclusion(
+                    symbol,
+                    ("late_stage_acceleration_hard_freeze", *stage.reasons),
+                )
+            )
+            continue
+        if not timeframe.candidate_qualified:
+            exclusions.append(
+                CandidateExclusion(
+                    symbol,
+                    _multi_timeframe_exclusion_reasons(timeframe),
+                )
+            )
+            continue
+        risk_history_required_returns = _required_holding_risk_return_observations(budget)
+        risk_history_reasons = _holding_risk_history_exclusion_reasons(returns, budget)
+        # Retained only as a legacy audit record.  It no longer controls
+        # candidate membership or action permission; those are owned by the
+        # selected horizon's multi-timeframe execution contract below.
+        entry = assess_entry_readiness(frame, as_of=cutoff)
         unknown = _unknown_evidence(item)
         raw_candidates.append(
-            (
-                symbol,
-                str(item.get("name", symbol)).strip() or symbol,
-                str(item.get("industry", "")).strip(),
-                entry,
-                returns,
-                unknown,
+            _CandidateInput(
+                symbol=symbol,
+                name=str(item.get("name", symbol)).strip() or symbol,
+                industry=str(item.get("industry", "")).strip(),
+                entry=entry,
+                timeframe=timeframe,
+                returns=returns,
+                evidence_unknown=unknown,
+                risk_history_available=not risk_history_reasons,
+                risk_history_reasons=risk_history_reasons,
+                risk_history_available_returns=len(returns),
+                risk_history_required_returns=risk_history_required_returns,
             )
         )
 
     benchmark_returns = _core_index_benchmark_returns(market_index_histories, cutoff)
-    relative_strength_60 = _full_universe_relative_strength_60(
+    relative_strength = _full_universe_relative_strength(
         normalized_histories,
         cutoff,
+        sessions=contract.relative_strength_sessions,
     )
     candidates = (
         _rank_candidates(
             raw_candidates,
             holding_weeks,
-            relative_strength_60,
+            relative_strength,
             benchmark_returns,
         )
         if raw_candidates
@@ -415,9 +565,19 @@ def build_midterm_portfolio(
     candidate_actions = {
         candidate.symbol: _candidate_action(candidate, price_cycle) for candidate in candidates
     }
+    horizon_candidate_count = len(candidates)
+    risk_eligible_candidates = [
+        candidate for candidate in candidates if candidate.risk_history_available
+    ]
+    risk_history_eligible_candidate_count = len(risk_eligible_candidates)
+    risk_history_ineligible_candidate_count = (
+        horizon_candidate_count - risk_history_eligible_candidate_count
+    )
+    daily_entry_ready_count = sum(candidate.timeframe.execution_ready for candidate in candidates)
     research_candidates = _build_research_shortlist(
         candidates,
         candidate_actions,
+        holding_weeks=holding_weeks,
         histories=normalized_histories,
         cutoff=cutoff,
     )
@@ -428,7 +588,10 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
-            entry_ready_count=len(candidates),
+            entry_ready_count=daily_entry_ready_count,
+            horizon_candidate_count=horizon_candidate_count,
+            risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
+            risk_history_ineligible_candidate_count=risk_history_ineligible_candidate_count,
             actionable_candidate_count=sum(
                 action is CandidateAction.CONDITIONAL_ENTRY
                 for action, _reasons in candidate_actions.values()
@@ -437,21 +600,39 @@ def build_midterm_portfolio(
             market_regime=market_regime,
             index_regime=index_regime,
             price_cycle=price_cycle,
-            reasons=(f"only_{len(candidates)}_entry_ready_candidates;minimum_three",),
+            reasons=(f"only_{len(candidates)}_horizon_candidates;minimum_three",),
         )
 
-    holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
-    budget = _resolve_risk_budget(
-        price_cycle,
-        risk_budget,
-        holding_sessions=holding_sessions,
-    )
+    if len(risk_eligible_candidates) < 3:
+        return MidtermPortfolioResult(
+            status=MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO,
+            data_cutoff=cutoff,
+            holding_weeks=holding_weeks,
+            research_candidates=research_candidates,
+            entry_ready_count=daily_entry_ready_count,
+            horizon_candidate_count=horizon_candidate_count,
+            risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
+            risk_history_ineligible_candidate_count=risk_history_ineligible_candidate_count,
+            actionable_candidate_count=0,
+            exclusions=tuple(exclusions),
+            market_regime=market_regime,
+            index_regime=index_regime,
+            price_cycle=price_cycle,
+            reasons=(
+                f"only_{risk_history_eligible_candidate_count}_risk_history_eligible_candidates;"
+                "minimum_three",
+            ),
+            warnings=(
+                "结构候选已经生成，但具备完整持有期风险与LCB历史的股票不足3只；"
+                "历史不足者仅保留研究观察，不进入组合搜索或权重计算。",
+            ),
+        )
 
     # Research-set optimisation is independent from current deployment
     # permission.  This lets a defensive market or incomplete review evidence
     # retain a diversified, risk-evaluated 3--5-name research set while the
     # action layer correctly stays at 100% cash.
-    research_pool = candidates[:candidate_pool_size]
+    research_pool = risk_eligible_candidates[:candidate_pool_size]
     research_viable, research_rejected, research_evaluated = _search_candidate_portfolios(
         research_pool,
         budget=budget,
@@ -468,6 +649,7 @@ def build_midterm_portfolio(
         research_candidates = _build_research_shortlist(
             candidates,
             candidate_actions,
+            holding_weeks=holding_weeks,
             histories=normalized_histories,
             cutoff=cutoff,
             preferred_symbols=tuple(
@@ -486,6 +668,7 @@ def build_midterm_portfolio(
         research_candidates = _build_research_shortlist(
             candidates,
             candidate_actions,
+            holding_weeks=holding_weeks,
             histories=normalized_histories,
             cutoff=cutoff,
             preferred_symbols=tuple(
@@ -500,7 +683,7 @@ def build_midterm_portfolio(
 
     actionable_candidates = [
         candidate
-        for candidate in candidates
+        for candidate in risk_eligible_candidates
         if candidate_actions[candidate.symbol][0] is CandidateAction.CONDITIONAL_ENTRY
     ]
     search_pool = actionable_candidates[:candidate_pool_size]
@@ -517,7 +700,10 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
-            entry_ready_count=len(candidates),
+            entry_ready_count=daily_entry_ready_count,
+            horizon_candidate_count=horizon_candidate_count,
+            risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
+            risk_history_ineligible_candidate_count=risk_history_ineligible_candidate_count,
             actionable_candidate_count=len(actionable_candidates),
             search_pool_count=len(search_pool),
             evaluated_portfolio_count=research_evaluated,
@@ -557,7 +743,10 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
-            entry_ready_count=len(candidates),
+            entry_ready_count=daily_entry_ready_count,
+            horizon_candidate_count=horizon_candidate_count,
+            risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
+            risk_history_ineligible_candidate_count=risk_history_ineligible_candidate_count,
             actionable_candidate_count=len(actionable_candidates),
             search_pool_count=len(search_pool),
             evaluated_portfolio_count=research_evaluated,
@@ -592,6 +781,7 @@ def build_midterm_portfolio(
     research_candidates = _build_research_shortlist(
         candidates,
         candidate_actions,
+        holding_weeks=holding_weeks,
         histories=normalized_histories,
         cutoff=cutoff,
         preferred_symbols=tuple(position.symbol for position in ordered_positions),
@@ -611,9 +801,14 @@ def build_midterm_portfolio(
             industry=position.industry,
             weight=exact_target_by_symbol[position.symbol],
             signal_score=position.signal_score,
-            entry_pattern=selected_by_symbol[position.symbol].entry.pattern,
-            breakout_line=float(selected_by_symbol[position.symbol].entry.breakout_line),
-            days_since_breakout=int(selected_by_symbol[position.symbol].entry.days_since_breakout),
+            entry_pattern=_observation_entry_pattern(selected_by_symbol[position.symbol]),
+            breakout_line=float(
+                selected_by_symbol[position.symbol].timeframe.structure.breakout_line
+            ),
+            days_since_breakout=int(
+                selected_by_symbol[position.symbol].timeframe.structure.days_or_bars_since_breakout
+                or 0
+            ),
             annual_downside_volatility=position.annual_downside_volatility,
             downside_risk_contribution=position.downside_risk_contribution,
             evidence_unknown=selected_by_symbol[position.symbol].evidence_unknown,
@@ -621,6 +816,11 @@ def build_midterm_portfolio(
             operational_stock_sleeve_weight=position.weight / best.stock_exposure,
             conditional_entry_plan=entry_plan_by_symbol.get(position.symbol),
             price_observation_plan=price_observation_plan_by_symbol.get(position.symbol),
+            timeframe=selected_by_symbol[position.symbol].timeframe,
+            horizon_absolute_return=selected_by_symbol[position.symbol].horizon_absolute_return,
+            relative_strength_sessions=selected_by_symbol[
+                position.symbol
+            ].relative_strength_sessions,
         )
         for rank, position in enumerate(ordered_positions, start=1)
     )
@@ -662,7 +862,10 @@ def build_midterm_portfolio(
         cash_weight=best.cash_weight,
         borrowed_weight=0.0,
         evaluation=best,
-        entry_ready_count=len(candidates),
+        entry_ready_count=daily_entry_ready_count,
+        horizon_candidate_count=horizon_candidate_count,
+        risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
+        risk_history_ineligible_candidate_count=risk_history_ineligible_candidate_count,
         actionable_candidate_count=len(actionable_candidates),
         search_pool_count=len(search_pool),
         evaluated_portfolio_count=research_evaluated,
@@ -690,6 +893,16 @@ def _normalize_cutoff(value: object) -> pd.Timestamp | None:
     if cutoff.tz is not None:
         cutoff = cutoff.tz_localize(None)
     return cutoff.normalize()
+
+
+def _finite_optional(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result > 0.0 else None
 
 
 def _normalize_mapping(values: Mapping[str, Any], label: str) -> dict[str, Any]:
@@ -772,6 +985,26 @@ def _unknown_evidence(item: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(unknown)
 
 
+def _multi_timeframe_exclusion_reasons(
+    assessment: MultiTimeframeAssessment,
+) -> tuple[str, ...]:
+    """Return compact, horizon-specific hard-gate reasons for audit output."""
+
+    reasons: list[str] = [
+        f"horizon_{assessment.holding_weeks}_week_structure_not_qualified",
+        f"slow_{assessment.slow_direction.timeframe.value}:"
+        f"{assessment.slow_direction.direction.value}",
+        f"primary_{assessment.structure.timeframe.value}:{assessment.structure.state.value}",
+    ]
+    if assessment.above_daily_anchor is not True:
+        reasons.append(f"below_daily_ma{assessment.contract.daily_anchor_sessions}_anchor")
+    if assessment.incomplete_week_excluded:
+        reasons.append("incomplete_current_week_excluded")
+    if assessment.incomplete_month_excluded:
+        reasons.append("incomplete_current_month_excluded")
+    return tuple(reasons)
+
+
 def _returns_at_cutoff(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.Series:
     if "trade_date" not in frame or "close" not in frame:
         raise ValueError("trade_date_and_close_required")
@@ -787,6 +1020,41 @@ def _returns_at_cutoff(frame: pd.DataFrame, cutoff: pd.Timestamp) -> pd.Series:
     if not bool(np.isfinite(returns.to_numpy()).all()) or bool((returns <= -1.0).any()):
         raise ValueError("invalid_simple_returns")
     return returns
+
+
+def _holding_risk_history_exclusion_reasons(
+    returns: pd.Series,
+    budget: AdaptiveRiskBudget,
+) -> tuple[str, ...]:
+    """Audit a single candidate before any 3--5-name risk combination.
+
+    This mirrors, without weakening, every history-length requirement in the
+    adaptive risk engine.  Alignment and portfolio-level degeneracy remain
+    fail-closed inside that engine.
+    """
+
+    required_returns = _required_holding_risk_return_observations(budget)
+    available_returns = len(returns)
+    if available_returns >= required_returns:
+        return ()
+    return (
+        "insufficient_holding_risk_history:"
+        f"available_{available_returns}_returns;required_{required_returns}_returns;"
+        f"holding_{budget.holding_period_sessions}_sessions;"
+        f"minimum_{budget.minimum_holding_period_samples}_nonoverlapping_samples",
+    )
+
+
+def _required_holding_risk_return_observations(budget: AdaptiveRiskBudget) -> int:
+    """Return the unchanged adaptive-engine history floor for one stock."""
+
+    return max(
+        budget.minimum_observations,
+        FIVE_DAY_SESSIONS * MINIMUM_FIVE_DAY_SAMPLES,
+        ROLLING_DRAWDOWN_SESSIONS + MINIMUM_ROLLING_DRAWDOWN_WINDOWS - 1,
+        budget.holding_period_sessions + MINIMUM_ROLLING_DRAWDOWN_WINDOWS - 1,
+        budget.holding_period_sessions * budget.minimum_holding_period_samples,
+    )
 
 
 def _core_index_benchmark_returns(
@@ -830,11 +1098,16 @@ def _core_index_benchmark_returns(
     return benchmark
 
 
-def _full_universe_relative_strength_60(
+def _full_universe_relative_strength(
     histories: Mapping[str, pd.DataFrame],
     cutoff: pd.Timestamp,
+    *,
+    sessions: int,
 ) -> dict[str, float]:
-    """Return exact 60-session return percentiles across the supplied universe."""
+    """Return exact horizon-session return percentiles across the full universe."""
+
+    if sessions < 1:
+        raise ValueError("relative-strength sessions must be positive")
 
     values: dict[str, float] = {}
     for symbol, frame in histories.items():
@@ -850,19 +1123,28 @@ def _full_universe_relative_strength_60(
         )
         series = series.loc[series.index <= cutoff].sort_index()
         if (
-            len(series) < 61
+            len(series) < sessions + 1
             or series.index.has_duplicates
             or series.index[-1] != cutoff
             or bool((series <= 0.0).any())
         ):
             continue
-        value = float(series.iloc[-1] / series.iloc[-61] - 1.0)
+        value = float(series.iloc[-1] / series.iloc[-sessions - 1] - 1.0)
         if math.isfinite(value):
             values[symbol] = value
     if not values:
         return {}
     ranked = pd.Series(values, dtype=float).rank(method="average", pct=True)
     return {str(symbol): float(value) for symbol, value in ranked.items()}
+
+
+def _full_universe_relative_strength_60(
+    histories: Mapping[str, pd.DataFrame],
+    cutoff: pd.Timestamp,
+) -> dict[str, float]:
+    """Compatibility wrapper for callers that explicitly need sixty sessions."""
+
+    return _full_universe_relative_strength(histories, cutoff, sessions=60)
 
 
 def _downside_capture_ratio(
@@ -907,6 +1189,7 @@ def _risk_budget_for_cycle(
         max_position_downside_risk_contribution=(policy.max_position_downside_risk_contribution),
         industry_weight_limit=policy.industry_weight_limit,
         maximum_stock_exposure=policy.max_stock_exposure,
+        max_horizon_rolling_drawdown_p90=policy.max_rolling_drawdown_60_p90,
         **common,
     )
 
@@ -937,6 +1220,16 @@ def _resolve_risk_budget(
         else requested.maximum_stock_exposure
     )
     assert cycle_budget.maximum_stock_exposure is not None
+    cycle_horizon_drawdown_limit = (
+        cycle_budget.max_horizon_rolling_drawdown_p90
+        if cycle_budget.max_horizon_rolling_drawdown_p90 is not None
+        else cycle_budget.max_rolling_drawdown_60_p90
+    )
+    requested_horizon_drawdown_limit = (
+        requested.max_horizon_rolling_drawdown_p90
+        if requested.max_horizon_rolling_drawdown_p90 is not None
+        else requested.max_rolling_drawdown_60_p90
+    )
     return AdaptiveRiskBudget(
         max_annual_downside_volatility=min(
             cycle_budget.max_annual_downside_volatility,
@@ -981,6 +1274,10 @@ def _resolve_risk_budget(
             cycle_budget.minimum_holding_period_samples,
             requested.minimum_holding_period_samples,
         ),
+        max_horizon_rolling_drawdown_p90=min(
+            cycle_horizon_drawdown_limit,
+            requested_horizon_drawdown_limit,
+        ),
     )
 
 
@@ -990,64 +1287,82 @@ def _candidate_action(
 ) -> tuple[CandidateAction, tuple[str, ...]]:
     """Apply cycle-specific entry confirmation without changing research rank."""
 
+    if not candidate.risk_history_available:
+        return CandidateAction.WAIT_CONFIRMATION, (
+            "risk_history_unavailable_for_portfolio_weighting",
+            *candidate.risk_history_reasons,
+        )
+    strictness = EntryStrictness.STANDARD if cycle is None else cycle.policy.entry_strictness
+    if not candidate.timeframe.execution_ready:
+        action = (
+            CandidateAction.OBSERVE_ONLY
+            if strictness is EntryStrictness.EXCEPTION_ONLY
+            else CandidateAction.WAIT_CONFIRMATION
+        )
+        return action, (
+            f"horizon_daily_execution_not_ready:{candidate.timeframe.execution.state.value}",
+        )
     if candidate.evidence_unknown:
         return (
             CandidateAction.WAIT_CONFIRMATION,
             ("fundamental_announcement_or_execution_evidence_requires_review",),
         )
-    strictness = EntryStrictness.STANDARD if cycle is None else cycle.policy.entry_strictness
     if strictness is EntryStrictness.STANDARD:
-        return CandidateAction.CONDITIONAL_ENTRY, ("standard_entry_structure_confirmed",)
+        return CandidateAction.CONDITIONAL_ENTRY, (
+            "standard_multi_timeframe_and_daily_entry_confirmed",
+        )
 
-    entry = candidate.entry
+    execution = candidate.timeframe.execution
     checks: tuple[tuple[bool, str], ...]
     if strictness is EntryStrictness.TIGHT:
         checks = (
-            (candidate.absolute_return_60 > 0.0, "sixty_session_absolute_return_not_positive"),
             (
-                entry.breakout_amount_ratio is not None and entry.breakout_amount_ratio >= 1.20,
-                "breakout_amount_ratio_below_1_20",
+                candidate.horizon_absolute_return > 0.0,
+                f"{candidate.relative_strength_sessions}_session_absolute_return_not_positive",
             ),
             (
-                entry.distance_ma20_ratio is not None and entry.distance_ma20_ratio <= 0.08,
-                "distance_ma20_ratio_above_8pct",
+                execution.activity_ratio is not None and execution.activity_ratio >= 1.20,
+                "horizon_execution_activity_ratio_below_1_20",
             ),
             (
-                entry.distance_ma20_atr is not None and entry.distance_ma20_atr <= 2.0,
-                "distance_ma20_atr_above_2",
+                execution.distance_to_average is not None and execution.distance_to_average <= 0.08,
+                "horizon_execution_average_distance_above_8pct",
             ),
         )
     else:
         checks = (
-            (candidate.absolute_return_60 > 0.0, "sixty_session_absolute_return_not_positive"),
+            (
+                candidate.horizon_absolute_return > 0.0,
+                f"{candidate.relative_strength_sessions}_session_absolute_return_not_positive",
+            ),
             (
                 candidate.relative_strength_percentile >= 0.90,
                 "relative_strength_not_top_decile",
             ),
-            (candidate.ma20_above_ma60, "ma20_not_above_ma60"),
+            (
+                candidate.timeframe.slow_direction.qualified,
+                "slow_timeframe_direction_not_qualified",
+            ),
             (
                 candidate.downside_capture_ratio is not None
                 and candidate.downside_capture_ratio <= 0.80,
                 "downside_capture_above_0_80_or_unavailable",
             ),
             (
-                entry.breakout_amount_ratio is not None and entry.breakout_amount_ratio >= 1.30,
-                "breakout_amount_ratio_below_1_30",
+                execution.activity_ratio is not None and execution.activity_ratio >= 1.30,
+                "horizon_execution_activity_ratio_below_1_30",
             ),
             (
-                entry.distance_ma20_ratio is not None and entry.distance_ma20_ratio <= 0.06,
-                "distance_ma20_ratio_above_6pct",
-            ),
-            (
-                entry.distance_ma20_atr is not None and entry.distance_ma20_atr <= 1.50,
-                "distance_ma20_atr_above_1_5",
+                execution.distance_to_average is not None and execution.distance_to_average <= 0.06,
+                "horizon_execution_average_distance_above_6pct",
             ),
         )
         if strictness is EntryStrictness.EXCEPTION_ONLY:
             checks = (
                 *checks,
                 (
-                    entry.pattern in {EntryPattern.HEALTHY_PULLBACK, EntryPattern.BREAKOUT_RECLAIM},
+                    execution.state is ExecutionState.READY_PULLBACK
+                    or candidate.timeframe.structure.state is StructureState.HEALTHY_PULLBACK,
                     "downtrend_pressure_requires_pullback_or_reclaim",
                 ),
             )
@@ -1066,6 +1381,7 @@ def _build_research_shortlist(
     candidates: list[MidtermCandidate],
     actions: Mapping[str, tuple[CandidateAction, tuple[str, ...]]],
     *,
+    holding_weeks: int,
     histories: Mapping[str, pd.DataFrame],
     cutoff: pd.Timestamp,
     preferred_symbols: tuple[str, ...] | None = None,
@@ -1077,6 +1393,18 @@ def _build_research_shortlist(
         selected = [by_symbol[symbol] for symbol in preferred_symbols if symbol in by_symbol]
     else:
         selected = candidates[: min(4, len(candidates))]
+    # Keep a bounded sample of structural candidates whose deep risk history
+    # is unavailable visible even though they can never receive a portfolio
+    # weight.  The user-facing shortlist must remain a genuine 3--5 name list;
+    # aggregate result counts expose the complete structural set.
+    selected_symbols = {candidate.symbol for candidate in selected}
+    risk_history_audit = [
+        candidate for candidate in candidates if not candidate.risk_history_available
+    ][:4]
+    for candidate in risk_history_audit:
+        if candidate.symbol not in selected_symbols and len(selected) < 5:
+            selected.append(candidate)
+            selected_symbols.add(candidate.symbol)
     evaluation_by_symbol = (
         {}
         if evaluation is None
@@ -1091,10 +1419,13 @@ def _build_research_shortlist(
     rows: list[MidtermResearchCandidate] = []
     for rank, candidate in enumerate(selected, start=1):
         action = actions[candidate.symbol][0]
-        price_observation_plan = _build_one_week_price_observation_plan(
+        observation_pattern = _observation_entry_pattern(candidate)
+        price_observation_plan = _build_horizon_price_observation_plan(
             histories.get(candidate.symbol),
             cutoff=cutoff,
-            entry_pattern=candidate.entry.pattern,
+            holding_weeks=holding_weeks,
+            timeframe=candidate.timeframe,
+            entry_pattern=observation_pattern,
         )
         rows.append(
             MidtermResearchCandidate(
@@ -1103,9 +1434,13 @@ def _build_research_shortlist(
                 name=candidate.name,
                 industry=candidate.industry,
                 signal_score=candidate.signal_score,
-                entry_pattern=candidate.entry.pattern,
-                breakout_line=float(candidate.entry.breakout_line),
-                days_since_breakout=int(candidate.entry.days_since_breakout),
+                entry_pattern=observation_pattern,
+                breakout_line=_finite_optional(candidate.timeframe.structure.breakout_line),
+                days_since_breakout=(
+                    None
+                    if candidate.timeframe.structure.days_or_bars_since_breakout is None
+                    else int(candidate.timeframe.structure.days_or_bars_since_breakout)
+                ),
                 action=action,
                 action_reasons=actions[candidate.symbol][1],
                 absolute_return_60=candidate.absolute_return_60,
@@ -1141,9 +1476,131 @@ def _build_research_shortlist(
                     / observation_evaluation.stock_exposure
                 ),
                 price_observation_plan=price_observation_plan,
+                timeframe=candidate.timeframe,
+                horizon_absolute_return=candidate.horizon_absolute_return,
+                relative_strength_sessions=candidate.relative_strength_sessions,
+                risk_history_available=candidate.risk_history_available,
+                risk_history_reasons=candidate.risk_history_reasons,
+                risk_history_available_returns=candidate.risk_history_available_returns,
+                risk_history_required_returns=candidate.risk_history_required_returns,
             )
         )
     return tuple(rows)
+
+
+def _observation_entry_pattern(candidate: MidtermCandidate) -> EntryPattern:
+    """Map horizon evidence to a daily observation-plan shape without granting entry."""
+
+    if candidate.timeframe.execution.state is ExecutionState.READY_PULLBACK:
+        return EntryPattern.HEALTHY_PULLBACK
+    if candidate.timeframe.execution.state is ExecutionState.READY_BREAKOUT:
+        return EntryPattern.VOLUME_BREAKOUT
+    if candidate.timeframe.structure.state is StructureState.HEALTHY_PULLBACK:
+        return EntryPattern.BREAKOUT_RECLAIM
+    # A structurally qualified candidate can only be BREAKOUT, NEAR_BREAKOUT,
+    # or HEALTHY_PULLBACK.  Never let the compatibility-only fixed 60-session
+    # assessment change the selected horizon's displayed price-plan shape.
+    return EntryPattern.VOLUME_BREAKOUT
+
+
+def _build_horizon_price_observation_plan(
+    frame: pd.DataFrame | None,
+    *,
+    cutoff: pd.Timestamp,
+    holding_weeks: int,
+    timeframe: MultiTimeframeAssessment,
+    entry_pattern: EntryPattern,
+) -> ConditionalEntryPlan | None:
+    """Build the daily execution condition for one independently assessed horizon.
+
+    Slow and primary bars decide whether the security belongs in the horizon's
+    candidate pool.  The displayed price remains a complete-daily-bar
+    execution condition, but its breakout lookback and reference line come
+    from that horizon's explicit contract rather than the legacy fixed five-day
+    plan.  This keeps a monthly/weekly trend decision separate from an order
+    price while still producing one practical conditional level.
+    """
+
+    if timeframe.holding_weeks != holding_weeks or timeframe.data_cutoff != cutoff:
+        return None
+    if not isinstance(frame, pd.DataFrame) or "trade_date" not in frame.columns:
+        return None
+    prepared = frame.copy()
+    parsed_dates = pd.to_datetime(prepared["trade_date"], errors="coerce")
+    if bool(parsed_dates.isna().any()):
+        return None
+    try:
+        parsed_dates = parsed_dates.dt.tz_localize(None)
+    except (AttributeError, TypeError):
+        return None
+    prepared["trade_date"] = parsed_dates.dt.normalize()
+    prepared = prepared.loc[prepared["trade_date"] <= cutoff].sort_values("trade_date")
+    if prepared.empty or pd.Timestamp(prepared.iloc[-1]["trade_date"]).normalize() != cutoff:
+        return None
+    try:
+        enriched = enrich_indicators(prepared)
+        atr = float(enriched.iloc[-1]["atr14"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    execution_line = _finite_optional(timeframe.execution.breakout_line)
+    primary_structure_line = _finite_optional(timeframe.structure.breakout_line)
+    entry_line = execution_line if execution_line is not None else primary_structure_line
+    price_source_timeframe = (
+        "daily" if execution_line is not None else timeframe.structure.timeframe.value
+    )
+    risk_reference_line = (
+        primary_structure_line if primary_structure_line is not None else entry_line
+    )
+    risk_source_timeframe = (
+        timeframe.structure.timeframe.value
+        if primary_structure_line is not None
+        else price_source_timeframe
+    )
+    if entry_line is None or risk_reference_line is None or not math.isfinite(atr) or atr <= 0.0:
+        return None
+
+    common = {
+        "data_cutoff": cutoff,
+        "horizon": _HORIZON_PLAN_LABELS[holding_weeks],
+        "sessions": HOLDING_PERIOD_SESSIONS[holding_weeks],
+        "structure_timeframe": timeframe.structure.timeframe.value,
+        "structure_cutoff": timeframe.structure_bar_cutoff,
+        "execution_lookback_sessions": timeframe.contract.execution_breakout_sessions,
+        "method_version": MIDTERM_METHOD_VERSION,
+        "price_source_timeframe": price_source_timeframe,
+        "primary_structure_timeframe": timeframe.structure.timeframe.value,
+        "primary_structure_cutoff": timeframe.structure_bar_cutoff,
+        "invalidation_price": round(max(0.01, risk_reference_line - atr), 4),
+        "reduction_review_price": round(max(0.01, risk_reference_line - 0.50 * atr), 4),
+        "entry_reference_price": round(entry_line, 4),
+        "primary_structure_reference_price": (
+            None if primary_structure_line is None else round(primary_structure_line, 4)
+        ),
+        "invalidation_source_timeframe": risk_source_timeframe,
+        "reduction_review_source_timeframe": risk_source_timeframe,
+    }
+    if entry_pattern is EntryPattern.HEALTHY_PULLBACK:
+        reference_label = "日线执行线" if price_source_timeframe == "daily" else "期限主结构线"
+        return ConditionalEntryPlan(
+            kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK,
+            price_low=round(max(0.01, entry_line - 0.25 * atr), 4),
+            price_high=round(entry_line + 0.15 * atr, 4),
+            confirmation_rule=f"回踩{reference_label}附近且完整日线未失效",
+            **common,
+        )
+    if entry_pattern is EntryPattern.BREAKOUT_RECLAIM:
+        return ConditionalEntryPlan(
+            kind=ConditionalEntryPlanKind.RECLAIM,
+            trigger_price=round(entry_line + 0.05 * atr, 4),
+            confirmation_rule="完整日线收盘重新站回期限执行线",
+            **common,
+        )
+    return ConditionalEntryPlan(
+        kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
+        trigger_price=round(entry_line + 0.10 * atr, 4),
+        confirmation_rule=("完整日线收盘越过期限执行线，且成交活跃度达到滚动中位数确认"),
+        **common,
+    )
 
 
 def _build_one_week_conditional_entry_plan(
@@ -1230,29 +1687,28 @@ def _build_one_week_price_observation_plan(
 
 
 def _rank_candidates(
-    rows: list[tuple[str, str, str, EntryReadinessAssessment, pd.Series, tuple[str, ...]]],
+    rows: list[_CandidateInput],
     holding_weeks: int,
-    relative_strength_60: Mapping[str, float],
+    relative_strength: Mapping[str, float],
     benchmark_returns: pd.Series | None = None,
 ) -> list[MidtermCandidate]:
     raw: list[dict[str, float]] = []
-    for _, _, _, entry, returns, _ in rows:
+    contract = horizon_contract(holding_weeks)
+    for row in rows:
+        returns = row.returns
         close_proxy = (1.0 + returns).cumprod()
         features: dict[str, float] = {}
-        for sessions, _weight in _MOMENTUM_WEIGHTS[holding_weeks]:
-            features[f"momentum_{sessions}"] = (
-                float(close_proxy.iloc[-1] / close_proxy.iloc[-sessions - 1] - 1.0)
-                if len(close_proxy) > sessions
-                else float("nan")
-            )
         downside = np.minimum(returns.to_numpy(dtype=float), 0.0)
         features["downside_volatility"] = float(
             np.sqrt(np.mean(np.square(downside))) * math.sqrt(252)
         )
         equity = (1.0 + returns).cumprod()
         features["max_drawdown"] = abs(float((equity / equity.cummax() - 1.0).min()))
-        features["entry"] = entry.score
+        features["multi_timeframe"] = row.timeframe.score
         features["absolute_return_60"] = float(close_proxy.iloc[-1] / close_proxy.iloc[-61] - 1.0)
+        features["horizon_absolute_return"] = float(
+            close_proxy.iloc[-1] / close_proxy.iloc[-contract.relative_strength_sessions - 1] - 1.0
+        )
         features["ma20_above_ma60"] = float(
             close_proxy.tail(20).mean() > close_proxy.tail(60).mean()
         )
@@ -1267,34 +1723,50 @@ def _rank_candidates(
         percentiles[key] = [float(value) for value in ranks]
 
     ranked: list[MidtermCandidate] = []
-    for index, (symbol, name, industry, entry, returns, unknown) in enumerate(rows):
-        if symbol not in relative_strength_60:
-            raise ValueError(f"{symbol}: full-universe 60-session relative strength missing")
-        momentum = sum(
-            weight * percentiles[f"momentum_{sessions}"][index]
-            for sessions, weight in _MOMENTUM_WEIGHTS[holding_weeks]
-        )
+    for index, row in enumerate(rows):
+        if row.symbol not in relative_strength:
+            raise ValueError(
+                f"{row.symbol}: full-universe {contract.relative_strength_sessions}-session "
+                "relative strength missing"
+            )
+        horizon_momentum = percentiles["horizon_absolute_return"][index]
         downside_quality = 1.0 - percentiles["downside_volatility"][index]
         drawdown_quality = 1.0 - percentiles["max_drawdown"][index]
         risk_quality = 0.60 * downside_quality + 0.40 * drawdown_quality
-        signal = 0.55 * entry.score + 0.25 * momentum + 0.20 * risk_quality
-        downside_capture = _downside_capture_ratio(returns, benchmark_returns)
+        # The holding-period assessment now owns the largest share of the
+        # ranking.  Its completed slow/primary bars and daily execution state
+        # replace the legacy common daily-entry score.  The only price-return
+        # rank is the selected horizon's own 5/10/20/60/120/252-session return;
+        # longer horizons no longer reuse one shared 20/60/120 daily blend.
+        # Full-universe relative strength is separate cross-sectional evidence;
+        # neither input is a future return probability.
+        signal = (
+            0.55 * row.timeframe.score
+            + 0.15 * horizon_momentum
+            + 0.10 * float(relative_strength[row.symbol])
+            + 0.20 * risk_quality
+        )
+        downside_capture = _downside_capture_ratio(row.returns, benchmark_returns)
         ranked.append(
             MidtermCandidate(
-                symbol=symbol,
-                name=name,
-                industry=industry,
+                symbol=row.symbol,
+                name=row.name,
+                industry=row.industry,
                 signal_score=round(float(signal), 6),
-                entry=entry,
-                returns=returns,
-                evidence_unknown=unknown,
+                entry=row.entry,
+                returns=row.returns,
+                evidence_unknown=row.evidence_unknown,
                 absolute_return_60=raw[index]["absolute_return_60"],
-                # The defensive entry contract is explicitly a 60-session
-                # relative-strength test.  Keep it separate from the
-                # horizon-dependent blended momentum used in ranking.
-                relative_strength_percentile=float(relative_strength_60[symbol]),
+                relative_strength_percentile=float(relative_strength[row.symbol]),
                 downside_capture_ratio=downside_capture,
                 ma20_above_ma60=bool(raw[index]["ma20_above_ma60"]),
+                timeframe=row.timeframe,
+                horizon_absolute_return=raw[index]["horizon_absolute_return"],
+                relative_strength_sessions=contract.relative_strength_sessions,
+                risk_history_available=row.risk_history_available,
+                risk_history_reasons=row.risk_history_reasons,
+                risk_history_available_returns=row.risk_history_available_returns,
+                risk_history_required_returns=row.risk_history_required_returns,
             )
         )
     return sorted(ranked, key=lambda item: (-item.signal_score, item.symbol))
@@ -1482,14 +1954,19 @@ def _normalized_rejection_overrun(
 
     industry_max = max(weight for _industry, weight in evaluation.industry_weights)
     correlation_scale = max(1e-6, 1.0 - budget.max_down_period_correlation)
+    horizon_drawdown_limit = (
+        budget.max_horizon_rolling_drawdown_p90
+        if budget.max_horizon_rolling_drawdown_p90 is not None
+        else budget.max_rolling_drawdown_60_p90
+    )
     return float(
         positive_ratio(
             metrics.annual_downside_volatility,
             budget.max_annual_downside_volatility,
         )
         + positive_ratio(
-            metrics.rolling_max_drawdown_60_p90,
-            budget.max_rolling_drawdown_60_p90,
+            metrics.horizon_rolling_max_drawdown_p90,
+            horizon_drawdown_limit,
         )
         + positive_ratio(metrics.es95_5d, budget.max_es95_5d)
         + max(
@@ -1518,7 +1995,7 @@ def _viable_sort_key(
     return (
         -objective,
         metrics.annual_downside_volatility,
-        metrics.rolling_max_drawdown_60_p90,
+        metrics.horizon_rolling_max_drawdown_p90,
         metrics.es95_5d,
         metrics.max_down_period_correlation,
         metrics.max_position_downside_risk_contribution,
@@ -1570,8 +2047,8 @@ def _five_stock_diversification_is_material(
         return False
     path_and_tail_not_worse = (
         five_metrics.annual_downside_volatility <= four_metrics.annual_downside_volatility + 0.005
-        and five_metrics.rolling_max_drawdown_60_p90
-        <= four_metrics.rolling_max_drawdown_60_p90 + 0.005
+        and five_metrics.horizon_rolling_max_drawdown_p90
+        <= four_metrics.horizon_rolling_max_drawdown_p90 + 0.005
         and five_metrics.es95_5d <= four_metrics.es95_5d + 0.005
     )
     diversification_improved = (

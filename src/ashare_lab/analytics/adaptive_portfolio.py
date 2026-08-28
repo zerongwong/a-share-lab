@@ -36,9 +36,12 @@ Risk formulas
 -------------
 
 * annual downside volatility uses zero as the minimum acceptable daily return;
-* rolling drawdown severity is the 90th percentile of positive maximum-drawdown
-  magnitudes from overlapping 60-session windows, including each window's
-  starting equity of one;
+* the legacy 60-session rolling drawdown severity is retained as a reporting
+  metric;
+* the binding rolling drawdown severity uses an overlapping window equal to the
+  configured holding period, so one-, two-, four-, thirteen-, twenty-six-, and
+  fifty-two-week research paths do not share one fixed risk horizon; both
+  calculations include each window's starting equity of one;
 * 5-session ES95 is the positive loss magnitude of the mean of the worst 5% of
   non-overlapping, buy-and-hold-within-block portfolio returns;
 * down-period correlation is the largest pairwise Pearson correlation on dates
@@ -168,6 +171,10 @@ class AdaptiveRiskBudget:
     minimum_down_periods: int = 20
     minimum_holding_period_samples: int = 8
     maximum_stock_exposure: float | None = None
+    # Appended for positional compatibility.  ``None`` deliberately falls back
+    # to the historical 60-session limit while changing only the measurement
+    # window to ``holding_period_sessions``.
+    max_horizon_rolling_drawdown_p90: float | None = None
 
     def __post_init__(self) -> None:
         positive: dict[str, object] = {
@@ -218,6 +225,20 @@ class AdaptiveRiskBudget:
             if not math.isfinite(maximum_exposure) or not 0.0 < maximum_exposure <= 0.85:
                 raise ValueError("maximum_stock_exposure must be in (0, 0.85]")
             object.__setattr__(self, "maximum_stock_exposure", maximum_exposure)
+        if self.max_horizon_rolling_drawdown_p90 is not None:
+            if isinstance(self.max_horizon_rolling_drawdown_p90, bool):
+                raise ValueError("max_horizon_rolling_drawdown_p90 must be in (0, 1]")
+            try:
+                horizon_drawdown_limit = float(self.max_horizon_rolling_drawdown_p90)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("max_horizon_rolling_drawdown_p90 must be in (0, 1]") from exc
+            if not math.isfinite(horizon_drawdown_limit) or not 0.0 < horizon_drawdown_limit <= 1.0:
+                raise ValueError("max_horizon_rolling_drawdown_p90 must be in (0, 1]")
+            object.__setattr__(
+                self,
+                "max_horizon_rolling_drawdown_p90",
+                horizon_drawdown_limit,
+            )
         if isinstance(self.holding_period_sessions, bool) or not isinstance(
             self.holding_period_sessions, int
         ):
@@ -273,6 +294,11 @@ class AdaptivePortfolioMetrics:
     lcb_confidence: float
     holding_period_cost_rate: float
     is_out_of_sample: bool = False
+    # Appended defaults preserve older positional constructors.  New engine
+    # results always populate these with the binding holding-horizon metric.
+    horizon_rolling_drawdown_window_sessions: int = ROLLING_DRAWDOWN_SESSIONS
+    horizon_rolling_drawdown_window_count: int = 0
+    horizon_rolling_max_drawdown_p90: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +311,12 @@ class AdaptiveRiskBudgetResult:
     position_risk_contribution_passed: bool
     industry_concentration_passed: bool
     violations: tuple[str, ...]
+    # ``rolling_drawdown_passed`` above is retained as a compatibility alias
+    # for the binding horizon result.  These appended fields make the active
+    # window and effective (possibly fallback) limit explicit.
+    horizon_rolling_drawdown_passed: bool = True
+    horizon_rolling_drawdown_window_sessions: int = ROLLING_DRAWDOWN_SESSIONS
+    horizon_rolling_drawdown_limit: float = 0.12
 
 
 @dataclass(frozen=True, slots=True)
@@ -541,6 +573,12 @@ def _prepare_candidates(
         raise AdaptivePortfolioDataError(
             f"at least {MINIMUM_ROLLING_DRAWDOWN_WINDOWS} rolling drawdown windows required"
         )
+    horizon_rolling_windows = len(matrix) - budget.holding_period_sessions + 1
+    if horizon_rolling_windows < MINIMUM_ROLLING_DRAWDOWN_WINDOWS:
+        raise AdaptivePortfolioDataError(
+            f"only {max(0, horizon_rolling_windows)} holding-horizon rolling drawdown windows; "
+            f"at least {MINIMUM_ROLLING_DRAWDOWN_WINDOWS} required"
+        )
     holding_samples = len(matrix) // budget.holding_period_sessions
     if holding_samples < budget.minimum_holding_period_samples:
         raise AdaptivePortfolioDataError(
@@ -745,11 +783,20 @@ def _non_overlapping_portfolio_returns(
     return stock_block_returns @ weights
 
 
-def _rolling_drawdown_magnitudes(portfolio_returns: np.ndarray) -> np.ndarray:
-    window_count = len(portfolio_returns) - ROLLING_DRAWDOWN_SESSIONS + 1
+def _rolling_drawdown_magnitudes(
+    portfolio_returns: np.ndarray,
+    sessions: int = ROLLING_DRAWDOWN_SESSIONS,
+) -> np.ndarray:
+    """Return overlapping drawdowns for an explicit positive session window."""
+
+    if isinstance(sessions, bool) or not isinstance(sessions, int) or sessions < 2:
+        raise AdaptivePortfolioDataError("rolling drawdown sessions must be at least two")
+    window_count = len(portfolio_returns) - sessions + 1
+    if window_count <= 0:
+        raise AdaptivePortfolioDataError("rolling drawdown window exceeds supplied history")
     magnitudes = np.empty(window_count, dtype=float)
     for start in range(window_count):
-        sample = portfolio_returns[start : start + ROLLING_DRAWDOWN_SESSIONS]
+        sample = portfolio_returns[start : start + sessions]
         equity = np.concatenate(([1.0], np.cumprod(1.0 + sample)))
         running_peak = np.maximum.accumulate(equity)
         magnitudes[start] = max(0.0, -float((equity / running_peak - 1.0).min()))
@@ -803,8 +850,19 @@ def _evaluate_prepared(
         np.sqrt(np.mean(np.square(portfolio_downside))) * math.sqrt(ANNUAL_SESSIONS)
     )
 
-    drawdown_magnitudes = _rolling_drawdown_magnitudes(portfolio_returns)
+    drawdown_magnitudes = _rolling_drawdown_magnitudes(
+        portfolio_returns,
+        ROLLING_DRAWDOWN_SESSIONS,
+    )
     drawdown_p90 = float(np.quantile(drawdown_magnitudes, 0.90))
+    if budget.holding_period_sessions == ROLLING_DRAWDOWN_SESSIONS:
+        horizon_drawdown_magnitudes = drawdown_magnitudes
+    else:
+        horizon_drawdown_magnitudes = _rolling_drawdown_magnitudes(
+            portfolio_returns,
+            budget.holding_period_sessions,
+        )
+    horizon_drawdown_p90 = float(np.quantile(horizon_drawdown_magnitudes, 0.90))
 
     five_day_returns = _non_overlapping_portfolio_returns(returns, weights, FIVE_DAY_SESSIONS)
     five_day_cutoff = float(np.quantile(five_day_returns, 0.05))
@@ -837,6 +895,7 @@ def _evaluate_prepared(
     metrics_values = (
         annual_downside_volatility,
         drawdown_p90,
+        horizon_drawdown_p90,
         es95_5d,
         max_down_correlation,
         max_contribution,
@@ -862,6 +921,9 @@ def _evaluate_prepared(
         holding_period_return_lcb=holding_lcb,
         lcb_confidence=budget.lcb_confidence,
         holding_period_cost_rate=budget.holding_period_cost_rate,
+        horizon_rolling_drawdown_window_sessions=budget.holding_period_sessions,
+        horizon_rolling_drawdown_window_count=len(horizon_drawdown_magnitudes),
+        horizon_rolling_max_drawdown_p90=horizon_drawdown_p90,
     )
     risk_result = _risk_budget_result(metrics, industry_totals, budget)
     positions = tuple(
@@ -899,12 +961,17 @@ def _risk_budget_result(
     industry_weights: Mapping[str, float],
     budget: AdaptiveRiskBudget,
 ) -> AdaptiveRiskBudgetResult:
+    horizon_drawdown_limit = (
+        budget.max_rolling_drawdown_60_p90
+        if budget.max_horizon_rolling_drawdown_p90 is None
+        else budget.max_horizon_rolling_drawdown_p90
+    )
     checks = {
         "annual_downside_volatility": (
             metrics.annual_downside_volatility <= budget.max_annual_downside_volatility + 1e-12
         ),
-        "rolling_drawdown_60_p90": (
-            metrics.rolling_max_drawdown_60_p90 <= budget.max_rolling_drawdown_60_p90 + 1e-12
+        "horizon_rolling_drawdown_p90": (
+            metrics.horizon_rolling_max_drawdown_p90 <= horizon_drawdown_limit + 1e-12
         ),
         "es95_5d": metrics.es95_5d <= budget.max_es95_5d + 1e-12,
         "down_period_correlation": (
@@ -922,10 +989,13 @@ def _risk_budget_result(
     return AdaptiveRiskBudgetResult(
         passed=not violations,
         annual_downside_volatility_passed=checks["annual_downside_volatility"],
-        rolling_drawdown_passed=checks["rolling_drawdown_60_p90"],
+        rolling_drawdown_passed=checks["horizon_rolling_drawdown_p90"],
         es95_5d_passed=checks["es95_5d"],
         down_period_correlation_passed=checks["down_period_correlation"],
         position_risk_contribution_passed=checks["position_downside_risk_contribution"],
         industry_concentration_passed=checks["industry_concentration"],
         violations=violations,
+        horizon_rolling_drawdown_passed=checks["horizon_rolling_drawdown_p90"],
+        horizon_rolling_drawdown_window_sessions=(metrics.horizon_rolling_drawdown_window_sessions),
+        horizon_rolling_drawdown_limit=horizon_drawdown_limit,
     )

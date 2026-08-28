@@ -5,6 +5,22 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Wire the multi-timeframe analytics core through the portfolio service, Streamlit UI, read-only MCP,
+  and evening digest. A read-only six-horizon acceptance run on the 2026-08-27 common cutoff confirmed
+  that the runtime routes are connected; it did not validate future performance or complete the central
+  contract. Central status remains `integration_pending`, and runtime output remains
+  `partial_multiframe`, until point-in-time official-calendar weekly/monthly boundaries, an immutable
+  six-horizon per-run archive, calibrated weekly/monthly late-stage maturity gates, and strict purged
+  walk-forward acceptance are complete.
+- Document the implemented late-stage boundary accurately: the runtime uses one shared daily
+  5/20/60/120-session acceleration freeze plus horizon structure and daily `EXTENDED` evidence. It does
+  not yet claim independently calibrated weekly/monthly maturity gates, and it does not add unvalidated
+  primary-timeframe overheat thresholds.
+- Define the `multi-timeframe-contract-v0.2.0` target contract: separate signal sampling, lookback, holding horizon,
+  and rebalance cadence; use completed weekly/monthly bars; and give all six horizons independent
+  structure gates, risk budgets, return LCBs, and price plans after one shared eligibility gate. A run
+  may claim this version only when its archive also contains horizon-overlap and difference attribution;
+  this documentation entry does not itself claim that implementation or out-of-sample validation is complete.
 - Define a price-cycle-aware medium-term research contract: identify early or orderly main uptrends,
   require explicit entry structure, and use the market cycle to adjust confirmation strictness and risk
   budget rather than stopping candidate discovery.

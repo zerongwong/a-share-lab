@@ -14,6 +14,8 @@ from ashare_lab.mcp_server import (
     MCPSettings,
     ReadOnlyResearchTools,
     _conditional_entry_fields,
+    _horizon_risk_lcb_fields,
+    _multi_timeframe_fields,
     _price_observation_fields,
     build_server,
 )
@@ -147,6 +149,84 @@ def test_mcp_allows_the_two_week_horizon() -> None:
     assert frozenset({1, 2, 4, 13, 26, 52}) == ALLOWED_HOLDING_WEEKS
 
 
+def test_mcp_exposes_horizon_sources_without_raw_bars() -> None:
+    fields = _multi_timeframe_fields(
+        SimpleNamespace(
+            method_version="multi-timeframe-core-v0.2.0",
+            implementation_status="analytics_core_only",
+            holding_weeks=13,
+            data_cutoff=date(2026, 8, 27),
+            weekly_cutoff=date(2026, 8, 21),
+            monthly_cutoff=date(2026, 7, 31),
+            candidate_qualified=True,
+            execution_ready=False,
+            score=0.812,
+            slow_direction=SimpleNamespace(
+                timeframe=SimpleNamespace(value="monthly_completed"),
+                direction=SimpleNamespace(value="up"),
+            ),
+            structure=SimpleNamespace(
+                timeframe=SimpleNamespace(value="weekly_completed"),
+                state=SimpleNamespace(value="near_breakout"),
+                breakout_line=12.34,
+            ),
+            execution=SimpleNamespace(state=SimpleNamespace(value="wait_for_daily_confirmation")),
+            contract=SimpleNamespace(relative_strength_sessions=60),
+            slow_bar_cutoff=date(2026, 7, 31),
+            structure_bar_cutoff=date(2026, 8, 21),
+            incomplete_week_excluded=True,
+            incomplete_month_excluded=True,
+        )
+    )["multi_timeframe"]
+
+    assert fields["holding_weeks"] == 13
+    assert fields["implementation_status"] == "analytics_core_only"
+    assert fields["completed_daily_cutoff"] == "2026-08-27"
+    assert fields["completed_weekly_cutoff"] == "2026-08-21"
+    assert fields["completed_monthly_cutoff"] == "2026-07-31"
+    assert fields["slow_timeframe"] == "monthly_completed"
+    assert fields["primary_timeframe"] == "weekly_completed"
+    assert fields["daily_execution_state"] == "wait_for_daily_confirmation"
+    assert fields["slow_bar_cutoff"] == "2026-07-31"
+    assert fields["primary_bar_cutoff"] == "2026-08-21"
+    assert "daily" not in fields
+
+
+def test_mcp_horizon_plan_keeps_price_and_primary_structure_sources_separate() -> None:
+    fields = _conditional_entry_fields(
+        action=SimpleNamespace(value="conditional_entry"),
+        plan=SimpleNamespace(
+            kind=SimpleNamespace(value="volume_breakout_close_confirmation"),
+            data_cutoff=date(2026, 8, 27),
+            horizon="三个月",
+            sessions=60,
+            trigger_price=15.2,
+            price_source_timeframe="daily",
+            primary_structure_timeframe="weekly_completed",
+            primary_structure_cutoff=date(2026, 8, 21),
+            entry_reference_price=15.0,
+            primary_structure_reference_price=14.0,
+            invalidation_price=13.8,
+            reduction_review_price=14.3,
+            invalidation_source_timeframe="weekly_completed",
+            reduction_review_source_timeframe="weekly_completed",
+        ),
+        evidence_unknown=(),
+        expected_cutoff=date(2026, 8, 27),
+        expected_holding_weeks=13,
+    )["conditional_entry_plan"]
+
+    assert fields["price_source_timeframe"] == "daily"
+    assert fields["primary_structure_timeframe"] == "weekly_completed"
+    assert fields["primary_structure_cutoff"] == "2026-08-21"
+    assert fields["entry_reference_price"] == pytest.approx(15.0)
+    assert fields["primary_structure_reference_price"] == pytest.approx(14.0)
+    assert fields["invalidation_price"] == pytest.approx(13.8)
+    assert fields["reduction_review_price"] == pytest.approx(14.3)
+    assert fields["invalidation_source_timeframe"] == "weekly_completed"
+    assert fields["reduction_review_source_timeframe"] == "weekly_completed"
+
+
 @pytest.mark.parametrize("action", ["wait_confirmation", "observe_only"])
 def test_non_actionable_mcp_entry_plan_never_exposes_a_numeric_price(action: str) -> None:
     fields = _conditional_entry_fields(
@@ -160,6 +240,7 @@ def test_non_actionable_mcp_entry_plan_never_exposes_a_numeric_price(action: str
         ),
         evidence_unknown=(),
         expected_cutoff=date(2026, 8, 26),
+        expected_holding_weeks=1,
     )
 
     assert fields["conditional_entry_plan"] is None
@@ -176,10 +257,122 @@ def test_non_actionable_mcp_entry_plan_never_exposes_a_numeric_price(action: str
             confirmation_rule="close and volume confirmation",
         ),
         expected_cutoff=date(2026, 8, 26),
+        expected_holding_weeks=1,
     )
     assert observation["price_observation_plan"]["trigger"] == pytest.approx(99.99)
     assert "99.99" in observation["price_observation_condition_label"]
     assert observation["price_observation_is_actionable"] is False
+
+
+@pytest.mark.parametrize("serializer", ["conditional", "observation"])
+def test_mcp_price_plan_sessions_must_match_selected_horizon(serializer: str) -> None:
+    plan = SimpleNamespace(
+        kind=SimpleNamespace(value="volume_breakout_close_confirmation"),
+        data_cutoff=date(2026, 8, 27),
+        horizon="一周",
+        sessions=5,
+        trigger_price=12.3,
+        confirmation_rule="close and volume confirmation",
+    )
+    if serializer == "conditional":
+        fields = _conditional_entry_fields(
+            action=SimpleNamespace(value="conditional_entry"),
+            plan=plan,
+            evidence_unknown=(),
+            expected_cutoff=date(2026, 8, 27),
+            expected_holding_weeks=13,
+        )
+        assert fields["conditional_entry_plan"] is None
+        assert fields["entry_price_condition_label"] == "—（暂未形成可介入价格）"
+    else:
+        fields = _price_observation_fields(
+            plan=plan,
+            expected_cutoff=date(2026, 8, 27),
+            expected_holding_weeks=13,
+        )
+        assert fields["price_observation_plan"] is None
+        assert fields["price_observation_condition_label"] == "—（暂无价格观察线）"
+
+
+def test_mcp_price_plan_rejects_non_integral_session_count() -> None:
+    fields = _conditional_entry_fields(
+        action=SimpleNamespace(value="conditional_entry"),
+        plan=SimpleNamespace(
+            kind=SimpleNamespace(value="volume_breakout_close_confirmation"),
+            data_cutoff=date(2026, 8, 27),
+            horizon="三个月",
+            sessions=60.5,
+            trigger_price=12.3,
+        ),
+        evidence_unknown=(),
+        expected_cutoff=date(2026, 8, 27),
+        expected_holding_weeks=13,
+    )
+
+    assert fields["conditional_entry_plan"] is None
+
+
+def test_mcp_horizon_risk_and_lcb_exposes_only_selected_derived_metrics() -> None:
+    fields = _horizon_risk_lcb_fields(
+        SimpleNamespace(
+            evaluation=SimpleNamespace(
+                metrics=SimpleNamespace(
+                    holding_period_sessions=60,
+                    horizon_rolling_drawdown_window_sessions=60,
+                    horizon_rolling_max_drawdown_p90=0.08,
+                    holding_period_sample_count=48,
+                    holding_period_return_mean=0.025,
+                    holding_period_return_lcb=0.011,
+                    lcb_confidence=0.90,
+                    holding_period_cost_rate=0.002,
+                ),
+                risk_budget=SimpleNamespace(
+                    passed=True,
+                    violations=(),
+                    horizon_rolling_drawdown_limit=0.14,
+                    horizon_rolling_drawdown_passed=True,
+                ),
+            ),
+            observation_rejection_reasons=(),
+        ),
+        expected_holding_weeks=13,
+    )
+
+    assert fields == {
+        "available": True,
+        "holding_weeks": 13,
+        "holding_period_sessions": 60,
+        "allocation_nature": "action_research",
+        "risk_budget_passed": True,
+        "risk_violations": [],
+        "holding_period_return_lcb_gate_passed": True,
+        "horizon_rolling_drawdown_window_sessions": 60,
+        "horizon_rolling_max_drawdown_p90": pytest.approx(0.08),
+        "horizon_rolling_drawdown_limit": pytest.approx(0.14),
+        "horizon_rolling_drawdown_passed": True,
+        "holding_period_sample_count": 48,
+        "holding_period_return_mean": pytest.approx(0.025),
+        "holding_period_return_lcb": pytest.approx(0.011),
+        "lcb_confidence": pytest.approx(0.90),
+        "holding_period_cost_rate": pytest.approx(0.002),
+    }
+    assert "raw_bars" not in fields
+
+
+def test_mcp_horizon_risk_and_lcb_fails_closed_on_metric_horizon_mismatch() -> None:
+    fields = _horizon_risk_lcb_fields(
+        SimpleNamespace(
+            evaluation=SimpleNamespace(
+                metrics=SimpleNamespace(holding_period_sessions=60),
+                risk_budget=SimpleNamespace(passed=True, violations=()),
+            )
+        ),
+        expected_holding_weeks=1,
+    )
+
+    assert fields["available"] is False
+    assert fields["holding_period_sessions"] == 5
+    assert fields["reason"] == "holding_period_metric_mismatch"
 
 
 def test_generated_portfolio_exposes_unambiguous_weight_semantics(
@@ -309,6 +502,8 @@ def test_generated_portfolio_exposes_unambiguous_weight_semantics(
         status=SimpleNamespace(value="research_only"),
         data_cutoff=date(2026, 8, 26),
         method_version="test",
+        central_implementation_status="partial_multiframe",
+        multi_timeframe_component_status="analytics_core_only",
         entry_ready_count=2,
         actionable_candidate_count=2,
         search_pool_count=2,
@@ -324,7 +519,24 @@ def test_generated_portfolio_exposes_unambiguous_weight_semantics(
         price_cycle=None,
         research_candidates=research_candidates,
         positions=positions,
-        evaluation=SimpleNamespace(metrics={}, risk_budget={}),
+        evaluation=SimpleNamespace(
+            metrics=SimpleNamespace(
+                holding_period_sessions=5,
+                horizon_rolling_drawdown_window_sessions=5,
+                horizon_rolling_max_drawdown_p90=0.04,
+                holding_period_sample_count=20,
+                holding_period_return_mean=0.02,
+                holding_period_return_lcb=0.01,
+                lcb_confidence=0.90,
+                holding_period_cost_rate=0.002,
+            ),
+            risk_budget=SimpleNamespace(
+                passed=True,
+                violations=(),
+                horizon_rolling_drawdown_limit=0.12,
+                horizon_rolling_drawdown_passed=True,
+            ),
+        ),
         warnings=(),
         reasons=(),
         evidence_review_required=False,
@@ -339,8 +551,12 @@ def test_generated_portfolio_exposes_unambiguous_weight_semantics(
         lambda *_args, **_kwargs: portfolio,
     )
 
-    result = ReadOnlyResearchTools(_settings(tmp_path, allow=True)).generate_portfolio()
+    result = ReadOnlyResearchTools(_settings(tmp_path, allow=True)).generate_portfolio(
+        holding_weeks=1
+    )
 
+    assert result["central_implementation_status"] == "partial_multiframe"
+    assert result["multi_timeframe_component_status"] == "analytics_core_only"
     canonical_allocation = result["action_research_allocation_not_brokerage_position"]
     assert canonical_allocation["weight_basis"] == "total_account_capital"
     assert canonical_allocation["is_brokerage_account_position"] is False
@@ -349,6 +565,9 @@ def test_generated_portfolio_exposes_unambiguous_weight_semantics(
         "action_research_allocation_not_brokerage_position"
     )
     assert result["actual_allocation"]["stock_exposure"] == pytest.approx(0.40)
+    assert result["horizon_risk_and_lcb"]["available"] is True
+    assert result["horizon_risk_and_lcb"]["holding_period_sessions"] == 5
+    assert result["horizon_risk_and_lcb"]["holding_period_return_lcb"] == pytest.approx(0.01)
 
     research = result["research_candidates"][0]
     assert research["research_weight_not_current_holding"] == pytest.approx(0.075)

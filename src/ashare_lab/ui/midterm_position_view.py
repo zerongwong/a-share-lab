@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from ashare_lab.services.build_midterm_portfolio import (
+    HOLDING_PERIOD_SESSIONS,
     CandidateAction,
     ConditionalEntryPlan,
     ConditionalEntryPlanKind,
@@ -39,6 +40,11 @@ def build_midterm_position_views(
     values are still validated internally, but are not leaked into this simple
     table.  No field is a brokerage account position or order.
     """
+
+    try:
+        expected_plan_sessions = HOLDING_PERIOD_SESSIONS[int(result.holding_weeks)]
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError("result must use a supported holding horizon") from exc
 
     research_exposure = _finite_weight(
         result.research_stock_exposure,
@@ -128,7 +134,10 @@ def build_midterm_position_views(
             raise ValueError(f"non-actionable candidate has action weight: {candidate.symbol}")
         rows.append(
             MidtermPositionView(
-                stock_label=f"**{candidate.rank}. {candidate.name}**  \n`{candidate.symbol}`",
+                stock_label=(
+                    f"**{candidate.rank}. {candidate.name}**  \n`{candidate.symbol}`"
+                    f"  \n{_timeframe_summary(getattr(candidate, 'timeframe', None))}"
+                ),
                 planned_weight_label=_planned_weight_label(
                     operational_weight,
                     operational_sleeve_weight,
@@ -140,6 +149,7 @@ def build_midterm_position_views(
                     getattr(candidate, "price_observation_plan", None),
                     evidence_passed=not bool(getattr(candidate, "evidence_unknown", ())),
                     expected_cutoff=result.data_cutoff,
+                    expected_sessions=expected_plan_sessions,
                     risk_qualified=operational_weight is not None,
                 ),
             )
@@ -174,6 +184,36 @@ def build_midterm_position_views(
     return tuple(rows)
 
 
+def _timeframe_summary(assessment: object) -> str:
+    if assessment is None:
+        return "期限结构：—"
+    slow = getattr(assessment, "slow_direction", None)
+    structure = getattr(assessment, "structure", None)
+    timeframe_labels = {
+        "daily": "日线",
+        "weekly_completed": "周线",
+        "monthly_completed": "月线",
+    }
+    structure_labels = {
+        "near_breakout": "临近突破",
+        "healthy_post_breakout_pullback": "健康回踩",
+        "volume_confirmed_breakout": "突破确认",
+        "base_not_yet_near_breakout": "底座形成",
+        "trend_continuation_without_entry_structure": "趋势延续",
+        "failed": "结构失效",
+        "insufficient": "证据不足",
+    }
+    slow_tf = getattr(getattr(slow, "timeframe", None), "value", "")
+    direction = getattr(getattr(slow, "direction", None), "value", "—")
+    primary_tf = getattr(getattr(structure, "timeframe", None), "value", "")
+    state = getattr(getattr(structure, "state", None), "value", "")
+    return (
+        f"{timeframe_labels.get(slow_tf, slow_tf or '慢周期')} {direction}｜"
+        f"{timeframe_labels.get(primary_tf, primary_tf or '主周期')} "
+        f"{structure_labels.get(state, state or '—')}"
+    )
+
+
 def _planned_weight_label(
     account_weight: float | None,
     stock_sleeve_weight: float | None,
@@ -193,6 +233,7 @@ def _entry_price_condition_label(
     *,
     evidence_passed: bool,
     expected_cutoff: object,
+    expected_sessions: int,
     risk_qualified: bool,
 ) -> str:
     unavailable = "—（暂未形成可介入价格）"
@@ -204,6 +245,7 @@ def _entry_price_condition_label(
         label = _validated_price_plan_label(
             conditional_plan,
             expected_cutoff=expected_cutoff,
+            expected_sessions=expected_sessions,
             observation=False,
         )
         if risk_qualified:
@@ -214,6 +256,7 @@ def _entry_price_condition_label(
     label = _validated_price_plan_label(
         observation_plan,
         expected_cutoff=expected_cutoff,
+        expected_sessions=expected_sessions,
         observation=True,
     )
     prefix = "仅观察" if action is CandidateAction.OBSERVE_ONLY else "价格观察"
@@ -224,6 +267,7 @@ def _validated_price_plan_label(
     plan: ConditionalEntryPlan,
     *,
     expected_cutoff: object,
+    expected_sessions: int,
     observation: bool,
 ) -> str:
     cutoff = getattr(plan, "data_cutoff", None)
@@ -231,8 +275,8 @@ def _validated_price_plan_label(
         expected_cutoff
     ):
         raise ValueError("conditional entry plan cutoff does not match portfolio cutoff")
-    if plan.horizon != "一周" or plan.sessions != 5:
-        raise ValueError("conditional entry plan must use the one-week horizon")
+    if not isinstance(plan.horizon, str) or plan.sessions != expected_sessions:
+        raise ValueError("conditional entry plan does not match the selected holding horizon")
     if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
         low = _positive_price(plan.price_low, field="pullback_entry_low")
         high = _positive_price(plan.price_high, field="pullback_entry_high")
@@ -247,7 +291,7 @@ def _validated_price_plan_label(
         return f"收盘价 ≥ **{trigger:.2f}元**（重新站回确认）"
     if plan.kind is ConditionalEntryPlanKind.VOLUME_BREAKOUT:
         if observation:
-            return f"收盘突破观察线 ≥ **{trigger:.2f}元**，且成交量不低于20日中位数1.2倍"
+            return f"收盘突破观察线 ≥ **{trigger:.2f}元**，并满足期限量能确认"
         return f"收盘价 ≥ **{trigger:.2f}元**（放量突破确认）"
     raise ValueError("unknown conditional entry plan kind")
 

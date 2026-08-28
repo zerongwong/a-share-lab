@@ -53,6 +53,7 @@ def _result(
     positions: tuple[SimpleNamespace, ...] = (),
     research_exposure: float = 0.30,
     action_exposure: float = 0.0,
+    holding_weeks: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         research_candidates=candidates,
@@ -60,6 +61,7 @@ def _result(
         research_stock_exposure=research_exposure,
         stock_exposure=action_exposure,
         data_cutoff=CUTOFF,
+        holding_weeks=holding_weeks,
     )
 
 
@@ -261,7 +263,7 @@ def test_wait_and_observe_show_numeric_observation_line_but_not_entry_permission
 
     assert prefix in label
     assert "12.30元" in label
-    assert "成交量不低于20日中位数1.2倍" in label
+    assert "满足期限量能确认" in label
     assert "触及不等于可买" in label
 
 
@@ -318,6 +320,46 @@ def test_conditional_entry_plan_is_formatted_as_a_price_condition(
     )
 
     assert build_midterm_position_views(result)[0].entry_price_condition == expected
+
+
+@pytest.mark.parametrize(
+    ("action", "plan_field"),
+    (
+        (CandidateAction.CONDITIONAL_ENTRY, "conditional_entry_plan"),
+        (CandidateAction.WAIT_CONFIRMATION, "price_observation_plan"),
+    ),
+)
+def test_price_plan_sessions_must_match_result_holding_horizon(
+    action: CandidateAction,
+    plan_field: str,
+) -> None:
+    candidate_kwargs = {
+        "action": action,
+        "operational_weight": 0.30,
+        "operational_sleeve_weight": 1.0,
+        "plan": None,
+        "observation_plan": None,
+    }
+    candidate_kwargs["plan" if plan_field == "conditional_entry_plan" else "observation_plan"] = (
+        _plan(ConditionalEntryPlanKind.VOLUME_BREAKOUT, trigger=12.30)
+    )
+    result = _result(
+        candidates=(
+            _candidate(
+                "600001",
+                1,
+                0.30,
+                **candidate_kwargs,
+            ),
+        ),
+        holding_weeks=13,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="conditional entry plan does not match the selected holding horizon",
+    ):
+        build_midterm_position_views(result)
 
 
 def test_unknown_evidence_never_displays_an_entry_price() -> None:

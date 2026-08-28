@@ -7,12 +7,12 @@ import streamlit as st
 
 from ashare_lab.bootstrap import application_data_dir
 from ashare_lab.services.build_midterm_portfolio import (
-    HOLDING_PERIOD_SESSIONS,
     MIDTERM_METHOD_VERSION,
     CandidateAction,
     MidtermPortfolioResult,
     MidtermPortfolioStatus,
     build_midterm_portfolio,
+    horizon_history_requirements,
 )
 from ashare_lab.services.load_hybrid_universe import load_hybrid_universe
 from ashare_lab.ui.midterm_position_view import build_midterm_position_views
@@ -60,6 +60,7 @@ REASON_LABELS = {
     "core_index_regime_unavailable": "核心指数证据不完整",
     "annual_downside_volatility": "年化下行波动超过预算",
     "rolling_drawdown_60_p90": "60日滚动回撤压力超过预算",
+    "horizon_rolling_drawdown_p90": "所选持有期窗口的滚动回撤压力超过预算",
     "es95_5d": "5日尾部损失超过预算",
     "down_period_correlation": "下跌期相关性超过预算",
     "position_downside_risk_contribution": "单只股票下行风险贡献超过预算",
@@ -67,6 +68,7 @@ REASON_LABELS = {
     "holding_period_return_lcb_below_minimum": "历史持有期收益下界未达最低门槛",
 }
 ACTION_REASON_LABELS = {
+    "standard_multi_timeframe_and_daily_entry_confirmed": "多周期结构与日线介入已确认",
     "standard_entry_structure_confirmed": "标准介入结构已确认",
     "tight_entry_confirmed": "加强介入条件已确认",
     "defensive_entry_confirmed": "防守介入条件已确认",
@@ -85,6 +87,32 @@ ACTION_REASON_LABELS = {
     "distance_ma20_atr_above_2": "距MA20超过2ATR",
     "distance_ma20_atr_above_1_5": "距MA20超过1.5ATR",
     "downtrend_pressure_requires_pullback_or_reclaim": "下行压力期只接受回踩或重新站回",
+    "horizon_execution_activity_ratio_below_1_20": "本期限日线成交活跃度不足1.20倍",
+    "horizon_execution_activity_ratio_below_1_30": "本期限日线成交活跃度不足1.30倍",
+    "horizon_execution_average_distance_above_8pct": "价格距本期限执行均线超过8%",
+    "horizon_execution_average_distance_above_6pct": "价格距本期限执行均线超过6%",
+}
+TIMEFRAME_LABELS = {
+    "daily": "日线",
+    "weekly_completed": "完整周线",
+    "monthly_completed": "完整月线",
+}
+STRUCTURE_LABELS = {
+    "insufficient": "证据不足",
+    "failed": "结构失效",
+    "trend_continuation_without_entry_structure": "趋势延续但无介入结构",
+    "base_not_yet_near_breakout": "底座形成中",
+    "near_breakout": "临近突破",
+    "healthy_post_breakout_pullback": "突破后健康回踩",
+    "volume_confirmed_breakout": "量能确认突破",
+}
+EXECUTION_LABELS = {
+    "insufficient": "日线证据不足",
+    "failed": "日线失效",
+    "extended_do_not_chase": "过度延伸不追",
+    "wait_for_daily_confirmation": "等待日线确认",
+    "daily_healthy_pullback_ready": "日线健康回踩",
+    "daily_volume_breakout_ready": "日线放量突破",
 }
 LATEST_MIDTERM_RUN_KEY = "latest_midterm_run"
 
@@ -103,6 +131,15 @@ def _action_reason_label(reason: str) -> str:
 
 def _weight_label(value: float | None) -> str:
     return "—" if value is None else f"{value:.1%}"
+
+
+def _timeframe_value(item: object, path: str, default: object = None) -> object:
+    value = getattr(item, "timeframe", None)
+    for name in path.split("."):
+        value = getattr(value, name, default)
+        if value is default:
+            return default
+    return getattr(value, "value", value)
 
 
 st.set_page_config(page_title="中期主升组合", page_icon="📈", layout="wide")
@@ -165,16 +202,17 @@ if submitted:
             raise FileNotFoundError(
                 "缺少核心指数参考库。请先导入CSMAR指数参考数据；没有指数确认时系统不会降级凑组合。"
             )
-        holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
-        minimum_sessions = max(252, holding_sessions * 8 + 1)
-        history_sessions = minimum_sessions + 70
+        history_requirements = horizon_history_requirements(holding_weeks)
         with st.spinner("正在读取共同截止日全市场，识别主升突破并计算3–5股风险组合…"):
             hybrid = load_hybrid_universe(
                 CSMAR_ROOT,
                 overlay_root=OVERLAY_ROOT,
                 as_of=as_of,
-                minimum_sessions=minimum_sessions,
-                history_sessions=history_sessions,
+                minimum_sessions=history_requirements.qualification_minimum_sessions,
+                history_sessions=history_requirements.history_read_sessions,
+                minimum_qualification_sessions=(
+                    history_requirements.qualification_minimum_sessions
+                ),
                 reference_dataset_root=REFERENCE_ROOT,
                 decision_date=as_of,
                 mode=mode,
@@ -230,6 +268,11 @@ if result is not None:
     ):
         title = "本轮没有达到主升结构的研究候选"
     st.subheader(title)
+    st.caption(
+        f"中央多周期实现状态：{getattr(result, 'central_implementation_status', '—')}｜"
+        f"分析组件状态：{getattr(result, 'multi_timeframe_component_status', '—')}。"
+        "当前仍是部分实现的研究输出，不代表中央合同或样本外验证已完成。"
+    )
     st.caption(
         f"共同截止日：{result.data_cutoff.date() if result.data_cutoff is not None else '—'}｜"
         f"证券主表：{universe.get('master', '—')}｜当日有行情：{universe.get('active', '—')}｜"
@@ -309,7 +352,8 @@ if result is not None:
             st.caption(
                 "计划仓位以10%为一档，在股票仓内合计100%；占总资金比例="
                 "股票仓内比例×本轮股票敞口，其余为现金。介入价格是基于"
-                "共同截止日生成的一周条件计划，未触发条件时保持等待；不是无条件买入价。"
+                "所选持有期的慢周期/主结构和完整日线生成，未触发条件时保持等待；"
+                "不是无条件买入价。"
             )
         elif has_observation_allocation:
             st.caption(
@@ -354,8 +398,8 @@ if result is not None:
         st.warning(warning)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("达到主升研究门", result.entry_ready_count)
-    c2.metric("展示研究候选", len(result.research_candidates))
+    c1.metric("通过期限结构门", result.horizon_candidate_count)
+    c2.metric("日线介入结构就绪", result.entry_ready_count)
     c3.metric("通过当前介入门", result.actionable_candidate_count)
     c4.metric("完成研究风险评估的组合", result.evaluated_portfolio_count)
     st.caption(
@@ -379,14 +423,37 @@ if result is not None:
                 "操作权重·占总资金": item.operational_account_weight,
                 "操作比例·股票仓内（10%档）": (item.operational_stock_sleeve_weight),
                 "行业": item.industry,
+                "慢周期方向": (
+                    TIMEFRAME_LABELS.get(
+                        str(_timeframe_value(item, "slow_direction.timeframe", "")),
+                        str(_timeframe_value(item, "slow_direction.timeframe", "—")),
+                    )
+                    + "｜"
+                    + str(_timeframe_value(item, "slow_direction.direction", "—"))
+                ),
+                "主周期结构": (
+                    TIMEFRAME_LABELS.get(
+                        str(_timeframe_value(item, "structure.timeframe", "")),
+                        str(_timeframe_value(item, "structure.timeframe", "—")),
+                    )
+                    + "｜"
+                    + STRUCTURE_LABELS.get(
+                        str(_timeframe_value(item, "structure.state", "")),
+                        str(_timeframe_value(item, "structure.state", "—")),
+                    )
+                ),
+                "日线执行": EXECUTION_LABELS.get(
+                    str(_timeframe_value(item, "execution.state", "")),
+                    str(_timeframe_value(item, "execution.state", "—")),
+                ),
                 "当前行动": ACTION_LABELS[item.action],
                 "介入结构": PATTERN_LABELS.get(
                     item.entry_pattern.value,
                     item.entry_pattern.value,
                 ),
-                "突破线": item.breakout_line,
-                "60日绝对收益": item.absolute_return_60,
-                "全市场60日相对强度分位": item.relative_strength_percentile,
+                "主结构线": item.breakout_line,
+                "期限绝对收益": item.horizon_absolute_return,
+                "期限相对强度分位": item.relative_strength_percentile,
                 "下跌捕获率": item.downside_capture_ratio,
                 "研究下行风险贡献": item.downside_risk_contribution,
                 "研究分（非概率）": item.signal_score,
@@ -399,12 +466,12 @@ if result is not None:
         st.dataframe(
             candidate_rows.style.format(
                 {
-                    "突破线": "{:.2f}",
+                    "主结构线": "{:.2f}",
                     "精确目标·占总资金（审计）": "{:.2%}",
                     "操作权重·占总资金": "{:.1%}",
                     "操作比例·股票仓内（10%档）": "{:.0%}",
-                    "60日绝对收益": "{:.1%}",
-                    "全市场60日相对强度分位": "{:.1%}",
+                    "期限绝对收益": "{:.1%}",
+                    "期限相对强度分位": "{:.1%}",
                     "下跌捕获率": lambda value: "—" if pd.isna(value) else f"{value:.2f}",
                     "研究下行风险贡献": "{:.1%}",
                     "研究分（非概率）": "{:.3f}",
@@ -428,8 +495,8 @@ if result is not None:
         )
         q2.metric("年化下行波动", f"{research_metrics.annual_downside_volatility:.1%}")
         q3.metric(
-            "60日回撤严重度P90",
-            f"{research_metrics.rolling_max_drawdown_60_p90:.1%}",
+            f"{research_metrics.horizon_rolling_drawdown_window_sessions}日回撤严重度P90",
+            f"{research_metrics.horizon_rolling_max_drawdown_p90:.1%}",
         )
         q4.metric("5日ES95", f"{research_metrics.es95_5d:.1%}")
         st.caption(
@@ -447,11 +514,22 @@ if result is not None:
                 "代码": item.symbol,
                 "名称": item.name,
                 "行业": item.industry,
+                "主周期结构": (
+                    TIMEFRAME_LABELS.get(
+                        str(_timeframe_value(item, "structure.timeframe", "")),
+                        str(_timeframe_value(item, "structure.timeframe", "—")),
+                    )
+                    + "｜"
+                    + STRUCTURE_LABELS.get(
+                        str(_timeframe_value(item, "structure.state", "")),
+                        str(_timeframe_value(item, "structure.state", "—")),
+                    )
+                ),
                 "精确目标·占总资金（审计）": item.weight,
                 "行动操作权重·占总资金": item.operational_account_weight,
                 "行动操作比例·股票仓内（10%档）": (item.operational_stock_sleeve_weight),
                 "介入结构": PATTERN_LABELS.get(item.entry_pattern.value, item.entry_pattern.value),
-                "突破线": item.breakout_line,
+                "主结构线": item.breakout_line,
                 "距突破日": item.days_since_breakout,
                 "量价信号分（非概率）": item.signal_score,
                 "下行风险贡献": item.downside_risk_contribution,
@@ -465,7 +543,7 @@ if result is not None:
                     "精确目标·占总资金（审计）": "{:.2%}",
                     "行动操作权重·占总资金": "{:.1%}",
                     "行动操作比例·股票仓内（10%档）": "{:.0%}",
-                    "突破线": "{:.2f}",
+                    "主结构线": "{:.2f}",
                     "量价信号分（非概率）": "{:.3f}",
                     "下行风险贡献": "{:.1%}",
                 }
@@ -479,7 +557,10 @@ if result is not None:
         r1, r2, r3, r4 = st.columns(4)
         r1.metric("股票 / 现金", f"{result.stock_exposure:.0%} / {result.cash_weight:.0%}")
         r2.metric("年化下行波动", f"{m.annual_downside_volatility:.1%}")
-        r3.metric("60日回撤严重度P90", f"{m.rolling_max_drawdown_60_p90:.1%}")
+        r3.metric(
+            f"{m.horizon_rolling_drawdown_window_sessions}日回撤严重度P90",
+            f"{m.horizon_rolling_max_drawdown_p90:.1%}",
+        )
         r4.metric("5日ES95", f"{m.es95_5d:.1%}")
         r5, r6, r7, r8 = st.columns(4)
         r5.metric("下跌期最高相关", f"{m.max_down_period_correlation:.2f}")

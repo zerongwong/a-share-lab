@@ -5,21 +5,59 @@ A Share Lab 是本地优先的确定性研究程序。UI、MCP 和通知都只�
 
 ```mermaid
 flowchart TB
-    C["CSMAR\n只读历史基线"] --> H["Hybrid Loader\n显式拼接"]
-    I["Infoway EOD\n沪深每日增量"] --> V["Quarantine / Verified\n覆盖·单位·指数共同截止"]
-    V --> H
-    P["Ports\n行情·财务·公告·通知"] --> A["Adapters\nCSMAR·授权行情·SQLite·Keychain"]
-    A --> Q["Quality Gate\n共同截止·单位·PIT·权利范围"]
-    H --> Q
-    Q --> CYC["Cycle Policy\n价格周期·风险姿态"]
-    Q --> SEC["Security Screen\n主升硬门·候选排序"]
-    CYC --> S["Research Services\n行动标签·组合优化·行动单"]
-    SEC --> S
-    S --> R["Immutable Research Archive"]
-    S --> U["Streamlit UI"]
-    S --> M["Read-only MCP"]
-    S --> N["Server酱 / Bark 摘要"]
+    subgraph DATA["① 合法数据与共同截止"]
+        C["CSMAR\n只读历史基线"]
+        I["Infoway EOD\n沪深每日增量"]
+        V["Staging → Verified / Quarantine\n覆盖·单位·连续性"]
+        H["Hybrid Loader\n来源隔离、显式拼接"]
+        I --> V --> H
+        C --> H
+    end
+
+    subgraph EVIDENCE["② 时点安全证据"]
+        P["Ports\n行情·财务·公告"]
+        A["Adapters\n授权读取与标准化"]
+        Q{{"Quality Gate\n共同截止·PIT·权限"}}
+        P --> A --> Q
+        H --> Q
+    end
+
+    subgraph RESEARCH["③ 确定性多周期研究（运行时已接入）"]
+        ELIG["Shared Eligibility\n资格·流动性·可成交性"]
+        TF["Completed-bar Builder\n日 / 完整周 / 完整月"]
+        CYC["Cycle Policy\n风险姿态与敞口上限"]
+        HZ["Six Horizon Runtime\n结构·期限风险·价位"]
+        OVL["Overlap Audit\n重合矩阵与差异归因"]
+        PORT["3 / 4 / 5 Portfolio Search\n10%股票仓整数档"]
+        Q --> ELIG
+        Q --> TF
+        Q --> CYC
+        ELIG --> HZ
+        TF --> HZ
+        HZ --> OVL --> PORT
+        CYC --> PORT
+    end
+
+    subgraph DELIVERY["④ 只读交付与待完成归档"]
+        X["Structured Runtime Result"]
+        R[("Immutable Six-horizon Run Archive\npending")]
+        U["Streamlit UI"]
+        M["Read-only MCP"]
+        N["Server酱 / Bark\n衍生摘要"]
+        PORT --> X
+        X --> U
+        X --> M
+        X --> N
+        X -.-> R
+    end
 ```
+
+多周期 core 已经贯通组合 service、Streamlit UI、只读 MCP 和晚间 digest，并以 2026-08-27
+共同截止日做过一次真实数据的只读链路验收；图中的实线表示这条运行路径。虚线归档仍是
+`multi-timeframe-contract-v0.2.0` 的未完成部分：只有不可变运行档案实际包含点时官方日历确定的
+完整周/月 bar 截止、六期限独立结构/风险/LCB/价位以及重合归因时，运行才可声明完整合同。
+当前中央状态是 `integration_pending`，单次运行属于 `partial_multiframe`；架构图和组件版本都
+不能代替运行时归档证据。
 
 ## 分层规则
 
@@ -53,6 +91,42 @@ flowchart TB
   只有至少 3 只通过当前介入门，才另行搜索行动层 3/4/5 股风险可行组合；否则实际持仓
   为 0、现金为 100%；
 - 防御周期只收紧风险姿态，不停止候选发现。缺少或错位的周期证据才是数据错误。
+
+## 多周期运行时与目标边界
+
+当前运行路径已经在质量门之后拆成“共享资格 + 六个期限计算”，而不是把同一份日线候选名单
+复制六次；完整 `multi-timeframe-contract-v0.2.0` 仍要求把以下语义全部写入不可变逐运行档案：
+
+1. **共享资格层**只负责证券身份、ST/停牌、上市历史、流动性、可成交性、公司行为和共同
+   截止；它可以安全复用，但不得决定某一持有期的图形结构。
+2. **Completed-bar Builder**从同一日线来源确定性构建日、周、月序列。周线和月线只输出在
+   决策截止日前已完成的 bar；当前周/月累计行情只能进入日线执行证据。当前完成边界使用
+   周五/工作月末保守回退，尚未接入历史时点的官方交易日历边界，因此仍是部分实现。
+3. **期限引擎**分别保存采样周期、回看长度、计划持有期和复核/调仓周期，并分别计算慢周期
+   方向、主结构门、下行风险预算、持有期收益 LCB、条件介入线和结构失效线。日线执行价不得
+   绕过 3 个月以上期限的完整周/月结构门。
+4. **重合审计**计算六期限集合的两两重合率和逐股差异归因。股票真实跨期共振是允许结果；
+   系统不得为了视觉差异加入次优股票，也不得把重合当成六份独立证据。
+5. **组合层**对每个期限独立运行 3/4/5 股风险搜索和 10% 股票仓整数档离散化；不能复用
+   3 个月组合后只更换报告标题。
+
+当前末端风险保护也有明确边界：共享日线 5/20/60/120 日加速规则会冻结所有期限的新介入，
+各期限再保存自己的结构状态和日线执行 `EXTENDED` 状态；尚未加入未经点时校准的周线/月线
+主周期过热阈值。因此这套保护不能被称作“六个期限各自已有独立成熟度门”。
+
+每日 21:00 运行可以更新所有期限的执行状态，但不代表所有结构每天变化，也不等于每天调仓。
+3 个月和 6 个月的主结构只能随新的完整周线更新；1 年的月线方向只能随新的完整月线更新，
+其间日线只负责次日条件价、可买性和失效监控。
+
+研究服务必须归档等价于以下语义的字段（具体序列化名称可以演进）：每个采样周期的最后完整
+bar 截止、每个期限的结构门结果与原因、风险预算版本、forward-label/LCB 定义、价位来源周期、
+结构/执行更新时间、两两重合矩阵和逐股差异归因。缺失这些证据时策略实现标签必须是
+`partial_multiframe`，并按既有最终报告合同返回相应的研究/验证状态；不能悄悄回退后仍声称
+完成多周期研究。
+
+中央状态升级至少还需要四项：点时官方交易日历的周/月完成边界、上述六期限证据的不可变
+逐运行归档、经校准的周/月主周期末端成熟度门，以及严格样本外 walk-forward。运行链路验收
+只证明组件接通，不替代这四项。
 
 当前代码按单个共同截止日确定性输出五个可用状态：`UPTREND_EXPANSION`
 （中期上行｜短线增强）、`UPTREND_PULLBACK`（中期上行｜短线回撤或分化）、

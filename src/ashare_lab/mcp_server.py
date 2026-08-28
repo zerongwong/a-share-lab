@@ -22,11 +22,14 @@ import pandas as pd
 from platformdirs import user_data_path
 
 from ashare_lab.analytics.adaptive_portfolio import OPERATION_STOCK_SLEEVE_STEP
+from ashare_lab.analytics.multi_timeframe import MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
 from ashare_lab.services.build_midterm_portfolio import (
+    CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
     HOLDING_PERIOD_SESSIONS,
     CandidateAction,
     ConditionalEntryPlanKind,
     build_midterm_portfolio,
+    horizon_history_requirements,
 )
 from ashare_lab.services.load_hybrid_universe import load_hybrid_universe
 
@@ -67,8 +70,9 @@ def _conditional_entry_fields(
     plan: object,
     evidence_unknown: object,
     expected_cutoff: object,
+    expected_holding_weeks: int,
 ) -> dict[str, Any]:
-    """Serialize a one-week entry plan without turning trend evidence into a quote.
+    """Serialize a horizon-aware daily entry plan without inventing a quote.
 
     This mirrors the concise UI semantics while failing closed for every
     non-actionable or incomplete row.  ``breakout_line`` deliberately is not an
@@ -88,18 +92,22 @@ def _conditional_entry_fields(
 
     cutoff = _normalized_timestamp(getattr(plan, "data_cutoff", None))
     expected = _normalized_timestamp(expected_cutoff)
+    raw_sessions = getattr(plan, "sessions", None)
     try:
-        sessions = int(plan.sessions)
+        sessions = int(raw_sessions)
     except (AttributeError, TypeError, ValueError):
         sessions = 0
     horizon = getattr(plan, "horizon", None)
     kind = getattr(getattr(plan, "kind", None), "value", getattr(plan, "kind", None))
+    expected_sessions = HOLDING_PERIOD_SESSIONS.get(expected_holding_weeks)
     if (
         cutoff is None
         or expected is None
         or cutoff != expected
-        or horizon != "一周"
-        or sessions != 5
+        or not isinstance(horizon, str)
+        or not horizon.strip()
+        or expected_sessions is None
+        or raw_sessions != expected_sessions
     ):
         return {
             "conditional_entry_plan": None,
@@ -138,16 +146,50 @@ def _conditional_entry_fields(
             "entry_price_condition_label": ENTRY_PRICE_UNAVAILABLE_LABEL,
         }
 
+    plan_payload: dict[str, Any] = {
+        "kind": kind,
+        "data_cutoff": cutoff.date().isoformat(),
+        "horizon": horizon,
+        "sessions": sessions,
+        "price_low": price_low,
+        "price_high": price_high,
+        "trigger": trigger,
+    }
+    structure_timeframe = getattr(plan, "structure_timeframe", None)
+    structure_cutoff = _date_string(getattr(plan, "structure_cutoff", None))
+    execution_lookback = getattr(plan, "execution_lookback_sessions", None)
+    method_version = getattr(plan, "method_version", None)
+    if structure_timeframe is not None:
+        plan_payload["structure_timeframe"] = structure_timeframe
+    if structure_cutoff is not None:
+        plan_payload["structure_cutoff"] = structure_cutoff
+    if execution_lookback is not None:
+        plan_payload["execution_lookback_sessions"] = execution_lookback
+    if method_version is not None:
+        plan_payload["method_version"] = method_version
+    for field_name in (
+        "price_source_timeframe",
+        "primary_structure_timeframe",
+        "invalidation_source_timeframe",
+        "reduction_review_source_timeframe",
+    ):
+        field_value = getattr(plan, field_name, None)
+        if field_value is not None:
+            plan_payload[field_name] = field_value
+    primary_cutoff = _date_string(getattr(plan, "primary_structure_cutoff", None))
+    if primary_cutoff is not None:
+        plan_payload["primary_structure_cutoff"] = primary_cutoff
+    for field_name in (
+        "entry_reference_price",
+        "primary_structure_reference_price",
+        "invalidation_price",
+        "reduction_review_price",
+    ):
+        field_value = _positive_entry_price(getattr(plan, field_name, None))
+        if field_value is not None:
+            plan_payload[field_name] = field_value
     return {
-        "conditional_entry_plan": {
-            "kind": kind,
-            "data_cutoff": cutoff.date().isoformat(),
-            "horizon": horizon,
-            "sessions": sessions,
-            "price_low": price_low,
-            "price_high": price_high,
-            "trigger": trigger,
-        },
+        "conditional_entry_plan": plan_payload,
         "entry_price_condition_label": label,
     }
 
@@ -156,6 +198,7 @@ def _price_observation_fields(
     *,
     plan: object,
     expected_cutoff: object,
+    expected_holding_weeks: int,
 ) -> dict[str, Any]:
     """Serialize neutral price levels in a namespace separate from entry permission."""
 
@@ -164,6 +207,7 @@ def _price_observation_fields(
         plan=plan,
         evidence_unknown=(),
         expected_cutoff=expected_cutoff,
+        expected_holding_weeks=expected_holding_weeks,
     )["conditional_entry_plan"]
     if serialized is None:
         return {
@@ -177,7 +221,7 @@ def _price_observation_fields(
     elif kind == ConditionalEntryPlanKind.RECLAIM.value:
         label = f"收盘站回观察线 ≥ **{serialized['trigger']:.2f}元**"
     else:
-        label = f"收盘突破观察线 ≥ **{serialized['trigger']:.2f}元**，且成交量不低于20日中位数1.2倍"
+        label = f"收盘突破观察线 ≥ **{serialized['trigger']:.2f}元**，并满足期限量能确认"
     return {
         "price_observation_plan": {
             **serialized,
@@ -208,6 +252,175 @@ def _positive_entry_price(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return price if np.isfinite(price) and price > 0.0 else None
+
+
+def _multi_timeframe_fields(assessment: object) -> dict[str, Any]:
+    """Return compact derived timeframe evidence without raw bars."""
+
+    if assessment is None:
+        return {"multi_timeframe": None}
+    contract = getattr(assessment, "contract", None)
+    slow = getattr(assessment, "slow_direction", None)
+    structure = getattr(assessment, "structure", None)
+    execution = getattr(assessment, "execution", None)
+    return {
+        "multi_timeframe": {
+            "method_version": getattr(assessment, "method_version", None),
+            "implementation_status": getattr(assessment, "implementation_status", None),
+            "holding_weeks": getattr(assessment, "holding_weeks", None),
+            "completed_daily_cutoff": _date_string(getattr(assessment, "data_cutoff", None)),
+            "completed_weekly_cutoff": _date_string(getattr(assessment, "weekly_cutoff", None)),
+            "completed_monthly_cutoff": _date_string(getattr(assessment, "monthly_cutoff", None)),
+            "candidate_qualified": bool(getattr(assessment, "candidate_qualified", False)),
+            "daily_execution_ready": bool(getattr(assessment, "execution_ready", False)),
+            "score_not_probability": getattr(assessment, "score", None),
+            "slow_timeframe": getattr(
+                getattr(slow, "timeframe", None),
+                "value",
+                None,
+            ),
+            "slow_direction": getattr(
+                getattr(slow, "direction", None),
+                "value",
+                None,
+            ),
+            "slow_bar_cutoff": _date_string(getattr(assessment, "slow_bar_cutoff", None)),
+            "primary_timeframe": getattr(
+                getattr(structure, "timeframe", None),
+                "value",
+                None,
+            ),
+            "primary_structure": getattr(
+                getattr(structure, "state", None),
+                "value",
+                None,
+            ),
+            "primary_breakout_line": getattr(structure, "breakout_line", None),
+            "primary_bar_cutoff": _date_string(getattr(assessment, "structure_bar_cutoff", None)),
+            "daily_execution_state": getattr(
+                getattr(execution, "state", None),
+                "value",
+                None,
+            ),
+            "relative_strength_sessions": getattr(
+                contract,
+                "relative_strength_sessions",
+                None,
+            ),
+            "incomplete_week_excluded": bool(
+                getattr(assessment, "incomplete_week_excluded", False)
+            ),
+            "incomplete_month_excluded": bool(
+                getattr(assessment, "incomplete_month_excluded", False)
+            ),
+        }
+    }
+
+
+def _derived_field(value: object, name: str, default: object = None) -> object:
+    """Read one derived dataclass or mapping field without exposing source data."""
+
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _horizon_risk_lcb_fields(
+    portfolio: object,
+    *,
+    expected_holding_weeks: int,
+) -> dict[str, Any]:
+    """Serialize the selected horizon's derived risk and historical LCB audit.
+
+    Action, risk-qualified research and rejected observation evaluations remain
+    distinguishable.  A mismatched holding-period metric fails closed rather
+    than being relabelled as the requested horizon.
+    """
+
+    expected_sessions = HOLDING_PERIOD_SESSIONS.get(expected_holding_weeks)
+    if expected_sessions is None:
+        raise ValueError("unsupported holding horizon")
+
+    evaluation = getattr(portfolio, "evaluation", None)
+    allocation_nature = "action_research"
+    if evaluation is None:
+        evaluation = getattr(portfolio, "research_evaluation", None)
+        allocation_nature = "risk_qualified_research"
+    if evaluation is None:
+        evaluation = getattr(portfolio, "observation_evaluation", None)
+        allocation_nature = "observation_only"
+
+    base: dict[str, Any] = {
+        "available": False,
+        "holding_weeks": expected_holding_weeks,
+        "holding_period_sessions": expected_sessions,
+        "allocation_nature": "unavailable" if evaluation is None else allocation_nature,
+        "risk_budget_passed": None,
+        "risk_violations": [],
+        "holding_period_return_lcb_gate_passed": None,
+    }
+    if evaluation is None:
+        return base
+
+    metrics = getattr(evaluation, "metrics", None)
+    risk_budget = getattr(evaluation, "risk_budget", None)
+    actual_sessions = _derived_field(metrics, "holding_period_sessions")
+    if actual_sessions != expected_sessions:
+        return {**base, "reason": "holding_period_metric_mismatch"}
+
+    violations = tuple(_derived_field(risk_budget, "violations", ()) or ())
+    risk_passed = bool(_derived_field(risk_budget, "passed", False))
+    rejection_reasons = tuple(getattr(portfolio, "observation_rejection_reasons", ()) or ())
+    lcb_passed = (
+        "holding_period_return_lcb_below_minimum" not in rejection_reasons
+        if allocation_nature == "observation_only"
+        else True
+    )
+    return {
+        **base,
+        "available": True,
+        "risk_budget_passed": risk_passed,
+        "risk_violations": list(violations),
+        "horizon_rolling_drawdown_window_sessions": _derived_field(
+            metrics,
+            "horizon_rolling_drawdown_window_sessions",
+        ),
+        "horizon_rolling_max_drawdown_p90": _derived_field(
+            metrics,
+            "horizon_rolling_max_drawdown_p90",
+        ),
+        "horizon_rolling_drawdown_limit": _derived_field(
+            risk_budget,
+            "horizon_rolling_drawdown_limit",
+        ),
+        "horizon_rolling_drawdown_passed": _derived_field(
+            risk_budget,
+            "horizon_rolling_drawdown_passed",
+        ),
+        "holding_period_sample_count": _derived_field(
+            metrics,
+            "holding_period_sample_count",
+        ),
+        "holding_period_return_mean": _derived_field(
+            metrics,
+            "holding_period_return_mean",
+        ),
+        "holding_period_return_lcb": _derived_field(
+            metrics,
+            "holding_period_return_lcb",
+        ),
+        "lcb_confidence": _derived_field(metrics, "lcb_confidence"),
+        "holding_period_cost_rate": _derived_field(
+            metrics,
+            "holding_period_cost_rate",
+        ),
+        "holding_period_return_lcb_gate_passed": lcb_passed,
+    }
+
+
+def _date_string(value: object) -> str | None:
+    timestamp = _normalized_timestamp(value)
+    return None if timestamp is None else timestamp.date().isoformat()
 
 
 def _environment_flag(name: str, *, default: bool = False) -> bool:
@@ -355,8 +568,7 @@ class ReadOnlyResearchTools:
             and (self.settings.csmar_reference_dir / "csmar_reference.duckdb").is_file()
             else None
         )
-        holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
-        minimum_sessions = max(252, holding_sessions * 8 + 1)
+        history_requirements = horizon_history_requirements(holding_weeks)
         hybrid = load_hybrid_universe(
             self.settings.csmar_cache_dir,
             overlay_root=(
@@ -365,8 +577,9 @@ class ReadOnlyResearchTools:
                 else self.settings.csmar_cache_dir.parent / "market_overlay"
             ),
             as_of=cutoff,
-            minimum_sessions=minimum_sessions,
-            history_sessions=minimum_sessions + 70,
+            minimum_sessions=history_requirements.qualification_minimum_sessions,
+            history_sessions=history_requirements.history_read_sessions,
+            minimum_qualification_sessions=(history_requirements.qualification_minimum_sessions),
             reference_dataset_root=reference_root,
             decision_date=cutoff,
             mode=mode,
@@ -408,6 +621,16 @@ class ReadOnlyResearchTools:
             "holding_weeks": holding_weeks,
             "profile": "adaptive_3_to_5_maintrend",
             "method_version": portfolio.method_version,
+            "central_implementation_status": getattr(
+                portfolio,
+                "central_implementation_status",
+                CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
+            ),
+            "multi_timeframe_component_status": getattr(
+                portfolio,
+                "multi_timeframe_component_status",
+                MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
+            ),
             "mode": mode,
             "data_lineage": {
                 "historical_baseline_cutoff": (hybrid.historical_baseline_cutoff.isoformat()),
@@ -426,10 +649,19 @@ class ReadOnlyResearchTools:
                 "excluded_symbols": snapshot.excluded_symbols,
             },
             "entry_ready_count": portfolio.entry_ready_count,
+            "horizon_candidate_count": getattr(
+                portfolio,
+                "horizon_candidate_count",
+                portfolio.entry_ready_count,
+            ),
             "actionable_candidate_count": portfolio.actionable_candidate_count,
             "search_pool_count": portfolio.search_pool_count,
             "evaluated_portfolio_count": portfolio.evaluated_portfolio_count,
             "action_evaluated_portfolio_count": (portfolio.action_evaluated_portfolio_count),
+            "horizon_risk_and_lcb": _horizon_risk_lcb_fields(
+                portfolio,
+                expected_holding_weeks=holding_weeks,
+            ),
             # Compatibility-only alias.  The canonical field below makes clear
             # that this is a research action layer, not a brokerage position.
             "actual_allocation": legacy_actual_allocation,
@@ -465,9 +697,30 @@ class ReadOnlyResearchTools:
                     "entry_pattern": candidate.entry_pattern.value,
                     "breakout_line": candidate.breakout_line,
                     "days_since_breakout": candidate.days_since_breakout,
+                    "legacy_sixty_session_absolute_return": candidate.absolute_return_60,
                     "sixty_session_absolute_return": candidate.absolute_return_60,
+                    "horizon_absolute_return": getattr(
+                        candidate,
+                        "horizon_absolute_return",
+                        None,
+                    ),
+                    "horizon_return_sessions": getattr(
+                        candidate,
+                        "relative_strength_sessions",
+                        None,
+                    ),
+                    "full_universe_horizon_relative_strength_percentile": (
+                        candidate.relative_strength_percentile
+                    ),
                     "full_universe_relative_strength_60_percentile": (
                         candidate.relative_strength_percentile
+                        if getattr(
+                            getattr(getattr(candidate, "timeframe", None), "contract", None),
+                            "relative_strength_sessions",
+                            60,
+                        )
+                        == 60
+                        else None
                     ),
                     "downside_capture_ratio": candidate.downside_capture_ratio,
                     "research_weight_not_current_holding": candidate.research_weight,
@@ -499,11 +752,14 @@ class ReadOnlyResearchTools:
                         plan=getattr(candidate, "conditional_entry_plan", None),
                         evidence_unknown=candidate.evidence_unknown,
                         expected_cutoff=portfolio.data_cutoff,
+                        expected_holding_weeks=holding_weeks,
                     ),
                     **_price_observation_fields(
                         plan=getattr(candidate, "price_observation_plan", None),
                         expected_cutoff=portfolio.data_cutoff,
+                        expected_holding_weeks=holding_weeks,
                     ),
+                    **_multi_timeframe_fields(getattr(candidate, "timeframe", None)),
                 }
                 for candidate in portfolio.research_candidates
             ],
@@ -564,6 +820,16 @@ class ReadOnlyResearchTools:
                     "entry_pattern": position.entry_pattern.value,
                     "breakout_line": position.breakout_line,
                     "days_since_breakout": position.days_since_breakout,
+                    "horizon_absolute_return": getattr(
+                        position,
+                        "horizon_absolute_return",
+                        None,
+                    ),
+                    "horizon_return_sessions": getattr(
+                        position,
+                        "relative_strength_sessions",
+                        None,
+                    ),
                     "ranking_score_not_probability": position.signal_score,
                     "downside_risk_contribution": position.downside_risk_contribution,
                     "evidence_unknown": list(position.evidence_unknown),
@@ -575,11 +841,14 @@ class ReadOnlyResearchTools:
                         plan=getattr(position, "conditional_entry_plan", None),
                         evidence_unknown=position.evidence_unknown,
                         expected_cutoff=portfolio.data_cutoff,
+                        expected_holding_weeks=holding_weeks,
                     ),
                     **_price_observation_fields(
                         plan=getattr(position, "price_observation_plan", None),
                         expected_cutoff=portfolio.data_cutoff,
+                        expected_holding_weeks=holding_weeks,
                     ),
+                    **_multi_timeframe_fields(getattr(position, "timeframe", None)),
                 }
                 for position in portfolio.positions
             ],

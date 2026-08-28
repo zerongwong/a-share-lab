@@ -85,6 +85,12 @@ _MANIFEST_COLUMNS = (
     "verified_at",
 )
 
+# Full-market membership needs enough complete daily history for the common
+# market-regime and basic liquidity gates.  Holding-horizon risk history is a
+# candidate-level requirement and must not remove nearly half the market before
+# the horizon screen has even run.
+HYBRID_QUALIFICATION_MINIMUM_SESSIONS = 252
+
 
 def load_hybrid_universe(
     dataset_root: str | Path,
@@ -96,6 +102,7 @@ def load_hybrid_universe(
     overlay_source_id: str = "infoway",
     core_index_codes: tuple[str, ...] = DEFAULT_CORE_INDEX_CODES,
     overlay_store: _VerifiedOverlayReader | None = None,
+    minimum_qualification_sessions: int = HYBRID_QUALIFICATION_MINIMUM_SESSIONS,
     **csmar_options: object,
 ) -> HybridUniverseLoad:
     """Return a CSMAR snapshot extended only by verified, later EOD rows.
@@ -118,6 +125,38 @@ def load_hybrid_universe(
         raise ValueError("core_index_codes must contain at least three unique codes")
     if "core_index_codes" in csmar_options:
         raise ValueError("pass core_index_codes only once")
+    if (
+        isinstance(minimum_qualification_sessions, bool)
+        or not isinstance(minimum_qualification_sessions, int)
+        or minimum_qualification_sessions < HYBRID_QUALIFICATION_MINIMUM_SESSIONS
+    ):
+        raise ValueError("minimum_qualification_sessions must be an integer of at least 252")
+
+    # ``minimum_sessions`` was historically supplied by the six-horizon
+    # orchestrator as the downstream portfolio-risk requirement (for one year,
+    # 2017 prices).  Preserve it as a requested read-depth validation, but do
+    # not apply it as a full-market coverage gate.  Each horizon service later
+    # excludes a structurally qualified stock whose own risk history is short.
+    requested_risk_sessions_raw = csmar_options.pop(
+        "minimum_sessions",
+        minimum_qualification_sessions,
+    )
+    history_sessions_raw = csmar_options.get("history_sessions", 320)
+    if (
+        isinstance(requested_risk_sessions_raw, bool)
+        or not isinstance(requested_risk_sessions_raw, int)
+        or requested_risk_sessions_raw < HYBRID_QUALIFICATION_MINIMUM_SESSIONS
+    ):
+        raise ValueError("minimum_sessions must be an integer of at least 252")
+    if (
+        isinstance(history_sessions_raw, bool)
+        or not isinstance(history_sessions_raw, int)
+        or history_sessions_raw < max(requested_risk_sessions_raw, minimum_qualification_sessions)
+    ):
+        raise ValueError(
+            "history_sessions cannot be shorter than the requested risk or qualification history"
+        )
+    csmar_options["minimum_sessions"] = minimum_qualification_sessions
 
     baseline = _load_baseline_allowing_verified_live_extension(
         dataset_root,
@@ -127,6 +166,17 @@ def load_hybrid_universe(
         core_index_codes=core_index_codes,
         csmar_options=csmar_options,
     )
+    if requested_risk_sessions_raw > minimum_qualification_sessions:
+        baseline = replace(
+            baseline,
+            reference_warnings=(
+                *baseline.reference_warnings,
+                "全市场资格门仅要求"
+                f"{minimum_qualification_sessions}个完整价格点；"
+                f"{requested_risk_sessions_raw}个价格点的持有期风险历史"
+                "仅对各期限结构合格候选逐股核验。",
+            ),
+        )
     baseline_cutoff = baseline.data_cutoff
     master_symbols = _read_csmar_master_symbols(dataset_root)
     if not set(baseline.histories).issubset(master_symbols):

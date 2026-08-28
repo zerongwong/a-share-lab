@@ -1,5 +1,42 @@
 # Medium-term model contract
 
+## Version and implementation truth
+
+**Central implementation status:** `integration_pending`
+
+The nested-timeframe rules below are the normative target for
+`multi-timeframe-contract-v0.2.0`. Writing the
+contract does not prove that a software run implements it. A run may declare this strategy version
+only when its immutable archive contains equivalent evidence for completed weekly/monthly cutoffs,
+per-horizon structure gates, per-horizon risk and return lower-confidence bounds, per-horizon price
+levels, and cross-horizon overlap attribution. A run missing any of those items must identify itself
+as `legacy_single_daily_gate` or `partial_multiframe`; it must not describe six parameterizations of
+one daily screen as six independent timeframe models. Runtime archive metadata, not repository prose
+or UI copy, is the source of truth.
+
+This is the single repository-level implementation-status marker for the contract. Component-level
+versions do not change it. Set it to `integrated/research_validation_pending` only after the complete
+service path has passed real integration acceptance for every required archive and report semantic,
+and the required purged walk-forward path has produced an auditable out-of-sample acceptance archive.
+Further investment-validity thresholds may still remain pending after that transition.
+
+**Current runtime note (2026-08-28):** the multi-timeframe analytics core is wired through the
+portfolio service, UI, read-only MCP, and evening digest. A read-only integration run using the
+2026-08-27 common cutoff exercised all six horizon routes. That acceptance proves component plumbing,
+not the complete contract. Runtime results remain `partial_multiframe`, and the central status stays
+`integration_pending`, because four requirements are still open:
+
+1. point-in-time official-exchange-calendar boundaries for completed weekly and monthly bars;
+2. one immutable per-run archive containing all six-horizon cutoffs, gates, risk/LCB, price-source,
+   and overlap/difference evidence;
+3. calibrated primary-weekly/monthly late-stage maturity gates; and
+4. the strict purged walk-forward out-of-sample acceptance described below.
+
+The current late-stage protection is narrower than the target contract: one shared daily
+5/20/60/120-session acceleration freeze is combined with each horizon's structure state and daily
+execution `EXTENDED` status. It must not be described as six independently calibrated weekly/monthly
+maturity gates. Do not add unvalidated primary-timeframe overheat thresholds merely to close this gap.
+
 ## Objective
 
 On every data-qualified decision date, run the deterministic full-market security screen even when the price-cycle evidence is defensive. When at least three securities pass the security gates, expose three to five ranked research candidates, with four as the attention default, and then separately determine which candidates, if any, have a conditional entry and whether they form a risk-feasible portfolio. If only zero to two securities pass the security gates, expose the available evidence, do not form a portfolio, and do not add inferior names. Do not optimize raw return alone and do not ask the user to choose an annual return target.
@@ -28,18 +65,113 @@ For each security set, exhaustively enumerate only the ten-point grids that sati
 
 Recompute portfolio downside volatility, rolling drawdown, five-day expected shortfall, position downside-risk contribution, industry concentration, holding-period return bounds, and every other reported or hard portfolio metric using `operational_account_weight`, never the continuous target. If the selected nearest grid fails a risk budget, reject that security set. Do not search a second-nearest or farther grid to rescue it, because risk-aware grid shopping would over-deviate from the continuous target. If no security set survives, do not form a portfolio and retain cash; never relax a limit or present the continuous audit target as executable. Both exact and operational weights are research outputs under the current universe, constraints, and deterministic search approximation. They are not brokerage positions, orders, a globally optimal solution over all possible market combinations, or a future-optimal allocation.
 
-## Horizons
+## Nested-timeframe horizon contract
 
-| Horizon | Role |
-|---|---|
-| 1 week / 5 sessions | Entry timing and immediate failure detection |
-| 2 weeks / 10 sessions | Short-term strength confirmed by the 20/60-session structure rather than a five-day spike |
-| 1 month / 20 sessions | Short end of the core holding thesis |
-| 3 months / 60 sessions | Default selection and portfolio-risk horizon |
-| 6 months / 120 sessions | Fundamental and trend persistence check |
-| 1 year / 252 sessions | Long-term continuation scenario, never extrapolated from short momentum |
+Keep four time concepts independent and archive all four:
 
-Require the thesis to remain coherent across adjacent horizons. A strong five-day move cannot compensate for a late-stage or unstable 60/120-day structure.
+1. **Signal sampling interval** is the daily, weekly, or monthly bar aggregation.
+2. **Signal lookback** is the number of completed bars used on that sampling interval.
+3. **Planned holding/evaluation horizon** is the forward session count used for outcome labels and
+   the net-return lower-confidence bound.
+4. **Review/rebalance cadence** determines when a portfolio may be reconstituted. A daily action
+   review is not permission or a requirement to replace holdings every day.
+
+Do not infer any one of these from another. In particular, a 60-session holding horizon does not
+imply a 60-daily-bar signal, and a 252-daily-bar lookback does not imply either a one-year holding
+period or monthly rebalancing.
+
+Use slow, primary-structure, and execution timeframes as follows:
+
+| Horizon | Slow context | Primary structure | Execution evidence | Primary / slow refresh |
+|---|---|---|---|---|
+| 1 week / 5 sessions | last completed weekly bars | daily fresh breakout or first healthy retest | completed daily bar | daily / weekly |
+| 2 weeks / 10 sessions | last completed weekly bars | ordered daily short/intermediate base; reject five-day spikes | completed daily bar | daily / weekly |
+| 1 month / 20 sessions | last completed weekly bars | daily base, volume-confirmed breakout, and post-breakout acceptance | completed daily bar | daily / weekly |
+| 3 months / 60 sessions | last completed monthly bars | completed weekly trend, base, and breakout/retest | daily confirmation and executable condition | weekly / monthly |
+| 6 months / 120 sessions | last completed monthly bars | completed weekly primary trend and secondary breakout/retest | weekly confirmation plus daily executability | weekly / monthly |
+| 1 year / 252 sessions | last completed monthly primary trend | completed weekly long base and continuation breakout | weekly confirmation plus daily executability | weekly / monthly |
+
+The deterministic analytics core starts with the following **unvalidated v0.2 research defaults**.
+`D`, `W`, and `M` mean completed daily, weekly, and monthly bars. These values distinguish signal
+lookbacks from holding horizons; they are not empirically optimal, permanent, or permission to tune
+against the full sample. Any change requires a method-version change and new point-in-time validation.
+
+| Horizon | Slow fast/slow MA | Primary lookback/recent/base | Minimum daily history |
+|---|---:|---:|---:|
+| 1 week | W4/W13 | D20/D5/D12 | 80 sessions |
+| 2 weeks | W4/W13 | D30/D8/D18 | 95 sessions |
+| 1 month | W8/W26 | D60/D10/D30 | 140 sessions |
+| 3 months | M3/M6 | W13/W4/W8 | 180 sessions |
+| 6 months | M6/M12 | W26/W6/W13 | 280 sessions |
+| 1 year | M12/M24 | W52/W8/W26 | 540 sessions |
+
+| Horizon | Daily execution breakout/recent/MA | Daily anchor MA | Relative-strength sessions |
+|---|---:|---:|---:|
+| 1 week | D20/D5/D10 | D20 | 5 |
+| 2 weeks | D30/D8/D10 | D20 | 10 |
+| 1 month | D40/D10/D20 | D60 | 20 |
+| 3 months | D60/D15/D20 | D120 | 60 |
+| 6 months | D90/D20/D40 | D120 | 120 |
+| 1 year | D120/D25/D50 | D252 | 252 |
+
+This is a nested model, not an exclusive rule that short horizons use only daily charts and long
+horizons use only monthly charts. The slow timeframe permits direction, the primary timeframe
+qualifies the base/breakout/retest, and the execution timeframe translates an already-qualified
+structure into a next-session condition and invalidation. Daily execution does not equal daily
+selection. For horizons of three months or longer, daily evidence must never override a failed or
+missing completed weekly/monthly gate.
+
+Weekly and monthly bars must be complete as of the decision cutoff. During a week or month, the
+partial aggregate may be retained only as explicitly identified execution evidence; it cannot pass a
+weekly or monthly hard gate. A holiday-shortened week becomes complete after the final actual exchange
+session of that week. Bar construction must use the point-in-time exchange calendar, not a fixed
+five-sessions-per-week approximation.
+
+If the official calendar is unavailable, a `W-FRI`/business-month-end fallback may conservatively
+defer a possibly complete shortened period, but it must never close one early. Archive the fallback
+and its reason, label contract implementation partial, and do not claim full integration until the
+official-calendar completed-period boundary is used.
+
+Require adjacent-horizon coherence, but do not require different names for visual variety. The same
+security may legitimately pass several horizons when each horizon independently confirms its own
+slow context, primary structure, risk budget, return LCB, entry condition, and invalidation. Such a
+result is genuine confluence. Every six-horizon report must show a pairwise overlap rate or overlap
+matrix and per-security attribution explaining whether overlap arose from the shared eligibility gate,
+independent structure confirmation, or merely similar ranking. It must also explain why a security
+entered one horizon but not an adjacent horizon. Without independent gates and this attribution, do
+not call overlap “multi-timeframe confirmation.”
+
+Candidate overlap uses pairwise Jaccard similarity, `|A intersection B| / |A union B|`; report it
+separately for machine candidates and risk-qualified portfolios. If both sets are empty, report the
+value as unavailable rather than 100%. Per-security difference attribution must distinguish at least
+shared-eligibility-only, independent-structure-confluence, slow-context failure, primary-structure
+failure, risk/LCB failure, untriggered price condition, and rank-only similarity. Weighted sleeve
+overlap may be added, but it must not replace the set-based audit.
+
+### Shared and horizon-specific computation
+
+The following may be shared exactly once across horizons:
+
+- licensed-source and common-cutoff checks;
+- security identity, historical listing status, ST/delisting/suspension status, corporate-action
+  integrity, liquidity, capacity, and decision-date executability;
+- point-in-time financial/announcement veto evidence whose publication gate is horizon-independent.
+
+After that shared eligibility layer, each horizon must independently compute and archive:
+
+- slow-context and primary-structure gate results with bar cutoffs and reason codes;
+- stage maturity, extension, ATR/volatility, and volume confirmation on its configured sampling
+  intervals and lookbacks;
+- downside-risk budget and portfolio metrics appropriate to that holding horizon;
+- forward net-return distribution and lower-confidence bound using that horizon's non-overlapping or
+  purged outcome labels;
+- conditional entry, structural invalidation, and staged-reduction levels with their source timeframe;
+- candidate ranking and the complete 3/4/5-security portfolio search using that horizon's operational
+  weights.
+
+Do not reuse a 60-session breakout line, one risk evaluation, one portfolio, or one price plan across
+all six horizons and relabel it. A shared eligible universe is intentional; a shared post-eligibility
+decision is not.
 
 ## Data hierarchy
 
@@ -57,6 +189,10 @@ Never use a report period as its publication date. Never backfill today's revise
 - Freeze late acceleration when any robust combination holds: consecutive limit-ups, 20-day return above 35%, price more than 15% above MA20, price more than 3 ATR above its base, or a near-vertical Edwards–Magee trend channel. Re-evaluate only after a base forms.
 - Reject unknown units, stale cutoffs, material missing eligibility fields, implausible corporate-action jumps, or unlicensed data.
 - Reject portfolios that breach industry, pair-correlation, volatility, drawdown, liquidity-capacity, or data-coverage limits.
+
+The late-acceleration bullet above is the normative target. In the current partial runtime, only the
+shared daily acceleration freeze plus horizon structure/daily `EXTENDED` evidence is implemented;
+weekly/monthly primary-timeframe maturity thresholds remain pending calibration.
 
 ## Evidence layers
 
@@ -102,8 +238,21 @@ Howard Marks's cycle framework governs the balance between aggressiveness and de
 - Include delisted names, historical ST/suspension states, corporate actions, fees, tax, slippage, and unfilled entries.
 - Report block-bootstrap confidence intervals for Sharpe and Calmar, non-overlapping horizon outcomes, turnover, capacity, worst fold, maximum drawdown, and CVaR.
 - Validate the five implemented price-cycle states, exposure overlays, and security selection both jointly and separately. Compare the double-layer policy with an always-invested benchmark and with the former risk-off hard stop. Separately test whether adding persistence or hysteresis improves out-of-sample behavior before implementing either feature.
+- Validate all six slow/primary/execution timeframe mappings separately. Rebuild completed weekly and
+  monthly bars at every historical decision date from the then-known exchange calendar, including
+  holiday-shortened weeks, and prove that partial higher-timeframe bars never pass a gate.
+- Ablate sampling interval, signal lookback, holding/evaluation horizon, and review/rebalance cadence
+  independently so that apparent performance cannot come from conflating those four concepts.
+- Compare `multi-timeframe-contract-v0.2.0` with `legacy_single_daily_gate` under identical point-in-time universe,
+  costs, slippage, capacity, and portfolio constraints. Report the incremental result, turnover,
+  worst fold, and a multiplicity-adjusted confidence interval rather than only the new model in sample.
+- Evaluate horizon overlap jointly. The same security across several horizons is correlated evidence,
+  not several independent observations; never multiply confidence or count it repeatedly in a pooled
+  significance test. Report false-confluence and neighboring-horizon disagreement diagnostics.
 - Keep a research-only status until the out-of-sample thresholds are met. Never substitute in-sample metrics.
-- Before that validation is complete, cycle labels, candidate ranks, exposure caps, and entry states are research outputs, not promises of future return, bear-market resilience, or successful market timing.
+- Before that validation is complete, cycle labels, candidate ranks, exposure caps, entry states, and
+  multi-timeframe confluence are research outputs, not promises of future return, bear-market resilience,
+  successful market timing, or superiority over the daily baseline.
 
 ## Final report contract
 
@@ -123,8 +272,11 @@ Every data-qualified report must show the implemented cycle label, its evidence 
 confidence, three to five ranked candidates when at least three pass the security gates (otherwise
 the available zero to two without forming a portfolio), each candidate's deployment state, the
 actionable count, the exposure cap, and cash. For each security include rank, automatic weight,
-thesis by horizon, entry condition, structural invalidation, reduction conditions, evidence,
+thesis by horizon, entry condition and its source timeframe, structural invalidation, reduction conditions, evidence,
 principal risks, and data
 confidence. For the portfolio include cash, zero borrowing, historical and out-of-sample metrics
 separately, scenario ranges, evidence coverage, strategy/data versions, and the next scheduled
-review condition.
+review condition. A report declaring `multi-timeframe-contract-v0.2.0` must additionally show the last completed
+daily/weekly/monthly bar cutoffs, per-horizon structure/risk/LCB status, pairwise horizon overlap, and
+per-security difference attribution. The exact serialized field names may evolve, but these audit
+semantics may not be omitted.

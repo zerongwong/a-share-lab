@@ -11,19 +11,71 @@ from ashare_lab.analytics.cycle_policy import PriceCycleState
 from ashare_lab.analytics.entry_readiness import EntryPattern
 from ashare_lab.analytics.indicators import enrich_indicators
 from ashare_lab.analytics.levels import build_horizon_levels
+from ashare_lab.analytics.multi_timeframe import (
+    MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
+    ExecutionState,
+    StructureState,
+    assess_multi_timeframe,
+)
 from ashare_lab.services.build_midterm_portfolio import (
-    _MOMENTUM_WEIGHTS,
+    CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
     HOLDING_PERIOD_SESSIONS,
     CandidateAction,
     ConditionalEntryPlanKind,
     MidtermPortfolioStatus,
+    _build_horizon_price_observation_plan,
     _build_one_week_conditional_entry_plan,
     _build_one_week_price_observation_plan,
+    _holding_risk_history_exclusion_reasons,
+    _observation_entry_pattern,
     _RejectedPortfolioEvaluation,
     _select_observation_portfolio,
     _select_stock_count,
+    _viable_sort_key,
     build_midterm_portfolio,
+    horizon_history_requirements,
 )
+
+
+def test_observation_pattern_never_falls_back_to_legacy_sixty_day_entry() -> None:
+    candidate = SimpleNamespace(
+        timeframe=SimpleNamespace(
+            execution=SimpleNamespace(state=ExecutionState.WAIT_CONFIRMATION),
+            structure=SimpleNamespace(state=StructureState.NEAR_BREAKOUT),
+        ),
+        entry=SimpleNamespace(pattern=EntryPattern.HEALTHY_PULLBACK),
+    )
+
+    assert _observation_entry_pattern(candidate) is EntryPattern.VOLUME_BREAKOUT
+
+
+def test_horizon_plan_separates_daily_entry_from_primary_structure_risk_line() -> None:
+    frame = _breakout_history(77)
+    cutoff = pd.Timestamp(frame.iloc[-1]["trade_date"]).normalize()
+    timeframe = assess_multi_timeframe(
+        frame,
+        as_of=cutoff,
+        holding_weeks=13,
+    )
+
+    plan = _build_horizon_price_observation_plan(
+        frame,
+        cutoff=cutoff,
+        holding_weeks=13,
+        timeframe=timeframe,
+        entry_pattern=EntryPattern.HEALTHY_PULLBACK,
+    )
+
+    assert plan is not None
+    assert plan.price_source_timeframe == "daily"
+    assert plan.primary_structure_timeframe == "weekly_completed"
+    assert plan.invalidation_source_timeframe == "weekly_completed"
+    assert plan.reduction_review_source_timeframe == "weekly_completed"
+    assert plan.entry_reference_price == pytest.approx(timeframe.execution.breakout_line)
+    assert plan.primary_structure_reference_price == pytest.approx(
+        timeframe.structure.breakout_line
+    )
+    assert "日线执行线" in (plan.confirmation_rule or "")
 
 
 def _breakout_history(seed: int, *, periods: int = 620, downtrend: bool = False) -> pd.DataFrame:
@@ -147,6 +199,16 @@ def test_builds_one_adaptive_research_portfolio_and_orders_weights() -> None:
     )
 
     assert result.status == MidtermPortfolioStatus.VALIDATION_NOT_READY
+    assert (
+        result.central_implementation_status
+        == CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+        == "partial_multiframe"
+    )
+    assert (
+        result.multi_timeframe_component_status
+        == MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+        == "analytics_core_only"
+    )
     assert "nonproduction_small_universe_or_negative_lcb_override" in result.reasons
     assert 3 <= len(result.positions) <= 5
     assert result.borrowed_weight == 0.0
@@ -167,7 +229,9 @@ def test_builds_one_adaptive_research_portfolio_and_orders_weights() -> None:
     assert all(
         item.conditional_entry_plan is not None
         and item.conditional_entry_plan.data_cutoff == cutoff
-        and item.conditional_entry_plan.sessions == 5
+        and item.conditional_entry_plan.sessions == 60
+        and item.conditional_entry_plan.horizon == "三个月"
+        and item.conditional_entry_plan.structure_timeframe == "weekly_completed"
         for item in result.research_candidates
     )
     assert all(
@@ -207,6 +271,215 @@ def test_two_week_horizon_runs_with_ten_session_risk_contract() -> None:
     assert result.status is not MidtermPortfolioStatus.DATA_NOT_READY
     assert result.evaluation is not None
     assert result.evaluation.metrics.holding_period_sessions == 10
+
+
+def test_one_year_short_risk_history_is_audited_per_stock_not_global_data_failure() -> None:
+    histories, metadata = _universe()
+    for index, symbol in enumerate(histories):
+        histories[symbol] = _breakout_history(index + 101, periods=2087)
+    short_symbol = next(iter(histories))
+    histories[short_symbol] = histories[short_symbol].tail(620).reset_index(drop=True)
+    first_long = next(frame for symbol, frame in histories.items() if symbol != short_symbol)
+    cutoff = first_long["trade_date"].iloc[-1]
+
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=cutoff,
+        holding_weeks=52,
+        market_index_histories=_uptrend_indices(first_long["trade_date"]),
+        risk_budget=_loose_budget(holding_sessions=252),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=8,
+        minimum_universe_size=3,
+    )
+
+    short_candidate = next(
+        item for item in result.research_candidates if item.symbol == short_symbol
+    )
+    assert result.status is not MidtermPortfolioStatus.DATA_NOT_READY
+    assert result.horizon_candidate_count >= 4
+    assert result.risk_history_eligible_candidate_count == (result.horizon_candidate_count - 1)
+    assert result.risk_history_ineligible_candidate_count == 1
+    assert 3 <= len(result.research_candidates) <= 5
+    assert short_candidate.risk_history_available is False
+    assert short_candidate.risk_history_available_returns == 619
+    assert short_candidate.risk_history_required_returns == 2016
+    assert short_candidate.research_weight is None
+    assert short_candidate.operational_account_weight is None
+    assert short_candidate.operational_stock_sleeve_weight is None
+    assert short_candidate.conditional_entry_plan is None
+    assert short_candidate.action is CandidateAction.WAIT_CONFIRMATION
+    assert "risk_history_unavailable_for_portfolio_weighting" in (short_candidate.action_reasons)
+    assert any(
+        reason.startswith(
+            "insufficient_holding_risk_history:available_619_returns;"
+            "required_2016_returns;holding_252_sessions;"
+        )
+        for reason in short_candidate.risk_history_reasons
+    )
+    assert short_symbol not in {position.symbol for position in result.positions}
+    assert result.research_evaluation is not None
+    assert short_symbol not in {
+        position.symbol for position in result.research_evaluation.positions
+    }
+
+
+def test_one_year_all_short_risk_histories_return_no_portfolio_not_data_not_ready() -> None:
+    histories, metadata = _universe()
+    first = histories[next(iter(histories))]
+    cutoff = first["trade_date"].iloc[-1]
+
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=cutoff,
+        holding_weeks=52,
+        market_index_histories=_uptrend_indices(first["trade_date"]),
+        risk_budget=_loose_budget(holding_sessions=252),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=8,
+        minimum_universe_size=3,
+    )
+
+    assert result.status is MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO
+    assert result.status is not MidtermPortfolioStatus.DATA_NOT_READY
+    assert result.horizon_candidate_count >= 3
+    assert result.risk_history_eligible_candidate_count == 0
+    assert result.risk_history_ineligible_candidate_count == result.horizon_candidate_count
+    assert result.research_candidates
+    assert all(not item.risk_history_available for item in result.research_candidates)
+    assert all(item.research_weight is None for item in result.research_candidates)
+    assert all(item.operational_account_weight is None for item in result.research_candidates)
+    assert all(item.conditional_entry_plan is None for item in result.research_candidates)
+
+
+def test_holding_risk_history_requirement_keeps_all_adaptive_sample_gates() -> None:
+    dates = pd.bdate_range("2020-01-02", periods=2017)
+    full = pd.Series(np.full(2016, 0.001), index=dates[1:])
+    short = full.iloc[:-1]
+    budget = _loose_budget(holding_sessions=252)
+
+    assert _holding_risk_history_exclusion_reasons(full, budget) == ()
+    assert _holding_risk_history_exclusion_reasons(short, budget) == (
+        "insufficient_holding_risk_history:available_2015_returns;"
+        "required_2016_returns;holding_252_sessions;"
+        "minimum_8_nonoverlapping_samples",
+    )
+
+
+@pytest.mark.parametrize(
+    ("holding_weeks", "slow_timeframe", "primary_timeframe", "plan_sessions"),
+    (
+        (4, "weekly_completed", "daily", 20),
+        (13, "monthly_completed", "weekly_completed", 60),
+        (26, "monthly_completed", "weekly_completed", 120),
+    ),
+)
+def test_service_exposes_the_selected_horizons_independent_timeframe_contract(
+    holding_weeks: int,
+    slow_timeframe: str,
+    primary_timeframe: str,
+    plan_sessions: int,
+) -> None:
+    histories, metadata = _universe()
+    required_prices = max(620, plan_sessions * 8 + 1)
+    if required_prices > 620:
+        for index, symbol in enumerate(histories):
+            histories[symbol] = _breakout_history(index + 201, periods=required_prices)
+    first = histories[next(iter(histories))]
+    cutoff = first["trade_date"].iloc[-1]
+
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=cutoff,
+        holding_weeks=holding_weeks,
+        market_index_histories=_uptrend_indices(first["trade_date"]),
+        risk_budget=_loose_budget(holding_sessions=HOLDING_PERIOD_SESSIONS[holding_weeks]),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=24,
+        minimum_universe_size=3,
+    )
+
+    assert result.research_candidates
+    for candidate in result.research_candidates:
+        assert candidate.timeframe is not None
+        assert candidate.timeframe.slow_direction.timeframe.value == slow_timeframe
+        assert candidate.timeframe.structure.timeframe.value == primary_timeframe
+        assert candidate.price_observation_plan is not None
+        assert candidate.price_observation_plan.sessions == plan_sessions
+        assert candidate.price_observation_plan.structure_timeframe == primary_timeframe
+
+
+def test_horizon_execution_is_not_blocked_by_the_legacy_fixed_60_day_gate() -> None:
+    histories, metadata = _universe()
+    first = histories[next(iter(histories))]
+    cutoff = first["trade_date"].iloc[-1]
+    for frame in histories.values():
+        # Multi-timeframe execution accepts >=1.05 activity confirmation while
+        # the legacy daily execution check retains its stricter >=1.10 gate.
+        # The selected horizon is execution-ready.  The legacy 60-session
+        # checker remains below its old 1.10 gate, but it is audit-only and
+        # must not block the new horizon action layer.
+        frame.loc[frame.index[-1], "amount_cny"] = 107_000_000.0
+
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=cutoff,
+        holding_weeks=13,
+        market_index_histories=_uptrend_indices(first["trade_date"]),
+        risk_budget=_loose_budget(),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=24,
+        minimum_universe_size=3,
+    )
+
+    assert result.horizon_candidate_count >= 3
+    assert result.entry_ready_count >= 3
+    assert result.research_candidates
+    assert all(
+        candidate.action is CandidateAction.CONDITIONAL_ENTRY
+        for candidate in result.research_candidates
+    )
+    assert result.positions
+    assert result.stock_exposure > 0.0
+
+
+def test_late_stage_vertical_acceleration_is_a_shared_candidate_hard_veto() -> None:
+    histories, metadata = _universe()
+    symbol = next(iter(histories))
+    frame = histories[symbol]
+    base = float(frame.loc[frame.index[-21], "close"])
+    accelerated = np.linspace(base * 1.02, base * 1.65, 20)
+    frame.loc[frame.index[-20:], "close"] = accelerated
+    frame.loc[frame.index[-20:], "open"] = accelerated * 0.995
+    frame.loc[frame.index[-20:], "high"] = accelerated * 1.006
+    frame.loc[frame.index[-20:], "low"] = accelerated * 0.989
+    frame.loc[frame.index[-1], "amount_cny"] = 180_000_000.0
+    cutoff = frame["trade_date"].iloc[-1]
+
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=cutoff,
+        holding_weeks=13,
+        market_index_histories=_uptrend_indices(frame["trade_date"]),
+        risk_budget=_loose_budget(),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=24,
+        minimum_universe_size=3,
+    )
+
+    exclusion = next(item for item in result.exclusions if item.symbol == symbol)
+    assert "late_stage_acceleration_hard_freeze" in exclusion.reasons
+    assert symbol not in {item.symbol for item in result.research_candidates}
 
 
 def test_risk_off_indices_continue_screen_and_return_research_candidates() -> None:
@@ -340,7 +613,8 @@ def test_downtrend_and_fundamental_veto_cannot_reenter_through_score() -> None:
     assert "600000.SH" not in selected
     assert "600001.SH" not in selected
     reasons = {item.symbol: item.reasons for item in result.exclusions}
-    assert any(reason.startswith("stage_not_entry_ready") for reason in reasons["600000.SH"])
+    assert "horizon_13_week_structure_not_qualified" in reasons["600000.SH"]
+    assert any(reason.startswith("slow_monthly_completed:down") for reason in reasons["600000.SH"])
     assert "fundamental_veto" in reasons["600001.SH"]
 
 
@@ -465,8 +739,30 @@ def test_core_index_evidence_cannot_be_disabled() -> None:
 
 def test_main_holding_period_session_contract_is_unique() -> None:
     assert HOLDING_PERIOD_SESSIONS == {1: 5, 2: 10, 4: 20, 13: 60, 26: 120, 52: 252}
-    assert _MOMENTUM_WEIGHTS[2] == ((10, 0.50), (20, 0.30), (60, 0.20))
-    assert sum(weight for _sessions, weight in _MOMENTUM_WEIGHTS[2]) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("holding_weeks", "qualification", "risk_prices", "read_sessions"),
+    (
+        (1, 252, 252, 322),
+        (2, 252, 252, 322),
+        (4, 252, 252, 322),
+        (13, 252, 481, 551),
+        (26, 280, 961, 1031),
+        (52, 540, 2017, 2087),
+    ),
+)
+def test_central_horizon_history_contract_separates_qualification_and_risk_depth(
+    holding_weeks: int,
+    qualification: int,
+    risk_prices: int,
+    read_sessions: int,
+) -> None:
+    requirement = horizon_history_requirements(holding_weeks)
+
+    assert requirement.qualification_minimum_sessions == qualification
+    assert requirement.risk_minimum_price_sessions == risk_prices
+    assert requirement.history_read_sessions == read_sessions
 
 
 def test_unknown_execution_eligibility_produces_provisional_positions() -> None:
@@ -503,11 +799,14 @@ def _selection_row(
     lcb: float,
     correlation: float,
     contribution: float,
+    horizon_drawdown: float = 0.08,
+    legacy_drawdown_60: float = 0.08,
 ):
     metrics = SimpleNamespace(
         holding_period_return_lcb=lcb,
         annual_downside_volatility=0.10,
-        rolling_max_drawdown_60_p90=0.08,
+        rolling_max_drawdown_60_p90=legacy_drawdown_60,
+        horizon_rolling_max_drawdown_p90=horizon_drawdown,
         es95_5d=0.03,
         max_down_period_correlation=correlation,
         max_position_downside_risk_contribution=contribution,
@@ -527,6 +826,52 @@ def test_five_stocks_replace_four_only_for_material_diversification() -> None:
 
     chosen = _select_stock_count({3: [], 4: [four], 5: [strong_five]})
     assert chosen is strong_five
+
+
+def test_final_portfolio_order_uses_horizon_drawdown_not_legacy_60_day_value() -> None:
+    first = _selection_row(
+        4,
+        lcb=0.05,
+        correlation=0.60,
+        contribution=0.32,
+        horizon_drawdown=0.09,
+        legacy_drawdown_60=0.01,
+    )
+    second = _selection_row(
+        4,
+        lcb=0.05,
+        correlation=0.60,
+        contribution=0.32,
+        horizon_drawdown=0.05,
+        legacy_drawdown_60=0.50,
+    )
+
+    ordered = sorted((first, second), key=_viable_sort_key)
+
+    assert ordered[0] is second
+
+
+def test_five_stock_diversification_uses_horizon_drawdown_tolerance() -> None:
+    four = _selection_row(
+        4,
+        lcb=0.05,
+        correlation=0.60,
+        contribution=0.32,
+        horizon_drawdown=0.08,
+        legacy_drawdown_60=0.01,
+    )
+    five = _selection_row(
+        5,
+        lcb=0.06,
+        correlation=0.54,
+        contribution=0.28,
+        horizon_drawdown=0.084,
+        legacy_drawdown_60=0.90,
+    )
+
+    chosen = _select_stock_count({3: [], 4: [four], 5: [five]})
+
+    assert chosen is five
 
 
 def _observation_row(

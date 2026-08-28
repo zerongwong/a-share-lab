@@ -258,6 +258,39 @@ def test_appends_only_verified_post_baseline_rows_and_advances_common_cutoff() -
     assert loaded.snapshot.market_index_histories["000905"].iloc[-1]["source"] == "infoway:eod"
 
 
+def test_long_risk_history_request_does_not_become_full_market_coverage_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[dict[str, object]] = []
+
+    def capture_loader(*_args: object, **kwargs: object) -> CSMARUniverseSnapshot:
+        captured.append(dict(kwargs))
+        return _baseline_snapshot()
+
+    monkeypatch.setattr(hybrid_module, "load_csmar_universe", capture_loader)
+    store = FakeOverlayStore(pd.DataFrame(), {}, {})
+    loaded = load_hybrid_universe(
+        "/unused/csmar",
+        overlay_root="/unused/overlay",
+        as_of=BASELINE_CUTOFF,
+        decision_date=BASELINE_CUTOFF,
+        mode="historical",
+        overlay_store=store,
+        minimum_sessions=2017,
+        history_sessions=2087,
+        **SMALL_UNIVERSE_GATES,
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["minimum_sessions"] == 252
+    assert captured[0]["history_sessions"] == 2087
+    assert set(loaded.snapshot.histories) == set(STOCK_SYMBOLS)
+    assert any(
+        "2017个价格点的持有期风险历史仅对各期限结构合格候选逐股核验" in warning
+        for warning in loaded.snapshot.reference_warnings
+    )
+
+
 def test_new_stock_outside_csmar_master_is_isolated() -> None:
     trade_day = date(2026, 8, 25)
     stock_days = {trade_day: _stock_day(trade_day, include_new_stock=True)}

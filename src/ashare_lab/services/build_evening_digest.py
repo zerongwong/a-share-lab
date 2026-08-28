@@ -7,10 +7,10 @@ returns a small derived report.  Raw CSMAR/overlay frames never enter the
 returned object.
 
 History requirements differ materially by holding period.  The builder groups
-periods that share the same requirement, holds only one such hybrid snapshot at
-a time, and then releases it before loading the next group.  In particular,
-1/2/4 weeks share the 252/322-session load, while 13/26/52 weeks retain their
-own stricter evidence gates instead of being silently shortened.
+periods that share the same qualification/read-depth contract, holds only one
+such hybrid snapshot at a time, and then releases it before loading the next
+group.  Deep holding-period risk history is read for finalist validation but
+never reused as a full-market coverage gate.
 """
 
 from __future__ import annotations
@@ -20,15 +20,18 @@ from collections import Counter
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Literal
 
 import pandas as pd
 
 from ashare_lab.analytics.cycle_policy import EntryStrictness
+from ashare_lab.analytics.multi_timeframe import MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
 from ashare_lab.domain.errors import AShareLabError, DataUnavailableError
 from ashare_lab.ports.notifications import MAX_COMPACT_NOTIFICATION_BODY_BYTES
 from ashare_lab.services.build_midterm_portfolio import (
+    CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
     HOLDING_PERIOD_SESSIONS,
     CandidateAction,
     ConditionalEntryPlan,
@@ -36,6 +39,7 @@ from ashare_lab.services.build_midterm_portfolio import (
     MidtermPortfolioResult,
     MidtermPortfolioStatus,
     build_midterm_portfolio,
+    horizon_history_requirements,
 )
 from ashare_lab.services.load_hybrid_universe import (
     HybridUniverseLoad,
@@ -43,7 +47,7 @@ from ashare_lab.services.load_hybrid_universe import (
 )
 
 EVENING_DIGEST_HORIZONS = (1, 2, 4, 13, 26, 52)
-EVENING_DIGEST_METHOD_VERSION = "evening-six-horizon-digest-v0.1.0"
+EVENING_DIGEST_METHOD_VERSION = "evening-six-horizon-digest-v0.4.0"
 
 _HORIZON_LABELS = {
     1: "1周",
@@ -68,11 +72,26 @@ _ACTION_LABELS = {
 _REJECTION_LABELS = {
     "annual_downside_volatility": "年化下行波动超限",
     "rolling_drawdown_60_p90": "60日滚动回撤超限",
+    "horizon_rolling_drawdown_p90": "本持有期滚动回撤超限",
     "es95_5d": "5日预期损失超限",
     "down_period_correlation": "下跌期相关性超限",
     "position_downside_risk_contribution": "单股下行风险贡献超限",
     "industry_concentration": "行业集中度超限",
     "holding_period_return_lcb_below_minimum": "历史持有期收益下界未达门槛",
+}
+_TIMEFRAME_LABELS = {
+    "daily": "日线",
+    "weekly_completed": "周线",
+    "monthly_completed": "月线",
+}
+_STRUCTURE_LABELS = {
+    "near_breakout": "临近突破",
+    "healthy_post_breakout_pullback": "健康回踩",
+    "volume_confirmed_breakout": "突破确认",
+    "base_not_yet_near_breakout": "底座形成",
+    "trend_continuation_without_entry_structure": "趋势延续",
+    "failed": "结构失效",
+    "insufficient": "证据不足",
 }
 
 
@@ -95,6 +114,93 @@ class EveningDigestCandidate:
     price_condition: str
     price_nature: Literal["conditional_entry", "observation_only", "unavailable"]
     evidence_pending: bool
+    slow_timeframe: str | None = None
+    slow_direction: str | None = None
+    primary_timeframe: str | None = None
+    primary_structure: str | None = None
+    primary_breakout_line: float | None = None
+    multi_timeframe_score: float | None = None
+    multi_timeframe_method_version: str | None = None
+    timeframe_holding_weeks: int | None = None
+    price_plan_sessions: int | None = None
+
+
+DifferenceReason = Literal[
+    "data_unavailable",
+    "slow_context_failure",
+    "primary_structure_failure",
+    "risk_history_unavailable",
+    "risk_budget_or_lcb_failure",
+    "price_or_action_not_triggered",
+    "ranking_not_selected",
+    "evidence_unavailable",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PairwiseSymbolDifference:
+    """Why one derived set contains a symbol while the peer set does not."""
+
+    symbol: str
+    name: str
+    side: Literal["left_only", "right_only"]
+    reason: DifferenceReason
+
+
+@dataclass(frozen=True, slots=True)
+class SymbolExclusionDigest:
+    """Sanitized exclusion categories; never contains raw source rows or exceptions."""
+
+    symbol: str
+    categories: tuple[DifferenceReason, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonOverlapDigest:
+    """Adjacent-horizon overlap; high values require independent evidence review."""
+
+    left_holding_weeks: int
+    right_holding_weeks: int
+    left_label: str
+    right_label: str
+    shared_symbols: tuple[str, ...]
+    union_count: int
+    jaccard: float | None
+    set_nature: Literal["candidate", "risk_qualified", "action"] = "candidate"
+    comparison_status: Literal["comparable", "unavailable"] = "comparable"
+    unavailable_reason: str | None = None
+    left_only: tuple[PairwiseSymbolDifference, ...] = ()
+    right_only: tuple[PairwiseSymbolDifference, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class HorizonSymbolDifference:
+    """One repeated symbol's derived evidence in one independent horizon."""
+
+    holding_weeks: int
+    label: str
+    independent_gate_documented: bool
+    slow_context: str
+    primary_structure: str
+    action: str
+    allocation_nature: str
+    stock_sleeve_weight: float | None
+    price_nature: str
+    price_condition: str
+
+
+@dataclass(frozen=True, slots=True)
+class RepeatedSymbolAttribution:
+    """Compact, non-probabilistic attribution for a cross-horizon repeat."""
+
+    symbol: str
+    name: str
+    appearances: tuple[HorizonSymbolDifference, ...]
+    independent_gate_count: int
+    conclusion: Literal[
+        "independent_horizon_gates_documented_not_automatic_confluence",
+        "repeated_candidate_evidence_incomplete_not_confluence",
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +218,13 @@ class EveningPeriodDigest:
     action_cash_weight: float
     candidates: tuple[EveningDigestCandidate, ...] = ()
     failure_code: str | None = None
+    audit_candidates: tuple[EveningDigestCandidate, ...] = ()
+    exclusion_categories: tuple[SymbolExclusionDigest, ...] = ()
+    exclusion_audit_available: bool = False
+    portfolio_failure_categories: tuple[DifferenceReason, ...] = ()
+    ranked_pool_count: int | None = None
+    central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +244,13 @@ class EveningResearchDigest:
     brokerage_connected: bool = False
     orders_enabled: bool = False
     plan_for_date: date | None = None
+    horizon_overlaps: tuple[HorizonOverlapDigest, ...] = ()
+    candidate_pairwise_overlaps: tuple[HorizonOverlapDigest, ...] = ()
+    risk_qualified_pairwise_overlaps: tuple[HorizonOverlapDigest, ...] = ()
+    action_pairwise_overlaps: tuple[HorizonOverlapDigest, ...] = ()
+    repeated_symbol_attributions: tuple[RepeatedSymbolAttribution, ...] = ()
+    central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
 
 
 HybridLoader = Callable[..., HybridUniverseLoad]
@@ -165,9 +285,12 @@ def build_evening_research_digest(
 
     requirement_groups: dict[tuple[int, int], list[int]] = {}
     for weeks in requested:
-        sessions = HOLDING_PERIOD_SESSIONS[weeks]
-        minimum_sessions = max(252, sessions * 8 + 1)
-        requirement_groups.setdefault((minimum_sessions, minimum_sessions + 70), []).append(weeks)
+        requirements = horizon_history_requirements(weeks)
+        key = (
+            requirements.qualification_minimum_sessions,
+            requirements.history_read_sessions,
+        )
+        requirement_groups.setdefault(key, []).append(weeks)
 
     period_by_weeks: dict[int, EveningPeriodDigest] = {}
     loaded_cutoff_by_weeks: dict[int, date] = {}
@@ -183,6 +306,7 @@ def build_evening_research_digest(
                 as_of=decision_date,
                 minimum_sessions=minimum_sessions,
                 history_sessions=history_sessions,
+                minimum_qualification_sessions=minimum_sessions,
                 reference_dataset_root=reference_dataset_root,
                 decision_date=decision_date,
                 mode="live",
@@ -253,6 +377,16 @@ def build_evening_research_digest(
         minimum_cash = 1.0 - max_exposure
         agreement = _optional_fraction(getattr(cycle, "confidence", None))
 
+    periods = tuple(period_by_weeks[weeks] for weeks in requested)
+    central_statuses = {period.central_implementation_status for period in periods}
+    component_statuses = {period.multi_timeframe_component_status for period in periods}
+    if len(central_statuses) != 1 or len(component_statuses) != 1:
+        raise ValueError("six-horizon implementation status mismatch")
+    candidate_overlaps = _build_pairwise_overlaps(periods, set_nature="candidate")
+    adjacent_pairs = {
+        (left.holding_weeks, right.holding_weeks)
+        for left, right in zip(periods, periods[1:], strict=False)
+    }
     return EveningResearchDigest(
         common_cutoff=common_cutoff,
         decision_date=decision_date,
@@ -261,7 +395,24 @@ def build_evening_research_digest(
         max_stock_exposure=max_exposure,
         minimum_cash_weight=minimum_cash,
         cycle_rule_agreement=agreement,
-        periods=tuple(period_by_weeks[weeks] for weeks in requested),
+        periods=periods,
+        central_implementation_status=next(iter(central_statuses)),
+        multi_timeframe_component_status=next(iter(component_statuses)),
+        horizon_overlaps=tuple(
+            item
+            for item in candidate_overlaps
+            if (item.left_holding_weeks, item.right_holding_weeks) in adjacent_pairs
+        ),
+        candidate_pairwise_overlaps=candidate_overlaps,
+        risk_qualified_pairwise_overlaps=_build_pairwise_overlaps(
+            periods,
+            set_nature="risk_qualified",
+        ),
+        action_pairwise_overlaps=_build_pairwise_overlaps(
+            periods,
+            set_nature="action",
+        ),
+        repeated_symbol_attributions=_build_repeated_symbol_attributions(periods),
     )
 
 
@@ -290,6 +441,8 @@ def render_evening_digest_markdown(digest: EveningResearchDigest) -> str:
     lines = [
         "# A股六周期研究日报",
         f"- **共同截止日：{cutoff}**",
+        f"- 实现状态：`{digest.central_implementation_status}`；"
+        f"组件：`{digest.multi_timeframe_component_status}`",
         plan_line,
         "- 仅作研究，不连接券商、不自动下单",
         "",
@@ -299,6 +452,42 @@ def render_evening_digest_markdown(digest: EveningResearchDigest) -> str:
         f"- 股票敞口上限：{digest.max_stock_exposure:.0%}；最低现金：{digest.minimum_cash_weight:.0%}",
         f"- 置信说明：{agreement}",
     ]
+
+    if digest.candidate_pairwise_overlaps or digest.horizon_overlaps:
+        candidate_overlaps = (
+            digest.candidate_pairwise_overlaps
+            if digest.candidate_pairwise_overlaps
+            else digest.horizon_overlaps
+        )
+        lines.extend(
+            (
+                "",
+                "## 六期限重合与差异审计",
+                f"- 候选{len(candidate_overlaps)}对：" + _overlap_line(candidate_overlaps),
+                "- 风险合格组合：" + _overlap_line(digest.risk_qualified_pairwise_overlaps),
+                "- 行动组合：" + _overlap_line(digest.action_pairwise_overlaps),
+                "- 重复只表示集合重合；必须逐期限独立记录慢周期、主结构、风险和价格门，"
+                "不能自动称为多周期共振。",
+            )
+        )
+        if digest.repeated_symbol_attributions:
+            lines.append("- 重复股票差异归因：")
+            lines.extend(
+                f"  - **{item.name} {item.symbol}**｜{_attribution_markdown(item)}"
+                for item in digest.repeated_symbol_attributions
+            )
+        difference_rows = tuple(
+            item
+            for item in (
+                *candidate_overlaps,
+                *digest.risk_qualified_pairwise_overlaps,
+                *digest.action_pairwise_overlaps,
+            )
+            if item.left_only or item.right_only
+        )
+        if difference_rows:
+            lines.append("- 仅左/仅右逐股原因：")
+            lines.extend(f"  - {_pair_difference_line(item)}" for item in difference_rows)
 
     for period in digest.periods:
         lines.extend(("", f"## {period.label}（{period.holding_sessions}个交易日）"))
@@ -322,7 +511,8 @@ def render_evening_digest_markdown(digest: EveningResearchDigest) -> str:
                 action += "（财务、公告或可买性待核验）"
             lines.append(
                 f"{candidate.rank}. **{_clean_text(candidate.name)} {candidate.symbol}**｜"
-                f"{allocation}｜{candidate.price_condition}｜{action}"
+                f"{allocation}｜{_candidate_timeframe_label(candidate)}｜"
+                f"{candidate.price_condition}｜{action}"
             )
 
     lines.extend(
@@ -361,6 +551,7 @@ def render_evening_digest_bark_compact(digest: EveningResearchDigest) -> str:
         (15, 42, 48),
         (12, 30, 36),
         (9, 21, 24),
+        (6, 15, 18),
     )
     for name_bytes, price_bytes, cycle_bytes in budgets:
         body = _render_bark_compact_with_budgets(
@@ -389,8 +580,21 @@ def _render_bark_compact_with_budgets(
     cycle = _truncate_utf8(_clean_text(digest.cycle_label), cycle_bytes)
     lines = [
         f"A股六周期｜数据{digest.common_cutoff.isoformat()}｜计划{plan}",
+        f"实现:{digest.central_implementation_status}",
         f"周期：{cycle}｜股≤{digest.max_stock_exposure:.0%}/现≥{digest.minimum_cash_weight:.0%}",
     ]
+    overlaps = digest.candidate_pairwise_overlaps or digest.horizon_overlaps
+    if overlaps:
+        lines.append(f"候选重合：{_compact_overlap_line(overlaps)}")
+        if digest.risk_qualified_pairwise_overlaps:
+            lines.append(
+                "风险组合重合：" + _compact_overlap_line(digest.risk_qualified_pairwise_overlaps)
+            )
+        if digest.action_pairwise_overlaps:
+            lines.append("行动组合重合：" + _compact_overlap_line(digest.action_pairwise_overlaps))
+        repeated_count = len(digest.repeated_symbol_attributions)
+        if repeated_count:
+            lines.append(f"重复{repeated_count}只；各期限独立过门才有效，重复≠自动共振。")
     for period in digest.periods:
         if period.failure_code is not None:
             lines.append(f"{period.label}｜数据不足")
@@ -413,7 +617,13 @@ def _render_bark_compact_with_budgets(
                 _compact_price_condition(candidate.price_condition),
                 price_bytes,
             )
-            lines.append(f"  {candidate.rank}.{symbol}{name} 仓{sleeve} {price}")
+            structure = _compact_timeframe_label(candidate)
+            action = _compact_action(candidate.action)
+            price_nature = _compact_price_nature(candidate.price_nature)
+            lines.append(
+                f"  {candidate.rank}.{symbol}{name} 仓{sleeve} {structure}"
+                f"/{action}/{price_nature} {price}"
+            )
     lines.append("仅研究；仓%=股票仓内10%档；价格为条件/观察线；不自动下单。")
     return "\n".join(lines).strip()
 
@@ -480,8 +690,22 @@ def _summarize_period(result: MidtermPortfolioResult, *, weeks: int) -> EveningP
                 position,
                 action=action_by_symbol.get(position.symbol, CandidateAction.WAIT_CONFIRMATION),
                 expected_cutoff=cutoff,
+                expected_sessions=HOLDING_PERIOD_SESSIONS[weeks],
             )
             for position in result.positions
+        )
+        audit_rows = tuple(
+            _candidate_from_research(
+                candidate,
+                allocation_nature=(
+                    "risk_qualified_research"
+                    if result.research_evaluation is not None
+                    else "unavailable"
+                ),
+                expected_cutoff=cutoff,
+                expected_sessions=HOLDING_PERIOD_SESSIONS[weeks],
+            )
+            for candidate in result.research_candidates
         )
         risk_nature = "下行风险与历史收益下界门已通过；仍是研究行动方案，不是实盘持仓"
         action_nature = "研究行动组合（非交易指令）"
@@ -505,9 +729,11 @@ def _summarize_period(result: MidtermPortfolioResult, *, weeks: int) -> EveningP
                 candidate,
                 allocation_nature=allocation_nature,
                 expected_cutoff=cutoff,
+                expected_sessions=HOLDING_PERIOD_SESSIONS[weeks],
             )
             for candidate in result.research_candidates
         )
+        audit_rows = rows
         if result.status is MidtermPortfolioStatus.VALIDATION_NOT_READY:
             action_nature = "证据待核验；行动层保持现金"
         elif result.status is MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO:
@@ -526,6 +752,22 @@ def _summarize_period(result: MidtermPortfolioResult, *, weeks: int) -> EveningP
         action_stock_exposure=_finite_fraction(result.stock_exposure),
         action_cash_weight=_finite_fraction(result.cash_weight),
         candidates=rows,
+        audit_candidates=audit_rows,
+        exclusion_categories=tuple(
+            SymbolExclusionDigest(
+                symbol=_symbol(exclusion.symbol),
+                categories=_categorize_exclusion_reasons(exclusion.reasons),
+            )
+            for exclusion in result.exclusions
+        ),
+        exclusion_audit_available=True,
+        portfolio_failure_categories=_categorize_portfolio_failures(
+            result.observation_rejection_reasons,
+            result.reasons,
+        ),
+        ranked_pool_count=_nonnegative_int_optional(result.horizon_candidate_count),
+        central_implementation_status=result.central_implementation_status,
+        multi_timeframe_component_status=result.multi_timeframe_component_status,
     )
 
 
@@ -534,6 +776,7 @@ def _candidate_from_position(
     *,
     action: CandidateAction,
     expected_cutoff: date | None,
+    expected_sessions: int,
 ) -> EveningDigestCandidate:
     evidence_pending = bool(position.evidence_unknown)
     conditional = (
@@ -545,6 +788,7 @@ def _candidate_from_position(
         conditional_plan=conditional,
         observation_plan=position.price_observation_plan,
         expected_cutoff=expected_cutoff,
+        expected_sessions=expected_sessions,
     )
     sleeve = _operational_weight(position.operational_stock_sleeve_weight)
     account = _finite_optional_fraction(position.operational_account_weight)
@@ -559,6 +803,11 @@ def _candidate_from_position(
         price_condition=price,
         price_nature=price_nature,
         evidence_pending=evidence_pending,
+        price_plan_sessions=_selected_plan_sessions(
+            conditional_plan=conditional,
+            observation_plan=position.price_observation_plan,
+        ),
+        **_candidate_timeframe_fields(getattr(position, "timeframe", None)),
     )
 
 
@@ -567,6 +816,7 @@ def _candidate_from_research(
     *,
     allocation_nature: Literal["risk_qualified_research", "observation_only", "unavailable"],
     expected_cutoff: date | None,
+    expected_sessions: int,
 ) -> EveningDigestCandidate:
     evidence_pending = bool(candidate.evidence_unknown)
     conditional = (
@@ -578,6 +828,7 @@ def _candidate_from_research(
         conditional_plan=conditional,
         observation_plan=candidate.price_observation_plan,
         expected_cutoff=expected_cutoff,
+        expected_sessions=expected_sessions,
     )
     if allocation_nature == "risk_qualified_research":
         sleeve = _operational_weight(candidate.operational_stock_sleeve_weight)
@@ -599,6 +850,11 @@ def _candidate_from_research(
         price_condition=price,
         price_nature=price_nature,
         evidence_pending=evidence_pending,
+        price_plan_sessions=_selected_plan_sessions(
+            conditional_plan=conditional,
+            observation_plan=candidate.price_observation_plan,
+        ),
+        **_candidate_timeframe_fields(getattr(candidate, "timeframe", None)),
     )
 
 
@@ -607,27 +863,499 @@ def _price_label(
     conditional_plan: ConditionalEntryPlan | None,
     observation_plan: ConditionalEntryPlan | None,
     expected_cutoff: date | None,
+    expected_sessions: int,
 ) -> tuple[str, Literal["conditional_entry", "observation_only", "unavailable"]]:
     if conditional_plan is not None:
-        label = _format_plan(conditional_plan, expected_cutoff=expected_cutoff, observation=False)
+        label = _format_plan(
+            conditional_plan,
+            expected_cutoff=expected_cutoff,
+            expected_sessions=expected_sessions,
+            observation=False,
+        )
         if label is not None:
             return label, "conditional_entry"
+        return "—（价格计划与本期不一致）", "unavailable"
     if observation_plan is not None:
-        label = _format_plan(observation_plan, expected_cutoff=expected_cutoff, observation=True)
+        label = _format_plan(
+            observation_plan,
+            expected_cutoff=expected_cutoff,
+            expected_sessions=expected_sessions,
+            observation=True,
+        )
         if label is not None:
             return f"仅观察：{label}（触及不等于可买）", "observation_only"
+        return "—（价格计划与本期不一致）", "unavailable"
     return "—（未形成价格条件）", "unavailable"
+
+
+def _candidate_timeframe_fields(assessment: object) -> dict[str, Any]:
+    if assessment is None:
+        return {}
+    slow = getattr(assessment, "slow_direction", None)
+    structure = getattr(assessment, "structure", None)
+    return {
+        "slow_timeframe": getattr(getattr(slow, "timeframe", None), "value", None),
+        "slow_direction": getattr(getattr(slow, "direction", None), "value", None),
+        "primary_timeframe": getattr(
+            getattr(structure, "timeframe", None),
+            "value",
+            None,
+        ),
+        "primary_structure": getattr(
+            getattr(structure, "state", None),
+            "value",
+            None,
+        ),
+        "primary_breakout_line": _positive_optional(getattr(structure, "breakout_line", None)),
+        "multi_timeframe_score": _optional_fraction(getattr(assessment, "score", None)),
+        "multi_timeframe_method_version": getattr(assessment, "method_version", None),
+        "timeframe_holding_weeks": _positive_int_optional(
+            getattr(assessment, "holding_weeks", None)
+        ),
+    }
+
+
+def _selected_plan_sessions(
+    *,
+    conditional_plan: ConditionalEntryPlan | None,
+    observation_plan: ConditionalEntryPlan | None,
+) -> int | None:
+    plan = conditional_plan if conditional_plan is not None else observation_plan
+    return None if plan is None else _positive_int_optional(getattr(plan, "sessions", None))
+
+
+def _candidate_timeframe_label(candidate: EveningDigestCandidate) -> str:
+    slow = _TIMEFRAME_LABELS.get(
+        candidate.slow_timeframe or "", candidate.slow_timeframe or "慢周期—"
+    )
+    primary = _TIMEFRAME_LABELS.get(
+        candidate.primary_timeframe or "",
+        candidate.primary_timeframe or "主周期—",
+    )
+    structure = _STRUCTURE_LABELS.get(
+        candidate.primary_structure or "",
+        candidate.primary_structure or "结构—",
+    )
+    direction = candidate.slow_direction or "—"
+    return f"{slow}{direction} / {primary}{structure}"
+
+
+def _compact_timeframe_label(candidate: EveningDigestCandidate) -> str:
+    frame_codes = {"daily": "D", "weekly_completed": "W", "monthly_completed": "M"}
+    slow = frame_codes.get(candidate.slow_timeframe or "", "?")
+    direction_value = (candidate.slow_direction or "").lower()
+    if direction_value.startswith("up"):
+        direction = "↑"
+    elif direction_value.startswith("down"):
+        direction = "↓"
+    else:
+        direction = "?"
+    primary = frame_codes.get(candidate.primary_timeframe or "", "?")
+    structure = {
+        "near_breakout": "近",
+        "healthy_post_breakout_pullback": "回",
+        "volume_confirmed_breakout": "突",
+        "base_not_yet_near_breakout": "基",
+        "trend_continuation_without_entry_structure": "延",
+        "failed": "失",
+        "insufficient": "缺",
+    }.get(candidate.primary_structure or "", "?")
+    return f"{slow}{direction}>{primary}{structure}"
+
+
+def _compact_action(value: str) -> str:
+    return {
+        CandidateAction.CONDITIONAL_ENTRY.value: "条",
+        CandidateAction.WAIT_CONFIRMATION.value: "等",
+        CandidateAction.OBSERVE_ONLY.value: "观",
+    }.get(value, "—")
+
+
+def _compact_price_nature(value: str) -> str:
+    return {
+        "conditional_entry": "条价",
+        "observation_only": "察价",
+        "unavailable": "价—",
+    }.get(value, "价—")
+
+
+def _build_pairwise_overlaps(
+    periods: tuple[EveningPeriodDigest, ...],
+    *,
+    set_nature: Literal["candidate", "risk_qualified", "action"],
+) -> tuple[HorizonOverlapDigest, ...]:
+    rows: list[HorizonOverlapDigest] = []
+    for left, right in combinations(periods, 2):
+        left_available, left_symbols, left_reason = _period_symbol_set(
+            left,
+            set_nature=set_nature,
+        )
+        right_available, right_symbols, right_reason = _period_symbol_set(
+            right,
+            set_nature=set_nature,
+        )
+        union = left_symbols | right_symbols
+        shared = tuple(sorted(left_symbols & right_symbols))
+        comparable = left_available and right_available and bool(union)
+        unavailable_reason = None
+        if not comparable:
+            unavailable_reason = _comparison_unavailable_reason(
+                left_available=left_available,
+                left_reason=left_reason,
+                right_available=right_available,
+                right_reason=right_reason,
+                union=union,
+            )
+        rows.append(
+            HorizonOverlapDigest(
+                left_holding_weeks=left.holding_weeks,
+                right_holding_weeks=right.holding_weeks,
+                left_label=left.label,
+                right_label=right.label,
+                shared_symbols=shared,
+                union_count=len(union),
+                jaccard=(len(shared) / len(union) if comparable else None),
+                set_nature=set_nature,
+                comparison_status="comparable" if comparable else "unavailable",
+                unavailable_reason=unavailable_reason,
+                left_only=tuple(
+                    _pairwise_difference(
+                        symbol,
+                        source=left,
+                        target=right,
+                        side="left_only",
+                        set_nature=set_nature,
+                    )
+                    for symbol in sorted(left_symbols - right_symbols)
+                ),
+                right_only=tuple(
+                    _pairwise_difference(
+                        symbol,
+                        source=right,
+                        target=left,
+                        side="right_only",
+                        set_nature=set_nature,
+                    )
+                    for symbol in sorted(right_symbols - left_symbols)
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _period_symbol_set(
+    period: EveningPeriodDigest,
+    *,
+    set_nature: Literal["candidate", "risk_qualified", "action"],
+) -> tuple[bool, set[str], str | None]:
+    if period.failure_code is not None:
+        return False, set(), "data_unavailable"
+    audit_candidates = period.audit_candidates or period.candidates
+    if set_nature == "candidate":
+        return True, {candidate.symbol for candidate in audit_candidates}, None
+    if set_nature == "risk_qualified":
+        accepted = {"risk_qualified_research", "action_research"}
+        symbols = {
+            candidate.symbol
+            for candidate in audit_candidates
+            if candidate.allocation_nature in accepted and candidate.stock_sleeve_weight is not None
+        }
+    else:
+        symbols = {
+            candidate.symbol
+            for candidate in period.candidates
+            if candidate.allocation_nature == "action_research"
+        }
+    if not symbols:
+        return False, set(), f"{set_nature}_set_not_formed"
+    return True, symbols, None
+
+
+def _comparison_unavailable_reason(
+    *,
+    left_available: bool,
+    left_reason: str | None,
+    right_available: bool,
+    right_reason: str | None,
+    union: set[str],
+) -> str:
+    if left_available and right_available and not union:
+        return "both_sets_empty"
+    reasons = []
+    if not left_available:
+        reasons.append(f"left:{left_reason or 'evidence_unavailable'}")
+    if not right_available:
+        reasons.append(f"right:{right_reason or 'evidence_unavailable'}")
+    return ";".join(reasons) or "evidence_unavailable"
+
+
+def _pairwise_difference(
+    symbol: str,
+    *,
+    source: EveningPeriodDigest,
+    target: EveningPeriodDigest,
+    side: Literal["left_only", "right_only"],
+    set_nature: Literal["candidate", "risk_qualified", "action"],
+) -> PairwiseSymbolDifference:
+    source_candidate = _find_period_candidate(source, symbol)
+    return PairwiseSymbolDifference(
+        symbol=symbol,
+        name="—" if source_candidate is None else source_candidate.name,
+        side=side,
+        reason=_difference_reason(symbol, target=target, set_nature=set_nature),
+    )
+
+
+def _difference_reason(
+    symbol: str,
+    *,
+    target: EveningPeriodDigest,
+    set_nature: Literal["candidate", "risk_qualified", "action"],
+) -> DifferenceReason:
+    if target.failure_code is not None:
+        return "data_unavailable"
+    candidate = _find_period_candidate(target, symbol)
+    if candidate is None:
+        categories = _exclusion_categories_for_symbol(target, symbol)
+        if categories:
+            return categories[0]
+        audit_candidates = target.audit_candidates or target.candidates
+        if target.ranked_pool_count is not None and target.ranked_pool_count > len(
+            audit_candidates
+        ):
+            return "ranking_not_selected"
+        return "evidence_unavailable"
+    if set_nature == "candidate":
+        return "evidence_unavailable"
+
+    _, risk_symbols, _ = _period_symbol_set(target, set_nature="risk_qualified")
+    if symbol not in risk_symbols:
+        if target.portfolio_failure_categories:
+            return target.portfolio_failure_categories[0]
+        if set_nature == "action" and (
+            candidate.action != CandidateAction.CONDITIONAL_ENTRY.value
+            or candidate.price_nature != "conditional_entry"
+        ):
+            return "price_or_action_not_triggered"
+        return "evidence_unavailable"
+    if set_nature == "risk_qualified":
+        return "ranking_not_selected"
+
+    if (
+        candidate.action != CandidateAction.CONDITIONAL_ENTRY.value
+        or candidate.price_nature != "conditional_entry"
+    ):
+        return "price_or_action_not_triggered"
+    _, action_symbols, _ = _period_symbol_set(target, set_nature="action")
+    if action_symbols:
+        return "ranking_not_selected"
+    return "evidence_unavailable"
+
+
+def _find_period_candidate(
+    period: EveningPeriodDigest,
+    symbol: str,
+) -> EveningDigestCandidate | None:
+    audit_candidates = period.audit_candidates or period.candidates
+    return next(
+        (candidate for candidate in audit_candidates if candidate.symbol == symbol),
+        None,
+    )
+
+
+def _exclusion_categories_for_symbol(
+    period: EveningPeriodDigest,
+    symbol: str,
+) -> tuple[DifferenceReason, ...]:
+    row = next(
+        (item for item in period.exclusion_categories if item.symbol == symbol),
+        None,
+    )
+    return () if row is None else row.categories
+
+
+def _build_repeated_symbol_attributions(
+    periods: tuple[EveningPeriodDigest, ...],
+) -> tuple[RepeatedSymbolAttribution, ...]:
+    appearances: dict[str, list[tuple[EveningPeriodDigest, EveningDigestCandidate]]] = {}
+    for period in periods:
+        audit_candidates = period.audit_candidates or period.candidates
+        for candidate in audit_candidates:
+            appearances.setdefault(candidate.symbol, []).append((period, candidate))
+
+    rows: list[RepeatedSymbolAttribution] = []
+    for symbol in sorted(appearances):
+        source_rows = appearances[symbol]
+        if len(source_rows) < 2:
+            continue
+        differences = tuple(
+            _symbol_difference(period, candidate) for period, candidate in source_rows
+        )
+        documented = sum(item.independent_gate_documented for item in differences)
+        rows.append(
+            RepeatedSymbolAttribution(
+                symbol=symbol,
+                name=_clean_text(source_rows[0][1].name),
+                appearances=differences,
+                independent_gate_count=documented,
+                conclusion=(
+                    "independent_horizon_gates_documented_not_automatic_confluence"
+                    if documented == len(differences)
+                    else "repeated_candidate_evidence_incomplete_not_confluence"
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def _symbol_difference(
+    period: EveningPeriodDigest,
+    candidate: EveningDigestCandidate,
+) -> HorizonSymbolDifference:
+    documented = _independent_gate_documented(period, candidate)
+    return HorizonSymbolDifference(
+        holding_weeks=period.holding_weeks,
+        label=period.label,
+        independent_gate_documented=bool(documented),
+        slow_context=(
+            f"{_TIMEFRAME_LABELS.get(candidate.slow_timeframe or '', candidate.slow_timeframe or '—')}"
+            f"/{_clean_text(candidate.slow_direction or '—', limit=24)}"
+        ),
+        primary_structure=(
+            f"{_TIMEFRAME_LABELS.get(candidate.primary_timeframe or '', candidate.primary_timeframe or '—')}"
+            f"/{_STRUCTURE_LABELS.get(candidate.primary_structure or '', candidate.primary_structure or '—')}"
+        ),
+        action=_ACTION_LABELS.get(candidate.action, _clean_text(candidate.action)),
+        allocation_nature=candidate.allocation_nature,
+        stock_sleeve_weight=candidate.stock_sleeve_weight,
+        price_nature=candidate.price_nature,
+        price_condition=candidate.price_condition,
+    )
+
+
+def _independent_gate_documented(
+    period: EveningPeriodDigest,
+    candidate: EveningDigestCandidate,
+) -> bool:
+    expected_frames = {
+        1: ("weekly_completed", "daily"),
+        2: ("weekly_completed", "daily"),
+        4: ("weekly_completed", "daily"),
+        13: ("monthly_completed", "weekly_completed"),
+        26: ("monthly_completed", "weekly_completed"),
+        52: ("monthly_completed", "weekly_completed"),
+    }
+    expected = expected_frames.get(period.holding_weeks)
+    if expected is None:
+        return False
+    expected_slow, expected_primary = expected
+    return bool(
+        candidate.timeframe_holding_weeks == period.holding_weeks
+        and candidate.price_plan_sessions == period.holding_sessions
+        and candidate.slow_timeframe == expected_slow
+        and candidate.primary_timeframe == expected_primary
+        and candidate.slow_direction
+        and candidate.primary_structure
+        and candidate.multi_timeframe_method_version
+        and candidate.multi_timeframe_score is not None
+    )
+
+
+def _overlap_line(overlaps: tuple[HorizonOverlapDigest, ...]) -> str:
+    if not overlaps:
+        return "无双方已形成的组合"
+    if all(item.comparison_status == "unavailable" for item in overlaps):
+        return f"{len(overlaps)}对均不可比较（数据不足、集合未形成或双方均为空）"
+    return "；".join(
+        f"{item.left_label}↔{item.right_label} "
+        + ("不可比较" if item.comparison_status == "unavailable" else f"{item.jaccard:.0%}")
+        for item in overlaps
+    )
+
+
+def _compact_overlap_line(overlaps: tuple[HorizonOverlapDigest, ...]) -> str:
+    if not overlaps:
+        return "无"
+    values = {item.jaccard for item in overlaps}
+    if len(values) == 1:
+        value = next(iter(values))
+        display = "U" if value is None else f"{value:.0%}"
+        return f"{len(overlaps)}对={display}"
+    counts = Counter("U" if item.jaccard is None else f"{item.jaccard:.0%}" for item in overlaps)
+    distribution = "/".join(f"{value}×{count}" for value, count in sorted(counts.items()))
+    return f"{len(overlaps)}对({distribution})"
+
+
+def _pair_difference_line(item: HorizonOverlapDigest) -> str:
+    nature = {
+        "candidate": "候选",
+        "risk_qualified": "风险",
+        "action": "行动",
+    }[item.set_nature]
+    left = _side_difference_label(item.left_only)
+    right = _side_difference_label(item.right_only)
+    return f"{nature} {item.left_label}↔{item.right_label}｜左[{left}]｜右[{right}]"
+
+
+def _side_difference_label(rows: tuple[PairwiseSymbolDifference, ...]) -> str:
+    if not rows:
+        return "无"
+    labels = {
+        "data_unavailable": "数据不可用",
+        "slow_context_failure": "慢周期",
+        "primary_structure_failure": "主结构",
+        "risk_history_unavailable": "风险历史",
+        "risk_budget_or_lcb_failure": "风险/LCB",
+        "price_or_action_not_triggered": "价格/动作",
+        "ranking_not_selected": "排名",
+        "evidence_unavailable": "证据不可用",
+    }
+    return ",".join(f"{row.symbol}:{labels[row.reason]}" for row in rows)
+
+
+def _attribution_markdown(item: RepeatedSymbolAttribution) -> str:
+    appearances = []
+    for difference in item.appearances:
+        sleeve = (
+            "配比—"
+            if difference.stock_sleeve_weight is None
+            else f"股票仓{difference.stock_sleeve_weight:.0%}"
+        )
+        allocation = {
+            "action_research": "行动组合",
+            "risk_qualified_research": "风险合格",
+            "observation_only": "观察层",
+            "unavailable": "配比不可用",
+        }.get(difference.allocation_nature, "性质—")
+        evidence = "独立门✓" if difference.independent_gate_documented else "独立门证据缺"
+        appearances.append(
+            f"{difference.label}[{difference.slow_context}；{difference.primary_structure}；"
+            f"{difference.action}；{allocation}/{sleeve}；"
+            f"{_compact_price_nature(difference.price_nature)}；"
+            f"{evidence}]"
+        )
+    conclusion = (
+        "各期独立门已有记录，但重合本身仍不是自动共振"
+        if item.conclusion == "independent_horizon_gates_documented_not_automatic_confluence"
+        else "独立门证据不完整，不称多周期共振"
+    )
+    return "；".join(appearances) + f"｜{conclusion}"
 
 
 def _format_plan(
     plan: ConditionalEntryPlan,
     *,
     expected_cutoff: date | None,
+    expected_sessions: int,
     observation: bool,
 ) -> str | None:
     if expected_cutoff is None or _as_date(plan.data_cutoff) != expected_cutoff:
         return None
-    if plan.horizon != "一周" or plan.sessions != 5:
+    if (
+        not isinstance(plan.horizon, str)
+        or not plan.horizon.strip()
+        or plan.sessions != expected_sessions
+    ):
         return None
     if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
         low = _positive_optional(plan.price_low)
@@ -732,6 +1460,54 @@ def _failure_label(code: str) -> str:
     }.get(code, "数据未通过完整性校验")
 
 
+def _categorize_exclusion_reasons(
+    reasons: Iterable[object],
+) -> tuple[DifferenceReason, ...]:
+    categories: list[DifferenceReason] = []
+    for value in reasons:
+        reason = str(value).strip().lower()
+        if reason.startswith("slow_"):
+            category: DifferenceReason = "slow_context_failure"
+        elif (
+            reason.startswith("primary_")
+            or "structure_not_qualified" in reason
+            or reason.startswith("below_daily_ma")
+        ):
+            category = "primary_structure_failure"
+        elif "insufficient_holding_risk_history" in reason:
+            category = "risk_history_unavailable"
+        else:
+            category = "evidence_unavailable"
+        if category not in categories:
+            categories.append(category)
+    return tuple(categories) or ("evidence_unavailable",)
+
+
+def _categorize_portfolio_failures(
+    rejection_reasons: Iterable[object],
+    result_reasons: Iterable[object],
+) -> tuple[DifferenceReason, ...]:
+    values = tuple(str(value).strip().lower() for value in rejection_reasons) + tuple(
+        str(value).strip().lower() for value in result_reasons
+    )
+    if any("insufficient_holding_risk_history" in value for value in values):
+        return ("risk_history_unavailable",)
+    risk_markers = (
+        "holding_period_return_lcb",
+        "risk_budget",
+        "drawdown",
+        "downside",
+        "correlation",
+        "expected_shortfall",
+        "es95",
+        "industry_concentration",
+        "no_3_to_5_stock_set_passed",
+    )
+    if any(any(marker in value for marker in risk_markers) for value in values):
+        return ("risk_budget_or_lcb_failure",)
+    return ()
+
+
 def _as_date(value: object) -> date:
     timestamp = pd.Timestamp(value)
     if pd.isna(timestamp):
@@ -782,6 +1558,26 @@ def _positive_optional(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) and result > 0.0 else None
+
+
+def _positive_int_optional(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 and result == value else None
+
+
+def _nonnegative_int_optional(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result >= 0 and result == value else None
 
 
 def _symbol(value: object) -> str:

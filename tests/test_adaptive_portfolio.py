@@ -255,7 +255,11 @@ def test_direct_and_continuous_evaluators_recompute_identical_metrics_for_same_g
         candidates[2].symbol: 0.16,
         candidates[3].symbol: 0.16,
     }
-    budget = _lax_budget(holding_period_cost_rate=0.001)
+    budget = _lax_budget(
+        holding_period_sessions=120,
+        holding_period_cost_rate=0.001,
+        minimum_holding_period_samples=2,
+    )
 
     continuous = evaluate_adaptive_portfolio(candidates, operation, budget=budget)
     direct = evaluate_operational_adaptive_portfolio(candidates, operation, budget=budget)
@@ -409,6 +413,147 @@ def test_metrics_match_the_documented_formulas() -> None:
     assert sum(
         position.downside_risk_contribution for position in result.positions
     ) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("holding_weeks", "holding_sessions"),
+    ((1, 5), (2, 10), (4, 20), (13, 60), (26, 120), (52, 252)),
+)
+def test_horizon_rolling_drawdown_uses_each_holding_window(
+    holding_weeks: int,
+    holding_sessions: int,
+) -> None:
+    periods = 600
+    candidates = _candidate_set(4, periods=periods)
+    weights_by_symbol = {candidate.symbol: 0.20 for candidate in candidates}
+    result = evaluate_adaptive_portfolio(
+        candidates,
+        weights_by_symbol,
+        budget=_lax_budget(
+            holding_period_sessions=holding_sessions,
+            minimum_holding_period_samples=2,
+        ),
+    )
+
+    ordered = tuple(sorted(candidates, key=lambda item: item.symbol))
+    returns = np.column_stack([item.returns.to_numpy() for item in ordered])
+    weights = np.asarray([position.weight for position in result.positions])
+    daily_portfolio = returns @ weights
+    expected_drawdowns = []
+    for start in range(periods - holding_sessions + 1):
+        equity = np.concatenate(
+            (
+                [1.0],
+                np.cumprod(1.0 + daily_portfolio[start : start + holding_sessions]),
+            )
+        )
+        expected_drawdowns.append(
+            max(0.0, -float((equity / np.maximum.accumulate(equity) - 1.0).min()))
+        )
+
+    assert holding_weeks in (1, 2, 4, 13, 26, 52)
+    assert result.metrics.horizon_rolling_drawdown_window_sessions == holding_sessions
+    assert result.metrics.horizon_rolling_drawdown_window_count == (periods - holding_sessions + 1)
+    assert result.metrics.horizon_rolling_max_drawdown_p90 == pytest.approx(
+        np.quantile(expected_drawdowns, 0.90)
+    )
+    assert result.risk_budget.horizon_rolling_drawdown_window_sessions == holding_sessions
+    assert result.risk_budget.horizon_rolling_drawdown_limit == pytest.approx(1.0)
+    assert result.risk_budget.rolling_drawdown_passed == (
+        result.risk_budget.horizon_rolling_drawdown_passed
+    )
+
+
+def test_legacy_60_day_drawdown_is_report_only_while_horizon_budget_binds() -> None:
+    periods = 800
+    dates = pd.bdate_range("2023-01-02", periods=periods)
+    cycle = np.asarray([-0.01] * 30 + [0.004] * 70, dtype=float)
+    shared = np.resize(cycle, periods)
+    candidates = tuple(
+        AdaptiveCandidate(
+            symbol=f"00000{index + 1}.SZ",
+            industry=f"行业{index}",
+            signal_score=index / 3,
+            returns=pd.Series(shared, index=dates),
+        )
+        for index in range(4)
+    )
+    weights = {candidate.symbol: 0.20 for candidate in candidates}
+
+    short = evaluate_adaptive_portfolio(
+        candidates,
+        weights,
+        budget=_lax_budget(
+            max_rolling_drawdown_60_p90=0.06,
+            holding_period_sessions=5,
+        ),
+    )
+    long = evaluate_adaptive_portfolio(
+        candidates,
+        weights,
+        budget=_lax_budget(
+            max_rolling_drawdown_60_p90=0.06,
+            holding_period_sessions=252,
+            minimum_holding_period_samples=2,
+        ),
+    )
+
+    assert short.metrics.rolling_max_drawdown_60_p90 > 0.06
+    assert short.metrics.horizon_rolling_max_drawdown_p90 < 0.06
+    assert short.risk_budget.horizon_rolling_drawdown_passed
+    assert "rolling_drawdown_60_p90" not in short.risk_budget.violations
+    assert "horizon_rolling_drawdown_p90" not in short.risk_budget.violations
+    assert long.metrics.rolling_max_drawdown_60_p90 == pytest.approx(
+        short.metrics.rolling_max_drawdown_60_p90
+    )
+    assert long.metrics.horizon_rolling_max_drawdown_p90 > 0.06
+    assert not long.risk_budget.horizon_rolling_drawdown_passed
+    assert "horizon_rolling_drawdown_p90" in long.risk_budget.violations
+
+
+def test_explicit_horizon_drawdown_limit_overrides_legacy_fallback() -> None:
+    candidates = _candidate_set(4)
+    weights = {candidate.symbol: 0.20 for candidate in candidates}
+    result = evaluate_adaptive_portfolio(
+        candidates,
+        weights,
+        budget=_lax_budget(
+            max_rolling_drawdown_60_p90=1.0,
+            max_horizon_rolling_drawdown_p90=0.000001,
+        ),
+    )
+
+    assert result.risk_budget.horizon_rolling_drawdown_limit == pytest.approx(0.000001)
+    assert not result.risk_budget.horizon_rolling_drawdown_passed
+    assert not result.risk_budget.rolling_drawdown_passed
+    assert "horizon_rolling_drawdown_p90" in result.risk_budget.violations
+
+
+def test_appended_horizon_budget_field_preserves_legacy_positional_construction() -> None:
+    budget = AdaptiveRiskBudget(
+        0.18,
+        0.12,
+        0.08,
+        0.75,
+        0.45,
+        0.40,
+        20,
+        0.0,
+        0.90,
+        160,
+        20,
+        8,
+        None,
+    )
+
+    assert budget.max_rolling_drawdown_60_p90 == pytest.approx(0.12)
+    assert budget.max_horizon_rolling_drawdown_p90 is None
+
+
+@pytest.mark.parametrize("value", (0.0, -0.1, 1.01, float("inf"), True))
+def test_invalid_horizon_drawdown_limit_is_rejected(value: object) -> None:
+    with pytest.raises(ValueError, match="max_horizon_rolling_drawdown_p90"):
+        _lax_budget(max_horizon_rolling_drawdown_p90=value)
 
 
 def test_cost_deduction_lowers_mean_and_lcb_one_for_one() -> None:
