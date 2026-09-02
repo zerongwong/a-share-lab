@@ -47,7 +47,7 @@ ashare-monthly-model-review = "ashare_lab.cli.monthly_model_review:main"
 mcp = ["mcp>=1.26,<2"]
 dev = [
     "hypothesis>=6.120,<7",
-    "pytest>=8.3,<9",
+    "pytest>=8.3,<10",
     "pytest-cov>=6,<8",
     "ruff>=0.9,<1",
 ]
