@@ -11,12 +11,15 @@ license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "akshare>=1.18,<2",
+    "baostock>=0.9.3,<1",
     "duckdb>=1.4,<2",
     "httpx>=0.28,<1",
     "keyring>=25,<26",
     "numpy>=2.0,<3",
     "openpyxl>=3.1,<4",
     "pandas>=2.2,<3.1",
+    "pillow>=11,<13",
     "platformdirs>=4.3,<5",
     "plotly>=6,<7",
     "pyarrow>=18,<23",
@@ -24,6 +27,7 @@ dependencies = [
     "pydantic-settings>=2.7,<3",
     "streamlit>=1.42,<2",
     "tenacity>=9,<10",
+    "tushare>=1.4,<2",
     "yfinance>=1.6,<2",
 ]
 
@@ -35,12 +39,11 @@ ashare-mcp = "ashare_lab.mcp_server:main"
 ashare-sync-daily = "ashare_lab.cli.sync_daily:main"
 ashare-scheduled-sync = "ashare_lab.cli.scheduled_sync:main"
 ashare-evening-report = "ashare_lab.cli.evening_report:main"
+ashare-recommendation-performance = "ashare_lab.cli.recommendation_performance:main"
+ashare-holdings = "ashare_lab.cli.holdings:main"
+ashare-monthly-model-review = "ashare_lab.cli.monthly_model_review:main"
 
 [project.optional-dependencies]
-# AKShare is deliberately optional. It is useful for a personal research MVP,
-# but every call must remain behind a data-provider adapter so a licensed feed
-# can replace it without changing the analysis code.
-akshare = ["akshare>=1.16,<2"]
 mcp = ["mcp>=1.26,<2"]
 dev = [
     "hypothesis>=6.120,<7",

@@ -4,9 +4,13 @@ import streamlit as st
 
 from ashare_lab.adapters.macos_keychain import (
     bark_key_is_configured,
+    cloudflare_r2_access_key_id_is_configured,
+    cloudflare_r2_secret_access_key_is_configured,
     load_bark_device_key,
     load_serverchan_sendkey,
     save_bark_device_key,
+    save_cloudflare_r2_access_key_id,
+    save_cloudflare_r2_secret_access_key,
     save_serverchan_sendkey,
     serverchan_key_is_configured,
 )
@@ -18,6 +22,14 @@ from ashare_lab.adapters.notification_channels import (
 )
 from ashare_lab.domain.errors import AShareLabError
 from ashare_lab.ports.notifications import NotificationMessage, NotificationUrgency
+from ashare_lab.services.chart_publisher_settings import (
+    CLOUDFLARE_R2_PUBLISHER_ID,
+    DEFAULT_R2_OBJECT_PREFIX,
+    DEFAULT_SIGNED_URL_TTL_SECONDS,
+    ChartPublisherSettings,
+    load_chart_publisher_settings,
+    save_chart_publisher_settings,
+)
 
 _FLASH_KEY = "notification_settings_flash"
 
@@ -71,6 +83,49 @@ def _save_bark(value: str) -> None:
     st.rerun()
 
 
+def _save_r2_coordinates(
+    account_id: str,
+    bucket_name: str,
+    signed_url_ttl_seconds: int,
+    private_bucket_verified: bool,
+    lifecycle_rule_verified: bool,
+) -> None:
+    settings = ChartPublisherSettings(
+        publisher_id=CLOUDFLARE_R2_PUBLISHER_ID,
+        account_id=account_id,
+        bucket_name=bucket_name,
+        object_prefix=DEFAULT_R2_OBJECT_PREFIX,
+        signed_url_ttl_seconds=signed_url_ttl_seconds,
+        private_bucket_verified=private_bucket_verified,
+        lifecycle_delete_after_days=1,
+        lifecycle_rule_verified=lifecycle_rule_verified,
+    )
+    save_chart_publisher_settings(settings)
+    st.session_state[_FLASH_KEY] = (
+        "Cloudflare R2非敏感配置已保存在本机；只有私有桶和1日删除均确认后才允许发布。"
+    )
+    st.rerun()
+
+
+def _save_r2_credentials(access_key_id: str, secret_access_key: str) -> None:
+    if not access_key_id.strip() or not secret_access_key.strip():
+        raise ValueError("请同时填写R2 Access Key ID和Secret Access Key")
+    save_cloudflare_r2_access_key_id(access_key_id)
+    save_cloudflare_r2_secret_access_key(secret_access_key)
+    st.session_state.pop("r2_access_key_id_input", None)
+    st.session_state.pop("r2_secret_access_key_input", None)
+    st.session_state[_FLASH_KEY] = "Cloudflare R2两项密钥已安全保存到macOS钥匙串。"
+    st.rerun()
+
+
+def _load_r2_coordinates() -> ChartPublisherSettings | None:
+    try:
+        return load_chart_publisher_settings()
+    except (OSError, TypeError, ValueError) as exc:
+        st.error(f"R2本机配置暂时无法读取（{type(exc).__name__}）。")
+        return None
+
+
 def _test_serverchan() -> None:
     sendkey = load_serverchan_sendkey()
     if not sendkey:
@@ -108,6 +163,9 @@ def render() -> None:
 
     serverchan_configured = _configured_status(serverchan_key_is_configured)
     bark_configured = _configured_status(bark_key_is_configured)
+    r2_access_key_configured = _configured_status(cloudflare_r2_access_key_id_is_configured)
+    r2_secret_key_configured = _configured_status(cloudflare_r2_secret_access_key_is_configured)
+    r2_settings = _load_r2_coordinates()
 
     with st.container(border=True):
         st.subheader("Server酱 · 个人微信提醒")
@@ -164,6 +222,106 @@ def render() -> None:
             "查看Bark说明",
             "https://github.com/Finb/Bark",
             use_container_width=True,
+        )
+
+    with st.container(border=True):
+        st.subheader("Cloudflare R2 · 持仓K线图私有发布配置")
+        st.warning(
+            "保存本页不会联网、上传或发送图片。"
+            "存储桶必须保持私有，并在R2端配置1日自动删除；"
+            "两项都未确认时，晚报会自动退回纯文字。"
+        )
+        st.caption(
+            "Account ID、存储桶、对象目录和有效期不是密钥，只写入本机私有"
+            "配置文件；Access Key ID和Secret Access Key只写入macOS钥匙串。"
+        )
+        st.write("非敏感配置：" + ("🟢 已保存" if r2_settings is not None else "🟡 未保存"))
+        st.write("Access Key ID：" + _status_label(r2_access_key_configured))
+        st.write("Secret Access Key：" + _status_label(r2_secret_key_configured))
+
+        account_id = st.text_input(
+            "Cloudflare Account ID",
+            value="" if r2_settings is None else r2_settings.account_id,
+            key="r2_account_id_input",
+            help="32位Account ID；它不是API密钥。",
+        )
+        bucket_name = st.text_input(
+            "R2存储桶名称",
+            value="" if r2_settings is None else r2_settings.bucket_name,
+            key="r2_bucket_name_input",
+        )
+        st.text_input(
+            "R2对象目录（固定）",
+            value=DEFAULT_R2_OBJECT_PREFIX,
+            disabled=True,
+            help="对象目录固定为holding-charts，不接受自定义。",
+        )
+        signed_url_ttl_seconds = int(
+            st.number_input(
+                "短期签名地址有效期（秒）",
+                min_value=300,
+                max_value=3_600,
+                value=(
+                    DEFAULT_SIGNED_URL_TTL_SECONDS
+                    if r2_settings is None
+                    else r2_settings.signed_url_ttl_seconds
+                ),
+                step=300,
+                key="r2_signed_url_ttl_input",
+            )
+        )
+        private_bucket_verified = st.checkbox(
+            "我已确认该R2存储桶保持私有",
+            value=(False if r2_settings is None else r2_settings.private_bucket_verified),
+            key="r2_private_bucket_verified",
+        )
+        lifecycle_rule_verified = st.checkbox(
+            "我已确认该存储桶已设置1日后自动删除对象",
+            value=(False if r2_settings is None else r2_settings.lifecycle_rule_verified),
+            key="r2_lifecycle_rule_verified",
+        )
+        if st.button(
+            "保存R2非敏感配置",
+            key="save_r2_coordinates",
+            use_container_width=True,
+        ):
+            _run_action(
+                lambda: _save_r2_coordinates(
+                    account_id,
+                    bucket_name,
+                    signed_url_ttl_seconds,
+                    private_bucket_verified,
+                    lifecycle_rule_verified,
+                ),
+                "R2非敏感配置已保存；未满足全部安全条件时仍只发文字。",
+            )
+
+        access_key_id = st.text_input(
+            "R2 Access Key ID",
+            type="password",
+            key="r2_access_key_id_input",
+            help="只保存到macOS钥匙串，请勿发送到聊天、截图或GitHub。",
+        )
+        secret_access_key = st.text_input(
+            "R2 Secret Access Key",
+            type="password",
+            key="r2_secret_access_key_input",
+            help="只保存到macOS钥匙串，页面不会回显已存密钥。",
+        )
+        if st.button(
+            "保存R2两项密钥",
+            key="save_r2_credentials",
+            use_container_width=True,
+        ):
+            _run_action(
+                lambda: _save_r2_credentials(access_key_id, secret_access_key),
+                "R2两项密钥已保存。",
+            )
+
+        st.info(
+            "持仓文字摘要授权 ≠ 持仓K线图授权。即使文字摘要已允许外发，"
+            "图片仍默认不外发。后续若分别授权Server酱或Bark发图，"
+            "对应服务商也会接触短期签名HTTPS地址，并可能在到期前拉取或缓存图片。"
         )
 
     st.info(

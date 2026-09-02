@@ -6,8 +6,8 @@ from datetime import UTC, date, datetime
 import streamlit as st
 
 from ashare_lab.adapters.macos_keychain import (
-    infoway_key_is_configured,
-    save_infoway_api_key,
+    save_tushare_token,
+    tushare_token_is_configured,
 )
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.bootstrap import application_data_dir
@@ -17,8 +17,8 @@ from ashare_lab.services.run_daily_update import (
     DailyUpdateReport,
     latest_complete_cn_candidate,
     read_csmar_baseline_cutoff,
-    run_daily_update,
 )
+from ashare_lab.services.run_zero_budget_daily_update import run_zero_budget_daily_update
 
 CSMAR_ROOT = application_data_dir() / "cache" / "csmar"
 OVERLAY_ROOT = application_data_dir() / "cache" / "market_overlay"
@@ -42,14 +42,16 @@ def _local_status(now: datetime) -> _LocalUpdateStatus:
     try:
         baseline = read_csmar_baseline_cutoff(CSMAR_ROOT, through_date=candidate)
         chain = MarketOverlayStore(OVERLAY_ROOT).verified_dates_from(
-            source_id="infoway",
+            source_id="zero_budget_eod",
             baseline_cutoff=baseline,
             through_date=candidate,
         )
         automatic = chain[-1] if chain else None
     except AShareLabError:
         pass
-    quarantine_root = OVERLAY_ROOT / "source=infoway" / "adjust=none" / "quarantine"
+    quarantine_root = (
+        OVERLAY_ROOT / "source=zero_budget_eod" / "adjust=none" / "quarantine"
+    )
     quarantine_count = len(tuple(quarantine_root.glob("run=*")))
     return _LocalUpdateStatus(
         requested_complete_date=candidate,
@@ -61,10 +63,10 @@ def _local_status(now: datetime) -> _LocalUpdateStatus:
 
 
 def _save_key(value: str) -> None:
-    save_infoway_api_key(value)
-    st.session_state.pop("infoway_api_key_input", None)
+    save_tushare_token(value)
+    st.session_state.pop("tushare_token_input", None)
     st.session_state[_FLASH_KEY] = (
-        "新的Infoway API密钥已安全保存到macOS钥匙串；页面不会回显该密钥。"
+        "Tushare Token已安全保存到macOS钥匙串；页面不会回显。"
     )
     st.rerun()
 
@@ -73,7 +75,7 @@ def _run_update() -> None:
     with daily_update_lock(SCHEDULED_SYNC_LOCK) as acquired:
         if not acquired:
             raise DataUnavailableError("收盘数据更新正在另一个进程中运行，请稍后再试。")
-        report = run_daily_update(
+        report = run_zero_budget_daily_update(
             csmar_root=CSMAR_ROOT,
             overlay_root=OVERLAY_ROOT,
         )
@@ -103,8 +105,8 @@ def _render_report(report: DailyUpdateReport) -> None:
         st.error("本地共同截止尚未追平最近完整交易日；失败日之后的数据没有被登记。")
     if report.provider_contract_changed:
         st.error(
-            "供应商字段契约变化，请更新适配器。系统已停止并隔离该批数据，"
-            "没有自动尝试vm、替换vw或猜测成交量/成交额倍数。"
+            "三源字段、单位或交叉核验合同可能发生变化。系统已停止并隔离该批数据，"
+            "没有猜测单位，也没有用AKShare替换Tushare数据。"
         )
     if report.quarantined_failures:
         with st.expander("查看隔离失败", expanded=True):
@@ -117,7 +119,7 @@ def _render_report(report: DailyUpdateReport) -> None:
 def render() -> None:
     st.title("自动补齐收盘数据")
     st.caption(
-        "CSMAR只作为不可改写的历史基线；缺失交易日写入Infoway独立overlay。"
+        "CSMAR只作为不可改写的历史基线；缺失交易日写入零预算三源独立overlay。"
         "系统不会连接券商、不会读取持仓，也不会自动下单。"
     )
     flash = st.session_state.pop(_FLASH_KEY, None)
@@ -126,11 +128,12 @@ def render() -> None:
 
     st.info(
         "盘中不会把今天的累计行情当成完整日线：上海时间15:30前只补到上一日期。"
-        "15:30后当日只进入收盘候选，仍需通过Infoway中国交易日历、全量覆盖和行质量校验；"
+        "15:30后当日只进入收盘候选，仍需通过BaoStock交易日历、Tushare覆盖和"
+        "AKShare独立核验；"
         "不完整数据会被隔离，18:30再复核。"
     )
     st.warning(
-        "Infoway当前股票清单只覆盖沪深A股，不含北交所。北交所股票不会被伪造或静默补齐，"
+        "当前免费链只覆盖沪深A股，不含北交所。北交所股票不会被伪造或静默补齐，"
         "在混合研究样本中会明确排除。"
     )
     st.caption(
@@ -140,28 +143,28 @@ def render() -> None:
     )
 
     try:
-        configured = infoway_key_is_configured()
+        configured = tushare_token_is_configured()
         key_status = "🟢 已安全配置" if configured else "🟡 尚未配置"
     except AShareLabError as exc:
         key_status = "🔴 macOS钥匙串暂时无法读取"
         st.error(str(exc))
 
     with st.container(border=True):
-        st.subheader("Infoway密钥 · 仅存macOS钥匙串")
+        st.subheader("Tushare Token · 仅存macOS钥匙串")
         st.write("状态：" + key_status)
-        st.error(
-            "曾经粘贴到聊天、截图或其他公开位置的旧密钥应先在Infoway后台轮换，"
-            "这里只保存轮换后的新密钥。"
+        st.caption(
+            "免费注册后在Tushare个人中心复制Token。请直接粘贴到本机页面，"
+            "不要发到聊天、截图或GitHub。"
         )
-        api_key = st.text_input(
-            "新的Infoway API密钥",
+        token = st.text_input(
+            "Tushare Token",
             type="password",
-            key="infoway_api_key_input",
-            help="密钥不会写入项目、数据库、日志、命令行参数或GitHub。",
+            key="tushare_token_input",
+            help="Token不会写入项目、数据库、日志、命令行参数或GitHub。",
         )
-        if st.button("保存新密钥到钥匙串", type="secondary", width="stretch"):
+        if st.button("保存Token到钥匙串", type="secondary", width="stretch"):
             try:
-                _save_key(api_key)
+                _save_key(token)
             except (AShareLabError, ValueError) as exc:
                 st.error(str(exc))
 
@@ -189,7 +192,9 @@ def render() -> None:
 
     if st.button("立即自动补齐缺失收盘数据", type="primary", width="stretch"):
         try:
-            with st.spinner("正在核对交易日历、分批取得沪深收盘数据并验证核心指数…"):
+            with st.spinner(
+                "正在用BaoStock核对交易日历、Tushare取得日线、AKShare交叉核验…"
+            ):
                 _run_update()
         except (AShareLabError, ValueError) as exc:
             st.error(f"自动数据更新未完成：{exc}")

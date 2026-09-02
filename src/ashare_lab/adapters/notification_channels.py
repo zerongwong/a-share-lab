@@ -19,6 +19,7 @@ from ashare_lab.ports.notifications import (
     NotificationMessage,
     NotificationReceipt,
     NotificationUrgency,
+    prepare_notification_for_channel,
 )
 
 _SERVERCHAN_KEY = re.compile(r"^SCT[A-Za-z0-9_-]{8,192}$")
@@ -56,6 +57,9 @@ class ServerChanNotificationChannel:
         self.close()
 
     def send(self, message: NotificationMessage) -> NotificationReceipt:
+        message = prepare_notification_for_channel(message, channel_name=self.channel_name)
+        if message is None:
+            raise ValueError("Server酱没有该持仓信息的逐通道授权")
         if "\n" in message.title or "\r" in message.title:
             raise ValueError("Server酱标题不能包含换行符")
         if len(message.title) > 32:
@@ -65,7 +69,7 @@ class ServerChanNotificationChannel:
         try:
             response = self._client.post(
                 f"{self._base_url}/{self._sendkey}.send",
-                data={"title": message.title, "desp": message.body},
+                data={"title": message.title, "desp": _serverchan_desp(message)},
             )
             response.raise_for_status()
             document = response.json()
@@ -89,6 +93,7 @@ class ServerChanNotificationChannel:
             accepted=True,
             provider_status="provider_accepted",
             provider_receipt_id=_serverchan_receipt_id(document.get("data")),
+            image_accepted=message.image_url is not None,
         )
 
 
@@ -122,6 +127,9 @@ class BarkNotificationChannel:
         self.close()
 
     def send(self, message: NotificationMessage) -> NotificationReceipt:
+        message = prepare_notification_for_channel(message, channel_name=self.channel_name)
+        if message is None:
+            raise ValueError("Bark没有该持仓信息的逐通道授权")
         payload: dict[str, Any] = {
             "device_key": self._device_key,
             "title": message.title,
@@ -133,6 +141,8 @@ class BarkNotificationChannel:
                 else "active"
             ),
         }
+        if message.image_url is not None:
+            payload["image"] = message.image_url
         try:
             response = self._client.post(f"{self._base_url}/push", json=payload)
             response.raise_for_status()
@@ -146,7 +156,19 @@ class BarkNotificationChannel:
             channel=self.channel_name,
             accepted=True,
             provider_status="provider_accepted",
+            image_accepted=message.image_url is not None,
         )
+
+
+def _serverchan_desp(message: NotificationMessage) -> str:
+    """Append one chart image without mutating the retry-safe message body."""
+
+    if message.image_url is None:
+        return message.body
+    image_reference = f"![A股研究图表](<{message.image_url}>)"
+    if image_reference in message.body:
+        return message.body
+    return f"{message.body}\n\n{image_reference}"
 
 
 def _serverchan_receipt_id(data: object) -> str | None:

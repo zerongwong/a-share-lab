@@ -168,6 +168,26 @@ class CSMARParquetMarketData:
         )
         return result
 
+    def latest_trade_date(self, *, on_or_before: date | None = None) -> date:
+        """Return the latest imported market date without loading the universe."""
+
+        connection = self._connect(read_only=True)
+        try:
+            if on_or_before is None:
+                row = connection.execute(
+                    "SELECT MAX(trade_date) AS trade_date FROM daily_bars"
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT MAX(trade_date) AS trade_date FROM daily_bars WHERE trade_date <= ?",
+                    [on_or_before],
+                ).fetchone()
+        finally:
+            connection.close()
+        if row is None or row[0] is None:
+            raise DataUnavailableError("CSMAR本地库没有可用交易日")
+        return pd.Timestamp(row[0]).date()
+
     def read_security_master(self, *, as_of: date | None = None) -> pd.DataFrame:
         connection = self._connect(read_only=True)
         try:

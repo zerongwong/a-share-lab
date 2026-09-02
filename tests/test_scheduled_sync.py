@@ -6,12 +6,13 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 from ashare_lab.cli import scheduled_sync
 from ashare_lab.domain.errors import DataUnavailableError
+from ashare_lab.services.build_monthly_model_review import MonthlyModelReview
 from ashare_lab.services.daily_update_lock import daily_update_lock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,15 +33,21 @@ class _NotificationResult:
         return bool(self.successful_channels)
 
 
-def _report(*, current: bool, updated: tuple[date, ...] = (), reason: str = ""):
+def _report(
+    *,
+    current: bool,
+    updated: tuple[date, ...] = (),
+    reason: str = "",
+    cutoff: date = date(2026, 8, 27),
+):
     failures = ()
     if reason:
         failures = (SimpleNamespace(reason=reason),)
     return SimpleNamespace(
         source_id="infoway",
-        requested_complete_date=date(2026, 8, 27),
-        latest_complete_session=date(2026, 8, 27),
-        common_cutoff=date(2026, 8, 27) if current else date(2026, 8, 26),
+        requested_complete_date=cutoff,
+        latest_complete_session=cutoff,
+        common_cutoff=cutoff if current else cutoff - timedelta(days=1),
         updated_sessions=updated,
         unchanged_sessions=(),
         quarantined_failures=failures,
@@ -82,6 +89,419 @@ def test_current_update_exits_zero_logs_private_event_and_sends_no_failure(
     line = json.loads(log_path.read_text(encoding="utf-8"))
     assert line["status"] == "updated"
     assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
+def test_current_update_settles_mature_recommendations_and_logs_counts(
+    tmp_path: Path,
+) -> None:
+    calls = []
+
+    def performance_runner(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            pending_batches=6,
+            evaluated_batches=2,
+            mature_batches=1,
+            notification_attempts=1,
+            notification_accepted_batches=1,
+            notification_failed_batches=0,
+            failed_batch_ids=(),
+        )
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: _NotificationResult(),
+        _performance_runner=performance_runner,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert len(calls) == 1
+    assert calls[0]["as_of"] == date(2026, 8, 27)
+    assert calls[0]["overlay_store"].root == (tmp_path / "overlay").resolve()
+    assert outcome.event["performance_status"] == "completed"
+    assert outcome.event["performance_pending_batches"] == 6
+    assert outcome.event["performance_evaluated_batches"] == 2
+    assert outcome.event["performance_mature_batches"] == 1
+    assert outcome.event["performance_notification_accepted_batches"] == 1
+    assert outcome.event["performance_failed_batch_count"] == 0
+
+
+def test_performance_partial_failure_is_visible_and_retryable(tmp_path: Path) -> None:
+    summary = SimpleNamespace(
+        pending_batches=6,
+        evaluated_batches=5,
+        mature_batches=1,
+        notification_attempts=0,
+        notification_accepted_batches=0,
+        notification_failed_batches=0,
+        failed_batch_ids=("batch-a",),
+    )
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: _NotificationResult(),
+        _performance_runner=lambda **_kwargs: summary,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["performance_status"] == "partial_retry_later"
+    assert outcome.event["performance_failed_batch_count"] == 1
+    assert "batch-a" not in json.dumps(outcome.event)
+
+
+def test_performance_review_failure_never_masks_data_sync_success(tmp_path: Path) -> None:
+    secret = "must-never-reach-log"
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: _NotificationResult(),
+        _performance_runner=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["performance_status"] == "error_retry_later"
+    assert outcome.event["performance_error_type"] == "RuntimeError"
+    assert secret not in json.dumps(outcome.event)
+
+
+def test_current_update_runs_private_holding_review_and_logs_only_aggregate_counts(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    secret_values = (
+        "600919",
+        "000001",
+        "江苏银行",
+        "12.34",
+        "10.87",
+        "private-reason",
+    )
+    summary = SimpleNamespace(
+        status=SimpleNamespace(value="ready"),
+        rows=(
+            SimpleNamespace(
+                symbol=secret_values[0],
+                name=secret_values[2],
+                cost_price=12.34,
+                effective_stop=10.87,
+                reasons=(secret_values[5],),
+                status=SimpleNamespace(value="ready"),
+                action=SimpleNamespace(value="hold"),
+                urgent=False,
+            ),
+            SimpleNamespace(
+                symbol=secret_values[1],
+                status=SimpleNamespace(value="data_not_ready"),
+                action=SimpleNamespace(value="review"),
+                urgent=True,
+            ),
+        ),
+    )
+
+    def holding_runner(repository, **kwargs):
+        calls.append((repository, kwargs))
+        return summary
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _holding_review_runner=holding_runner,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert len(calls) == 1
+    repository, kwargs = calls[0]
+    assert repository.db_path == (tmp_path / "research.db").resolve()
+    assert kwargs == {
+        "dataset_root": (tmp_path / "csmar").resolve(),
+        "overlay_root": (tmp_path / "overlay").resolve(),
+        "as_of": date(2026, 8, 27),
+        "reviewed_at": NOW,
+        "persist": True,
+    }
+    assert outcome.event["holding_review_status"] == "ready"
+    assert outcome.event["holding_review_row_count"] == 2
+    assert outcome.event["holding_review_ready_count"] == 1
+    assert outcome.event["holding_review_urgent_count"] == 1
+    assert outcome.event["holding_review_action_counts"] == {
+        "hold": 1,
+        "tighten": 0,
+        "reduce": 0,
+        "exit": 0,
+        "review": 1,
+    }
+    event_text = json.dumps(outcome.event, ensure_ascii=False)
+    assert all(value not in event_text for value in secret_values)
+
+
+def test_no_holdings_is_a_local_noop_with_zero_counts(tmp_path: Path) -> None:
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _holding_review_runner=scheduled_sync.run_active_holding_review,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["holding_review_status"] == "no_holdings"
+    assert outcome.event["holding_review_row_count"] == 0
+    assert outcome.event["holding_review_urgent_count"] == 0
+    assert set(outcome.event["holding_review_action_counts"].values()) == {0}
+
+
+def test_holding_review_failure_is_private_retryable_and_never_masks_sync(
+    tmp_path: Path,
+) -> None:
+    secret = "600919 江苏银行 cost=12.34 stop=10.87"
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _holding_review_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(secret)
+        ),
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["status"] == "noop_current"
+    assert outcome.event["holding_review_status"] == "error_retry_later"
+    assert secret not in json.dumps(outcome.event, ensure_ascii=False)
+
+
+def test_shadow_runs_after_holding_review_and_logs_only_aggregate_counts(
+    tmp_path: Path,
+) -> None:
+    order = []
+    secret = "600919 江苏银行 stop=10.87 private-shadow-reason"
+
+    def holding_runner(*_args, **_kwargs):
+        order.append("holding")
+        return SimpleNamespace(status=SimpleNamespace(value="no_holdings"), rows=())
+
+    def shadow_runner(repository, **kwargs):
+        order.append("shadow")
+        assert repository.db_path == (tmp_path / "research.db").resolve()
+        assert kwargs == {
+            "dataset_root": (tmp_path / "csmar").resolve(),
+            "overlay_root": (tmp_path / "overlay").resolve(),
+            "as_of": date(2026, 8, 27),
+            "evaluated_at": NOW,
+            "persist": True,
+        }
+        return SimpleNamespace(
+            status=SimpleNamespace(value="completed"),
+            observation_count=8,
+            variant_count=2,
+            private_payload=secret,
+        )
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _holding_review_runner=holding_runner,
+        _holding_shadow_runner=shadow_runner,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert order == ["holding", "shadow"]
+    assert outcome.event["holding_shadow_status"] == "completed"
+    assert outcome.event["holding_shadow_row_count"] == 8
+    assert outcome.event["holding_shadow_variant_count"] == 2
+    assert secret not in json.dumps(outcome.event, ensure_ascii=False)
+
+
+def test_shadow_failure_is_nonfatal_private_and_retryable(tmp_path: Path) -> None:
+    secret = "601919 shadow-price=17.00"
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=True),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _holding_shadow_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(secret)
+        ),
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["holding_shadow_status"] == "error_retry_later"
+    assert secret not in json.dumps(outcome.event, ensure_ascii=False)
+
+
+def test_first_verified_session_archives_monthly_review_locally_once(
+    tmp_path: Path,
+) -> None:
+    cutoff = date(2026, 9, 1)
+    now = datetime(2026, 9, 1, 10, 0, tzinfo=UTC)
+    build_calls = []
+    notified = []
+    review = MonthlyModelReview(
+        review_month="2026-08",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        generated_as_of=cutoff,
+        method_version="monthly-model-review-v0.1.0",
+        horizon_reviews=(),
+        experiment_proposals=(),
+        excluded_batches=(),
+        evidence_gaps=("benchmark_unavailable",),
+        archive_scan_truncated=False,
+        conclusion="样本不足，不自动调整参数。",
+    )
+
+    def monthly_builder(repository, **kwargs):
+        build_calls.append((repository, kwargs))
+        return review
+
+    performance = SimpleNamespace(
+        pending_batches=0,
+        evaluated_batches=0,
+        mature_batches=0,
+        notification_attempts=0,
+        notification_accepted_batches=0,
+        notification_failed_batches=0,
+        failed_batch_ids=(),
+    )
+    common = {
+        **_paths(tmp_path),
+        "clock": lambda: now,
+        "_run_update": lambda **_kwargs: _report(current=True, cutoff=cutoff),
+        "_notifier": lambda message: notified.append(message) or _NotificationResult(),
+        "_performance_runner": lambda **_kwargs: performance,
+        "_monthly_review_builder": monthly_builder,
+    }
+
+    first = scheduled_sync.run_scheduled_sync(**common)
+    second = scheduled_sync.run_scheduled_sync(**common)
+
+    assert first.exit_code == scheduled_sync.EXIT_CURRENT
+    assert first.event["monthly_review_status"] == "completed_local_only"
+    assert first.event["monthly_review_month"] == "2026-08"
+    assert first.event["monthly_review_horizon_count"] == 0
+    assert first.event["monthly_review_mature_batch_count"] == 0
+    assert first.event["monthly_review_proposal_count"] == 0
+    assert second.event["monthly_review_status"] == "not_due"
+    assert len(build_calls) == 1
+    repository, kwargs = build_calls[0]
+    assert repository.db_path == (tmp_path / "research.db").resolve()
+    assert kwargs == {"review_month": date(2026, 8, 1), "as_of": cutoff}
+    archive_dir = tmp_path / "scheduler" / "monthly-model-reviews"
+    archive_path = archive_dir / "2026-08.json"
+    state_path = tmp_path / "scheduler" / "monthly-model-review-state.json"
+    assert json.loads(archive_path.read_text(encoding="utf-8"))["review_month"] == "2026-08"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["completed_months"] == ["2026-08"]
+    assert stat.S_IMODE(archive_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(archive_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+    assert notified == []
+
+
+def test_monthly_archive_failure_does_not_mark_complete_and_retries(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    cutoff = date(2026, 9, 1)
+    review = MonthlyModelReview(
+        review_month="2026-08",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        generated_as_of=cutoff,
+        method_version="monthly-model-review-v0.1.0",
+        horizon_reviews=(),
+        experiment_proposals=(),
+        excluded_batches=(),
+        evidence_gaps=(),
+        archive_scan_truncated=False,
+        conclusion="local only",
+    )
+    secret = "private monthly payload"
+    monkeypatch.setattr(
+        scheduled_sync,
+        "_write_private_json",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError(secret)),
+    )
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        _run_update=lambda **_kwargs: _report(current=True, cutoff=cutoff),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
+        _monthly_review_builder=lambda *_args, **_kwargs: review,
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["monthly_review_status"] == "error_retry_later"
+    assert secret not in json.dumps(outcome.event)
+    assert not (tmp_path / "scheduler" / "monthly-model-review-state.json").exists()
+
+
+def test_monthly_review_waits_until_same_run_performance_settlement_is_complete(
+    tmp_path: Path,
+) -> None:
+    cutoff = date(2026, 9, 1)
+    partial = SimpleNamespace(
+        pending_batches=1,
+        evaluated_batches=1,
+        mature_batches=0,
+        notification_attempts=0,
+        notification_accepted_batches=0,
+        notification_failed_batches=0,
+        failed_batch_ids=("private-batch-id",),
+    )
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        _run_update=lambda **_kwargs: _report(current=True, cutoff=cutoff),
+        _notifier=lambda _message: _NotificationResult(),
+        _performance_runner=lambda **_kwargs: partial,
+        _monthly_review_builder=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("monthly review must wait for complete settlement")
+        ),
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_CURRENT
+    assert outcome.event["performance_status"] == "partial_retry_later"
+    assert outcome.event["monthly_review_status"] == "deferred_performance_incomplete"
+    assert "private-batch-id" not in json.dumps(outcome.event)
+    assert not (tmp_path / "scheduler" / "monthly-model-review-state.json").exists()
+
+
+def test_incomplete_sync_does_not_run_holding_or_monthly_postprocessing(
+    tmp_path: Path,
+) -> None:
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(current=False, reason="coverage gate"),
+        _notifier=lambda _message: _NotificationResult(),
+        _holding_review_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("holding review must wait for current data")
+        ),
+        _holding_shadow_runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("holding shadow must wait for current data")
+        ),
+        _monthly_review_builder=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("monthly review must wait for current data")
+        ),
+    )
+
+    assert outcome.exit_code == scheduled_sync.EXIT_INCOMPLETE
+    assert "holding_review_status" not in outcome.event
+    assert "holding_shadow_status" not in outcome.event
+    assert "monthly_review_status" not in outcome.event
 
 
 def test_non_trading_or_already_current_run_is_noop_success(tmp_path: Path) -> None:

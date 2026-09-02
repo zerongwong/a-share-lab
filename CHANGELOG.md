@@ -5,6 +5,54 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Add an isolated `holding-stop-shadow-runner-v0.1.0` research track for a strict daily-bar
+  Edwards--Magee translation. The `magee-shadow-daily-v0.1.0` engine keeps
+  `three_day_escape_6pct` and `new_high_3pct_6pct` separate, scans only entry-date-through-cutoff
+  evidence, and uses a frozen 6% buffer. Shadow events live only in `holding_stop_shadow_events`, are
+  not production decision inputs, cannot notify or place orders, and remain ineligible for promotion until point-in-time
+  company-action/calendar, A-share execution, paired purged walk-forward, and multiplicity-adjusted
+  acceptance gates pass. This does not claim superiority over the current ATR-based protection line.
+- Add an opt-in private current-holding chart report for the four-name, one-month case: one pastel
+  4-by-2 composite PNG with a daily and completed-weekly panel per holding, A-share red-up/green-down
+  candles, model observation conditions, moving averages, volume, confirmed references, and effective
+  protection lines. Reconstructed observations remain explicitly non-actionable; lines begin only when
+  knowable, incomplete weeks are excluded, and costs, shares, amounts, and account weights are omitted.
+  Generation requires channel-specific holding-summary authorization; local archives use private
+  permissions and a 30-day retention window. ServerChan can receive one optional image through a private
+  Cloudflare R2 object, a signed URL capped at one hour, and a separately confirmed one-day bucket
+  lifecycle; Bark never receives the image. Publication requires an exact holding revision plus separate
+  summary/chart/provider grants, repeats those checks before and after upload and immediately before
+  provider submission, and revokes the object when authorization changes or ServerChan does not accept
+  the image. Missing configuration still falls back to concise text, and no chart is uploaded to GitHub
+  or a public image host.
+- Add a private, explicit current-holding ledger and close-confirmed fruit-tree review. Holdings and
+  horizons persist until the user replaces or clears them; daily reviews emit HOLD/TIGHTEN/REDUCE/
+  EXIT/REVIEW without changing membership or placing orders. The Edwards--Magee-inspired protection
+  line uses confirmed post-entry pivots, is enforced never to move down, and requires independent
+  company-action clearance before destructive actions or stop ratchets. The daily scheduler stores only
+  aggregate action counts; channel-specific holding delivery remains deny-by-default.
+- Add a private monthly model-review archive after the first verified session of each new month. Formal
+  action, original observation, and reconstructed observation remain separate across all six horizons;
+  mutable results are filtered by knowledge time, insufficient/truncated samples do not create conclusions,
+  and an unavailable same-interval point-in-time benchmark is reported as unavailable. Reviews may propose
+  versioned experiments, but never change the production model without user approval and a fresh purged
+  walk-forward comparison.
+- Add immutable six-horizon recommendation archives and idempotent maturity-settlement components.
+  Maturity is measured 5/10/20/60/120/252 verified sessions after `plan_for_date`; the 15:30/18:30
+  daily-sync path invokes settlement only after a verified close, while the independent 21:00 task
+  remains a new-plan publisher. Results are separated into official action, original observation,
+  and reconstructed-observation populations. They use unadjusted price returns, exclude dividends,
+  preserve published weights without reweighting, and do not automatically backfill legacy reports.
+  Corporate-action coverage stays unknown unless an independent point-in-time action or adjustment-factor
+  source is injected; prior-candle closes are never treated as exchange ex-right references. Historical
+  reconstruction is explicitly a current-model replay, not a recovery of the original software payload.
+- Document an out-of-sample `U0–U3 × C0–C2` industry/leader experiment instead of adopting a fixed
+  leader universe. The proposed secondary-industry maximum of one stock, primary-industry maximum of
+  two stocks, and primary-industry sleeve cap of 40% remain an unvalidated candidate default rather
+  than an enabled production rule.
+- Fix the macOS evening-report weekday mapping so Sunday-to-Thursday uses launchd weekdays
+  `0,1,2,3,4`; the former `1..5` mapping skipped Sunday plans. Also stop a no-session weekend
+  sync before requesting the full stock universe, avoiding unnecessary provider failures.
 - Wire the multi-timeframe analytics core through the portfolio service, Streamlit UI, read-only MCP,
   and evening digest. A read-only six-horizon acceptance run on the 2026-08-27 common cutoff confirmed
   that the runtime routes are connected; it did not validate future performance or complete the central

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -28,6 +29,12 @@ def _client(handler):
 
 def _message(urgency: NotificationUrgency = NotificationUrgency.NORMAL):
     return NotificationMessage("行动单", "今日全部持有。", urgency=urgency)
+
+
+_SIGNED_IMAGE_URL = (
+    "https://private.example.com/charts/2026-08-31.png?"
+    "X-Amz-Expires=86400&X-Amz-Signature=signed-secret"
+)
 
 
 def test_serverchan_posts_expected_fields_and_accepts_success() -> None:
@@ -59,6 +66,38 @@ def test_serverchan_posts_expected_fields_and_accepts_success() -> None:
     assert "desp=" in str(seen["body"])
 
 
+def test_serverchan_appends_one_signed_chart_without_mutating_retry_body() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(parse_qs(request.read().decode())["desp"][0])
+        return httpx.Response(200, json={"code": 0, "message": "SUCCESS"})
+
+    message = NotificationMessage(
+        "行动单",
+        "精简文字结论。",
+        compact_body="更短结论。",
+        image_url=_SIGNED_IMAGE_URL,
+        image_authorized_channels=frozenset({"serverchan"}),
+    )
+    channel = ServerChanNotificationChannel(
+        "SCTabcdefgh12345678",
+        client=_client(handler),
+    )
+
+    first_receipt = channel.send(message)
+    second_receipt = channel.send(message)
+
+    expected = f"精简文字结论。\n\n![A股研究图表](<{_SIGNED_IMAGE_URL}>)"
+    assert seen == [expected, expected]
+    assert all(body.count(_SIGNED_IMAGE_URL) == 1 for body in seen)
+    assert message.body == "精简文字结论。"
+    assert _SIGNED_IMAGE_URL not in message.compact_body
+    assert _SIGNED_IMAGE_URL not in repr(message)
+    assert _SIGNED_IMAGE_URL not in repr(first_receipt)
+    assert _SIGNED_IMAGE_URL not in repr(second_receipt)
+
+
 def test_serverchan_never_reveals_sendkey_in_errors() -> None:
     secret = "SCTsupersecret123456"
     channel = ServerChanNotificationChannel(
@@ -69,6 +108,25 @@ def test_serverchan_never_reveals_sendkey_in_errors() -> None:
     with pytest.raises(NotificationDeliveryError) as exc_info:
         channel.send(_message())
     assert secret not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_serverchan_never_reveals_signed_image_url_in_errors() -> None:
+    channel = ServerChanNotificationChannel(
+        "SCTabcdefgh12345678",
+        client=_client(lambda _: httpx.Response(500, json={"image": _SIGNED_IMAGE_URL})),
+    )
+
+    with pytest.raises(NotificationDeliveryError) as exc_info:
+        channel.send(
+            NotificationMessage(
+                "行动单",
+                "正文",
+                image_url=_SIGNED_IMAGE_URL,
+                image_authorized_channels=frozenset({"serverchan"}),
+            )
+        )
+    assert _SIGNED_IMAGE_URL not in str(exc_info.value)
     assert exc_info.value.__cause__ is None
 
 
@@ -166,6 +224,38 @@ def test_bark_accepts_official_url_and_sends_time_sensitive_payload() -> None:
     }
 
 
+def test_bark_sends_one_signed_chart_in_the_official_image_field() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.read())
+        return httpx.Response(200, json={"code": 200, "message": "success"})
+
+    message = NotificationMessage(
+        "行动单",
+        "精简文字结论。",
+        compact_body="更短结论。",
+        image_url=f"  {_SIGNED_IMAGE_URL}  ",
+        image_authorized_channels=frozenset({"bark"}),
+    )
+    channel = BarkNotificationChannel("barkDevice123", client=_client(handler))
+
+    receipt = channel.send(message)
+
+    assert message.image_url == _SIGNED_IMAGE_URL
+    assert seen["payload"] == {
+        "device_key": "barkDevice123",
+        "title": "行动单",
+        "body": "精简文字结论。",
+        "group": "A股研究室",
+        "level": "active",
+        "image": _SIGNED_IMAGE_URL,
+    }
+    assert _SIGNED_IMAGE_URL not in message.compact_body
+    assert _SIGNED_IMAGE_URL not in repr(message)
+    assert _SIGNED_IMAGE_URL not in repr(receipt)
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -191,6 +281,25 @@ def test_bark_never_reveals_device_key_in_errors() -> None:
     with pytest.raises(NotificationDeliveryError) as exc_info:
         channel.send(_message())
     assert secret not in str(exc_info.value)
+
+
+def test_bark_never_reveals_signed_image_url_in_errors() -> None:
+    channel = BarkNotificationChannel(
+        "barkSecretDevice123",
+        client=_client(lambda _: httpx.Response(500, json={"image": _SIGNED_IMAGE_URL})),
+    )
+
+    with pytest.raises(NotificationDeliveryError) as exc_info:
+        channel.send(
+            NotificationMessage(
+                "行动单",
+                "正文",
+                image_url=_SIGNED_IMAGE_URL,
+                image_authorized_channels=frozenset({"bark"}),
+            )
+        )
+    assert _SIGNED_IMAGE_URL not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
 
 
 def test_dispatcher_keeps_second_channel_when_first_fails() -> None:
@@ -227,3 +336,50 @@ def test_message_rejects_empty_and_overlong_content() -> None:
             "正文",
             compact_body="中" * (MAX_COMPACT_NOTIFICATION_BODY_BYTES // 3 + 1),
         )
+
+
+def test_message_requires_explicit_image_channel_scope() -> None:
+    with pytest.raises(ValueError, match="明确授权"):
+        NotificationMessage("行动单", "正文", image_url=_SIGNED_IMAGE_URL)
+    with pytest.raises(ValueError, match="没有图表图片"):
+        NotificationMessage(
+            "行动单",
+            "正文",
+            image_authorized_channels=frozenset({"serverchan"}),
+        )
+    with pytest.raises(ValueError, match="serverchan/bark"):
+        NotificationMessage(
+            "行动单",
+            "正文",
+            image_url=_SIGNED_IMAGE_URL,
+            image_authorized_channels=frozenset({"email"}),
+        )
+
+
+@pytest.mark.parametrize(
+    "image_url",
+    [
+        " ",
+        "http://private.example.com/chart.png",
+        "file:///tmp/chart.png",
+        "data:image/png;base64,AAAA",
+        "/tmp/chart.png",
+        "https://user:password@private.example.com/chart.png",
+        "https://private.example.com/chart.png\nforged",
+        "https://private.example.com/chart.png\rforged",
+        "https://localhost/chart.png",
+        "https://127.0.0.1/chart.png",
+    ],
+)
+def test_message_rejects_unsafe_chart_image_urls_without_leaking_them(
+    image_url: str,
+) -> None:
+    with pytest.raises(ValueError) as exc_info:
+        NotificationMessage(
+            "行动单",
+            "正文",
+            image_url=image_url,
+            image_authorized_channels=frozenset({"serverchan"}),
+        )
+    if image_url.strip():
+        assert image_url not in str(exc_info.value)

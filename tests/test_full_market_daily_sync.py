@@ -255,6 +255,7 @@ def test_default_unconnected_rights_fail_before_provider_or_filesystem(
     tmp_path: Path,
 ) -> None:
     provider = FakeDateMajorProvider()
+    provider.source_id = SourceId.IFIND
     root = tmp_path / "market"
 
     with pytest.raises(RightsViolationError):

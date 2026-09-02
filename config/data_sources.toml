@@ -28,15 +28,39 @@ notes = "需自行购买或获得账户数据权限；默认未连接。"
 
 [sources.tushare]
 display_name = "Tushare Pro"
-status = "not_connected"
-purposes = ["A股证券主表", "全市场日线行情", "交易日历"]
+status = "experimental"
+purposes = ["免费档全市场未复权日线"]
 official_url = "https://tushare.pro/"
 application_url = "https://tushare.pro/register"
-authorization_basis = "account_entitlement"
+authorization_basis = "personal_research_only"
+authorization_reference = ""
+configurable = true
+allowed_actions = ["market_data_read", "market_data_cache"]
+notes = "仅使用用户免费档明确允许的未复权日线；Token只放操作系统钥匙串。证券主表、交易日历和复权因子不冒充免费权限。"
+
+[sources.baostock]
+display_name = "BaoStock"
+status = "experimental"
+purposes = ["免费交易日历", "沪深证券清单", "核心指数未复权日线"]
+official_url = "https://www.baostock.com/"
+application_url = "https://pypi.org/project/baostock/"
+authorization_basis = "personal_research_only"
+authorization_reference = ""
+configurable = false
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "仅供本机个人研究；无可依赖SLA，必须经过完整性、单位和跨源验证后才能进入组合数据链。"
+
+[sources.zero_budget_eod]
+display_name = "零预算三源收盘链"
+status = "experimental"
+purposes = ["Tushare免费日线", "BaoStock日历与指数", "AKShare独立交叉核验"]
+official_url = "https://tushare.pro/"
+application_url = "https://tushare.pro/register"
+authorization_basis = "personal_research_only"
 authorization_reference = ""
 configurable = true
 allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
-notes = "需用户自行注册并取得相应积分/接口权限；令牌只放操作系统密钥存储或运行环境，禁止写入本配置。"
+notes = "组合来源必须分别留痕；任一日期、覆盖、单位或核验门失败均不得推进共同截止日。"
 
 [sources.csmar]
 display_name = "CSMAR 本地导出"

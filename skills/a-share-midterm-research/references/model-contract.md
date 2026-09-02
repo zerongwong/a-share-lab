@@ -173,6 +173,95 @@ Do not reuse a 60-session breakout line, one risk evaluation, one portfolio, or 
 all six horizons and relabel it. A shared eligible universe is intentional; a shared post-eligibility
 decision is not.
 
+## Persistent holding-management contract
+
+Recommendation generation and management of an already-held portfolio are separate state machines.
+The current holding set, entry date, planned horizon, and user-supplied cost or weights come only from
+an explicit user statement. They remain effective until the user explicitly replaces or clears that
+statement. A new candidate ranking, an `EXIT` research label, or a newly generated model portfolio must
+never silently rewrite the holding ledger.
+
+For each verified completed close, review every active holding under its declared horizon and return one
+of `HOLD`, `TIGHTEN`, `REDUCE`, `EXIT`, or `REVIEW`:
+
+- `HOLD` keeps an intact position and ignores ordinary rank churn;
+- `TIGHTEN` keeps the position while ratcheting a confirmed protection line upward;
+- `REDUCE` is a next-tradable-session staged-reduction review after completed-timeframe deterioration;
+- `EXIT` requires a completed close below the effective protection line; and
+- `REVIEW` is fail-closed whenever price, calendar, company-action, or other required evidence cannot
+  support a destructive action.
+
+The implemented protection line is a versioned **Edwards--Magee-inspired research default**, not a claim
+of reproducing every rule in a specific book edition. For the position's primary structure timeframe,
+use only a reaction low confirmed with right-hand bars after entry; until one exists, use the structure
+floor that was knowable at entry. Apply the documented ATR buffer and persist
+`max(previous_effective_stop, new_candidate_stop)`. The effective line may never move down. A database
+constraint must independently enforce that monotonic rule. A close below the line is a research trigger
+for the next tradable session, not a guaranteed fill; A-share T+1, suspension, limit-down, and gaps still
+apply.
+
+The separate `holding-stop-shadow-runner-v0.1.0` experiment does not change that production default.
+Its `magee-shadow-daily-v0.1.0` engine evaluates `three_day_escape_6pct` and
+`new_high_3pct_6pct` independently, scanning only complete daily bars from the recorded entry date through
+the point-in-time cutoff; pre-entry bars cannot form an anchor, candidate, or trigger. A low is confirmed
+only after three consecutive
+verified sessions whose complete ranges escape above the candidate day's high, and a 3%-new-high candidate
+whose low becomes the next baseline. Both use a 6% buffer, never move a remembered line down, and become
+effective only on the next observed daily bar. The pure engine cannot itself prove that input rows form
+the complete official trading-session chain; the orchestration evidence must establish that before an
+event is evaluation-eligible. The current runner has not integrated that evidence, so it archives the
+counterfactuals while keeping `evaluation_eligible=0`. They write only `holding_stop_shadow_events` with
+`decision_layer=shadow_research_only`, `production_decision_input=0`, `external_delivery_allowed=0`, and
+`auto_order_allowed=0`; they cannot update production stops, holding actions, notifications, or orders.
+Missing or stale interval-complete company-action clearance makes an event non-comparable. The shadow
+schema records coverage-start, clearance-through, and knowledge-time fields, but the existence of those
+fields is not evidence: if the upstream source cannot supply the complete interval and point-in-time
+knowledge boundary, `evaluation_eligible` must remain zero. Runs that
+depend on the current `W-FRI`/business-month-end fallback remain partial until point-in-time official-calendar
+boundaries are implemented. No shadow version may be promoted without per-horizon paired purged walk-forward
+evidence, costs and A-share executability, multiplicity-adjusted intervals, at least 30 valid paired paths
+across three non-overlapping folds and two market states, explicit user approval, and a new production method
+version. These gates do not assert that the shadow rules are superior to the incumbent.
+
+Unadjusted prices cannot distinguish genuine trend failure from every ex-rights, dividend, bonus-share,
+split, or rights event. A missing or stale independent company-action clearance must therefore block a
+new protection-line write and convert apparent `TIGHTEN`, `REDUCE`, or `EXIT` into urgent `REVIEW`.
+An unambiguously detected action also requires review. A non-destructive `HOLD` may be shown without a
+clearance, but it must not advance the remembered protection line. Never treat a previous-candle close as
+an exchange ex-right reference.
+
+Pruning is deliberately asymmetric: keep strong or intact branches, never average down, and respond to
+confirmed weakness rather than every red day. A reduction or exit leaves the released weight in cash.
+The model does not automatically fill the slot, rebalance the remaining positions, or place an order.
+Adding a replacement requires a separately generated data-qualified plan and an explicit user holding
+update. This avoids turning the fruit-tree metaphor into daily high-turnover rank chasing.
+
+The complete holding review and protection-line history stay local. External summaries may include only
+the minimum explicitly authorized fields and only for specifically authorized channels; absence of an
+allow-list is denial, not implied consent. Costs, total account amounts, raw history, and evidence payloads
+must not be placed in notification bodies or sanitized scheduler logs.
+
+## Rolling performance and monthly learning contract
+
+Every published six-horizon cohort freezes its plan date, method version, structured price condition, and
+operational weights before provider submission. Settle the 5/10/20/60/120/252-session outcomes on the
+verified trading-session chain without rewriting the prediction, renormalizing unentered weights, or
+mixing formal action, original observation, and reconstructed observation populations. Unadjusted price
+return excludes dividends and is not account total return. Missing company-action coverage, an incomplete
+entry rule, suspension, or a missing due-date mark remains pending or needs review rather than becoming a
+fabricated return.
+
+Once per completed calendar month, summarize each population and horizon independently. Filter every
+mutable result by the knowledge time of the review, require an adequate count of verifiable matured
+batches before a directional conclusion, and report a market comparison only when a same-interval,
+point-in-time benchmark with matching cutoff and adjustment is supplied. A truncated archive scan or an
+unavailable benchmark must be stated explicitly.
+
+Weak or negative outcomes may create a versioned experiment proposal and an attribution checklist; they
+must never mutate thresholds automatically. Any proposed change requires user approval, a new strategy
+version, and a fresh purged walk-forward comparison against the frozen incumbent before it may become the
+production default.
+
 ## Data hierarchy
 
 1. Licensed historical stock, corporate-action, membership, financial, and publication-time data.

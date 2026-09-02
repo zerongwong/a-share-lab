@@ -231,6 +231,7 @@ def test_appends_only_verified_post_baseline_rows_and_advances_common_cutoff() -
     loaded = load_hybrid_universe(
         "/unused/csmar",
         overlay_root="/unused/overlay",
+        overlay_source_id="infoway",
         as_of=day_two,
         decision_date=date(2026, 8, 27),
         mode="live",
@@ -272,6 +273,7 @@ def test_long_risk_history_request_does_not_become_full_market_coverage_gate(
     loaded = load_hybrid_universe(
         "/unused/csmar",
         overlay_root="/unused/overlay",
+        overlay_source_id="infoway",
         as_of=BASELINE_CUTOFF,
         decision_date=BASELINE_CUTOFF,
         mode="historical",
@@ -300,6 +302,7 @@ def test_new_stock_outside_csmar_master_is_isolated() -> None:
     loaded = load_hybrid_universe(
         "/unused/csmar",
         overlay_root="/unused/overlay",
+        overlay_source_id="infoway",
         as_of=trade_day,
         decision_date=trade_day,
         mode="historical",
@@ -323,6 +326,7 @@ def test_missing_baseline_stock_is_excluded_when_coverage_gate_passes() -> None:
     loaded = load_hybrid_universe(
         "/unused/csmar",
         overlay_root="/unused/overlay",
+        overlay_source_id="infoway",
         as_of=trade_day,
         decision_date=trade_day,
         mode="historical",
@@ -347,8 +351,9 @@ def test_missing_baseline_stock_fails_when_coverage_gate_is_breached() -> None:
 
     with pytest.raises(DataUnavailableError, match="不再满足全市场研究资格门"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",
@@ -366,8 +371,9 @@ def test_missing_core_index_fails_closed() -> None:
 
     with pytest.raises(DataQualityError, match="六核心指数不完整"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",
@@ -386,8 +392,9 @@ def test_manifest_index_alias_collision_fails_closed() -> None:
 
     with pytest.raises(DataQualityError, match="别名映射后发生指数代码碰撞"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",
@@ -409,8 +416,9 @@ def test_index_rows_alias_collision_fails_closed() -> None:
 
     with pytest.raises(DataQualityError, match="别名映射后发生指数代码碰撞"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",
@@ -430,8 +438,9 @@ def test_manifest_trading_day_gap_fails_closed() -> None:
 
     with pytest.raises(DataQualityError, match="交易日断链"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=day_two,
             decision_date=day_two,
             mode="historical",
@@ -451,8 +460,9 @@ def test_historical_replay_rejects_manifest_known_after_decision(audit_column: s
 
     with pytest.raises(DataQualityError, match="历史回放禁止使用"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",
@@ -473,8 +483,9 @@ def test_adjusted_overlay_is_rejected() -> None:
 
     with pytest.raises(DataQualityError, match="必须为none未复权"):
         load_hybrid_universe(
-            "/unused/csmar",
-            overlay_root="/unused/overlay",
+                "/unused/csmar",
+                overlay_root="/unused/overlay",
+                overlay_source_id="infoway",
             as_of=trade_day,
             decision_date=trade_day,
             mode="historical",

@@ -1,14 +1,35 @@
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.cli import evening_report
+from ashare_lab.cli.evening_digest import _message_for_channel
 from ashare_lab.domain.errors import NotificationDeliveryError
 from ashare_lab.ports.notifications import NotificationReceipt
 from ashare_lab.services.build_evening_digest import EveningResearchDigest
+from ashare_lab.services.build_holding_chart_report import (
+    HoldingChartBuildResult,
+    HoldingChartBuildStatus,
+)
 from ashare_lab.services.daily_update_lock import daily_update_lock
+from ashare_lab.services.holding_ledger import (
+    HOLDING_CHART_DELIVERY_CHANNELS_KEY,
+    HOLDING_CHART_PUBLISHER_ID_KEY,
+    ActiveHoldingPortfolio,
+    HoldingPositionInput,
+    replace_active_holdings,
+)
+from ashare_lab.services.review_active_holdings import (
+    HoldingAction,
+    HoldingReviewRowStatus,
+    HoldingReviewSummaryStatus,
+    HoldingTreeReviewRow,
+    HoldingTreeReviewSummary,
+)
 
 CUTOFF = date(2026, 8, 27)
 FRIDAY = date(2026, 8, 28)
@@ -53,12 +74,219 @@ def _accepted_summary(
     )
 
 
+def _recommendation_repository(tmp_path: Path) -> SQLiteRepository:
+    return SQLiteRepository(
+        tmp_path / "research.db",
+        Path(__file__).resolve().parents[1] / "migrations",
+    )
+
+
 def _rejected_summary(*channels: str) -> evening_report.EveningNotificationSummary:
     rejected = channels or ("serverchan", "bark")
     return evening_report.EveningNotificationSummary(
         configured_channels=rejected,
         failed_channels=rejected,
     )
+
+
+def _register_holding_channels(
+    repository: SQLiteRepository,
+    channels: tuple[str, ...],
+    *,
+    chart_channels: tuple[str, ...] = (),
+    chart_publisher_id: str | None = None,
+    legacy_bool: bool | None = None,
+) -> ActiveHoldingPortfolio:
+    metadata: dict[str, object] = {
+        "holding_summary_delivery_channels": list(channels),
+        HOLDING_CHART_DELIVERY_CHANNELS_KEY: list(chart_channels),
+        HOLDING_CHART_PUBLISHER_ID_KEY: chart_publisher_id,
+    }
+    if legacy_bool is not None:
+        metadata["external_delivery_consent"] = legacy_bool
+    return replace_active_holdings(
+        repository,
+        (
+            HoldingPositionInput(
+                symbol="600919",
+                name="持仓摘要股票",
+                entry_date=CUTOFF,
+                cost_price=987654.32,
+                stock_sleeve_weight=1.0,
+                account_weight=0.731,
+            ),
+        ),
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 27, 21, tzinfo=UTC),
+        metadata=metadata,
+    )
+
+
+def _holding_review(
+    portfolio_id: str,
+    holding_version: int,
+    *,
+    symbol: str = "600919",
+    name: str = "持仓摘要股票",
+) -> HoldingTreeReviewSummary:
+    row = HoldingTreeReviewRow(
+        symbol=symbol,
+        name=name,
+        holding_weeks=4,
+        holding_version=holding_version,
+        position_key=f"holding:{symbol}:test",
+        status=HoldingReviewRowStatus.READY,
+        action=HoldingAction.HOLD,
+        latest_close=12.50,
+        cost_price=987654.32,
+        stock_sleeve_weight=1.0,
+        account_weight=0.731,
+        candidate_stop=11.80,
+        previous_stop=11.50,
+        effective_stop=11.80,
+        stop_raised=True,
+        close_below_stop=False,
+        source_timeframe="daily",
+        evidence_date=CUTOFF,
+        slow_direction="up",
+        primary_structure="volume_confirmed_breakout",
+        daily_execution="confirmed",
+        reasons=("no_completed_close_exit_or_reduce_signal",),
+    )
+    return HoldingTreeReviewSummary(
+        status=HoldingReviewSummaryStatus.READY,
+        portfolio_id=portfolio_id,
+        holding_version=holding_version,
+        holding_weeks=4,
+        reviewed_at=datetime(2026, 8, 27, 21, tzinfo=UTC),
+        data_cutoff=CUTOFF,
+        rows=(row,),
+    )
+
+
+def _holding_chart_result(
+    portfolio: ActiveHoldingPortfolio,
+    *,
+    payload: bytes = b"\x89PNG\r\n\x1a\nprivate-composite",
+) -> HoldingChartBuildResult:
+    identity = SimpleNamespace(
+        portfolio_id=portfolio.id,
+        holding_version=portfolio.version,
+        holding_weeks=portfolio.holding_weeks,
+        data_cutoff=CUTOFF,
+    )
+    metadata = SimpleNamespace(
+        review_identity=identity,
+        panel_count=8,
+        symbols=tuple(position.symbol for position in portfolio.positions),
+        width=1_200,
+        height=3_600,
+        raw_rows_embedded=False,
+        sensitive_fields_embedded=False,
+    )
+    rendered = SimpleNamespace(composite_png=payload, metadata=metadata)
+    return HoldingChartBuildResult(
+        status=HoldingChartBuildStatus.READY,
+        portfolio_id=portfolio.id,
+        holding_version=portfolio.version,
+        holding_weeks=portfolio.holding_weeks,
+        data_cutoff=CUTOFF,
+        rendered=rendered,
+        archive=SimpleNamespace(composite_path=Path("private-local-only.png")),
+    )
+
+
+def _register_four_holding_channels(
+    repository: SQLiteRepository,
+    *,
+    summary_channels: tuple[str, ...] = ("serverchan", "bark"),
+    chart_channels: tuple[str, ...] = ("serverchan",),
+) -> ActiveHoldingPortfolio:
+    symbols = ("601101", "603012", "603268", "603679")
+    return replace_active_holdings(
+        repository,
+        tuple(
+            HoldingPositionInput(
+                symbol=symbol,
+                name=f"持仓{index}",
+                entry_date=CUTOFF,
+                stock_sleeve_weight=0.25,
+            )
+            for index, symbol in enumerate(symbols, start=1)
+        ),
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 27, 21, tzinfo=UTC),
+        metadata={
+            "holding_summary_delivery_channels": list(summary_channels),
+            HOLDING_CHART_DELIVERY_CHANNELS_KEY: list(chart_channels),
+            HOLDING_CHART_PUBLISHER_ID_KEY: "cloudflare_r2",
+        },
+    )
+
+
+def _holding_review_for_portfolio(
+    portfolio: ActiveHoldingPortfolio,
+) -> HoldingTreeReviewSummary:
+    rows = tuple(
+        HoldingTreeReviewRow(
+            symbol=position.symbol,
+            name=position.name,
+            holding_weeks=4,
+            holding_version=portfolio.version,
+            position_key=f"holding:{position.symbol}:test",
+            status=HoldingReviewRowStatus.READY,
+            action=HoldingAction.HOLD,
+            latest_close=12.50,
+            cost_price=None,
+            stock_sleeve_weight=0.25,
+            account_weight=None,
+            candidate_stop=11.80,
+            previous_stop=11.50,
+            effective_stop=11.80,
+            stop_raised=True,
+            close_below_stop=False,
+            source_timeframe="daily",
+            evidence_date=CUTOFF,
+            slow_direction="up",
+            primary_structure="volume_confirmed_breakout",
+            daily_execution="confirmed",
+            reasons=("no_completed_close_exit_or_reduce_signal",),
+        )
+        for position in portfolio.positions
+    )
+    return HoldingTreeReviewSummary(
+        status=HoldingReviewSummaryStatus.READY,
+        portfolio_id=portfolio.id,
+        holding_version=portfolio.version,
+        holding_weeks=4,
+        reviewed_at=datetime(2026, 8, 27, 21, tzinfo=UTC),
+        data_cutoff=CUTOFF,
+        rows=rows,
+    )
+
+
+class _PrivatePublisher:
+    provider_id = "cloudflare_r2"
+
+    def __init__(self) -> None:
+        self.published: list[bytes] = []
+        self.revoked: list[str] = []
+
+    def publish_png(self, payload: bytes):
+        self.published.append(payload)
+        return SimpleNamespace(
+            provider_id="cloudflare_r2",
+            expires_at=datetime.now(UTC) + timedelta(seconds=3_600),
+            image_url="https://images.example.com/private.png?signature=opaque",
+            revoke_key="holding-charts/0123456789abcdef0123456789abcdef.png",
+        )
+
+    def revoke(self, revoke_key: str):
+        self.revoked.append(revoke_key)
+        return SimpleNamespace(provider_id="cloudflare_r2", revoked=True)
+
+    def close(self) -> None:
+        return None
 
 
 def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path: Path) -> None:
@@ -99,8 +327,10 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert second.event["status"] == "noop_no_new_trading_day"
     assert len(builds) == len(messages) == 1
     assert messages[0].title == "A股日报｜2026-08-28（周五）计划"
-    assert "共同截止日：2026-08-27" in messages[0].body
-    assert "计划适用日：2026-08-28（周五）" in messages[0].body
+    assert "2026-08-28周五 A股研究计划" in messages[0].body
+    assert "数据2026-08-27" in messages[0].body
+    assert "六期限重合与差异审计" not in messages[0].body
+    assert len(messages[0].body.encode("utf-8")) <= 2_400
     assert messages[0].compact_body is not None
     assert "数据2026-08-27" in messages[0].compact_body
     assert len(messages[0].compact_body.encode("utf-8")) <= 2_400
@@ -133,6 +363,663 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert "A股六周期研究日报" not in log_path.read_text(encoding="utf-8")
     assert log_path.stat().st_mode & 0o777 == 0o600
     assert log_path.parent.stat().st_mode & 0o777 == 0o700
+    repository = _recommendation_repository(tmp_path)
+    reports = repository.list_recommendation_reports()
+    assert len(reports) == 1
+    assert reports[0]["archive_nature"] == "original"
+    assert reports[0]["plan_for_date"] == "2026-08-28"
+    delivery = repository.list_recommendation_delivery_events(reports[0]["id"])
+    assert {row["channel"] for row in delivery} == {"serverchan", "bark"}
+    assert {row["provider_status"] for row in delivery} == {"provider_accepted"}
+    assert all(row["detail_json"]["orders_enabled"] is False for row in delivery)
+
+
+def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing(
+    tmp_path: Path,
+) -> None:
+    cases = (
+        ("neither", (), False, False),
+        ("server_only", ("serverchan",), True, False),
+        ("bark_only", ("bark",), False, True),
+        ("both", ("serverchan", "bark"), True, True),
+    )
+    for label, channels, server_allowed, bark_allowed in cases:
+        case_root = tmp_path / label
+        repository = _recommendation_repository(case_root)
+        portfolio = _register_holding_channels(repository, channels)
+        seen: dict[str, str] = {}
+        review_calls: list[dict[str, object]] = []
+
+        def notifier(message, *, _seen=seen):
+            server = _message_for_channel(message, channel_name="serverchan")
+            bark = _message_for_channel(message, channel_name="bark")
+            assert server is not None
+            assert bark is not None
+            _seen["serverchan"] = server.body
+            _seen["bark"] = bark.body
+            return _accepted_summary("serverchan", "bark")
+
+        def build_holding_review(
+            *_args,
+            _review_calls=review_calls,
+            _portfolio=portfolio,
+            **kwargs,
+        ):
+            _review_calls.append(kwargs)
+            return _holding_review(_portfolio.id, _portfolio.version)
+
+        outcome = evening_report.run_evening_digest(
+            **_paths(case_root),
+            decision_date=CUTOFF,
+            _latest_cutoff=lambda _root: CUTOFF,
+            _next_trading_day=lambda _cutoff: FRIDAY,
+            _build_digest=lambda **_kwargs: _digest(),
+            _repository=repository,
+            _build_holding_review=build_holding_review,
+            _notifier=notifier,
+        )
+
+        assert outcome.exit_code == evening_report.EXIT_OK
+        assert len(review_calls) == (1 if channels else 0)
+        assert ("持仓摘要股票(600919)" in seen["serverchan"]) is server_allowed
+        assert ("持仓摘要股票(600919)" in seen["bark"]) is bark_allowed
+        assert ("当前持仓修枝" in seen["serverchan"]) is server_allowed
+        assert ("当前持仓修枝" in seen["bark"]) is bark_allowed
+        for body in seen.values():
+            assert "987654.32" not in body
+            assert "73.1%" not in body
+            assert "总金额" not in body
+            assert "账户权重" not in body
+            assert len(body.encode("utf-8")) <= 2_400
+
+
+def test_concurrent_holding_replacement_cannot_disclose_new_portfolio_details(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    _register_holding_channels(repository, ("serverchan", "bark"))
+    seen: dict[str, str] = {}
+
+    def build_holding_review(*_args, **_kwargs):
+        replacement = replace_active_holdings(
+            repository,
+            (
+                HoldingPositionInput(
+                    symbol="601919",
+                    name="B组合机密持仓",
+                    entry_date=CUTOFF,
+                    stock_sleeve_weight=1.0,
+                ),
+            ),
+            holding_weeks=4,
+            effective_at=datetime(2026, 8, 27, 22, tzinfo=UTC),
+            metadata={"holding_summary_delivery_channels": ["serverchan", "bark"]},
+        )
+        return _holding_review(
+            replacement.id,
+            replacement.version,
+            symbol="601919",
+            name="B组合机密持仓",
+        )
+
+    def notifier(message):
+        for channel in ("serverchan", "bark"):
+            rendered = _message_for_channel(message, channel_name=channel)
+            assert rendered is not None
+            seen[channel] = rendered.body
+        return _accepted_summary("serverchan", "bark")
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=build_holding_review,
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    for body in seen.values():
+        assert "持仓复核不可用｜本次不生成持仓动作" in body
+        assert "B组合机密持仓" not in body
+        assert "601919" not in body
+
+
+def test_concurrent_holding_consent_revocation_invalidates_old_review(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    authorized = _register_holding_channels(repository, ("serverchan", "bark"))
+    seen: dict[str, str] = {}
+
+    def build_holding_review(*_args, **_kwargs):
+        replace_active_holdings(
+            repository,
+            (
+                HoldingPositionInput(
+                    symbol="600919",
+                    name="持仓摘要股票",
+                    entry_date=CUTOFF,
+                    stock_sleeve_weight=1.0,
+                ),
+            ),
+            holding_weeks=4,
+            effective_at=datetime(2026, 8, 27, 22, tzinfo=UTC),
+            metadata={"holding_summary_delivery_channels": []},
+        )
+        return _holding_review(authorized.id, authorized.version)
+
+    def notifier(message):
+        for channel in ("serverchan", "bark"):
+            rendered = _message_for_channel(message, channel_name=channel)
+            assert rendered is not None
+            seen[channel] = rendered.body
+        return _accepted_summary("serverchan", "bark")
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=build_holding_review,
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    for body in seen.values():
+        assert "持仓复核不可用｜本次不生成持仓动作" in body
+        assert "持仓摘要股票" not in body
+        assert "600919" not in body
+
+
+def test_authorized_channel_gets_fail_closed_unavailable_copy_when_review_fails(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    _register_holding_channels(repository, ("serverchan",))
+    seen: dict[str, str] = {}
+
+    def notifier(message):
+        server = _message_for_channel(message, channel_name="serverchan")
+        bark = _message_for_channel(message, channel_name="bark")
+        assert server is not None
+        assert bark is not None
+        seen["serverchan"] = server.body
+        seen["bark"] = bark.body
+        return _accepted_summary("serverchan", "bark")
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("private holding review detail")
+        ),
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert "持仓复核不可用｜本次不生成持仓动作" in seen["serverchan"]
+    assert "当前持仓修枝" not in seen["bark"]
+    assert "private holding review detail" not in json.dumps(outcome.event)
+
+
+def test_legacy_boolean_alone_never_discloses_holding_summary(tmp_path: Path) -> None:
+    repository = _recommendation_repository(tmp_path)
+    _register_holding_channels(repository, (), legacy_bool=True)
+    seen: dict[str, str] = {}
+
+    def notifier(message):
+        server = _message_for_channel(message, channel_name="serverchan")
+        bark = _message_for_channel(message, channel_name="bark")
+        assert server is not None
+        assert bark is not None
+        seen["serverchan"] = server.body
+        seen["bark"] = bark.body
+        return _accepted_summary("serverchan", "bark")
+
+    review_calls: list[object] = []
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: (
+            review_calls.append(object()) or _holding_review("unused", 1)
+        ),
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert review_calls == []
+    for body in seen.values():
+        assert "持仓摘要股票" not in body
+        assert "当前持仓修枝" not in body
+
+
+def test_holding_chart_is_not_built_without_provider_scoped_authorization(
+    tmp_path: Path,
+) -> None:
+    chart_calls: list[object] = []
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _build_holding_chart_report=lambda *_args, **_kwargs: chart_calls.append(object()),
+        _notifier=lambda _message: _accepted_summary("serverchan", "bark"),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert chart_calls == []
+
+
+def test_summary_authorization_alone_never_builds_or_uploads_holding_chart(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_holding_channels(repository, ("serverchan",))
+    chart_calls: list[dict[str, object]] = []
+    messages = []
+
+    def build_chart(*_args, **kwargs):
+        chart_calls.append(kwargs)
+        return _holding_chart_result(portfolio)
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review(
+            portfolio.id, portfolio.version
+        ),
+        _build_holding_chart_report=build_chart,
+        _notifier=lambda message: messages.append(message) or _accepted_summary("serverchan"),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert chart_calls == []
+    assert len(messages) == 1
+    assert messages[0].image_url is None
+
+
+def test_authorized_r2_chart_is_attached_only_to_serverchan(tmp_path: Path) -> None:
+    repository = _recommendation_repository(tmp_path)
+    earlier_portfolio = _register_four_holding_channels(repository)
+    portfolio = replace_active_holdings(
+        repository,
+        tuple(
+            HoldingPositionInput(
+                symbol=position.symbol,
+                name=position.name,
+                entry_date=position.entry_date,
+                stock_sleeve_weight=position.stock_sleeve_weight,
+            )
+            for position in earlier_portfolio.positions
+        ),
+        holding_weeks=earlier_portfolio.holding_weeks,
+        effective_at=datetime(2026, 8, 28, 1, tzinfo=UTC),
+        metadata={
+            "holding_summary_delivery_channels": ["serverchan", "bark"],
+            HOLDING_CHART_DELIVERY_CHANNELS_KEY: ["serverchan"],
+            HOLDING_CHART_PUBLISHER_ID_KEY: "cloudflare_r2",
+        },
+    )
+    publisher = _PrivatePublisher()
+    seen: dict[str, object] = {}
+    review_calls: list[dict[str, object]] = []
+    chart_calls: list[dict[str, object]] = []
+
+    def build_review(*_args, **kwargs):
+        review_calls.append(kwargs)
+        return _holding_review_for_portfolio(portfolio)
+
+    def build_chart(*_args, **kwargs):
+        chart_calls.append(kwargs)
+        return _holding_chart_result(portfolio)
+
+    def notifier(message):
+        server = _message_for_channel(message, channel_name="serverchan")
+        bark = _message_for_channel(message, channel_name="bark")
+        assert server is not None
+        assert bark is not None
+        seen["root_url"] = message.image_url
+        seen["server_url"] = server.image_url
+        seen["bark_url"] = bark.image_url
+        return evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan", "bark"),
+            accepted_channels=("serverchan", "bark"),
+            image_accepted_channels=("serverchan",),
+        )
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=build_review,
+        _build_holding_chart_report=build_chart,
+        _holding_chart_publisher=publisher,
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert len(review_calls) == len(chart_calls) == 1
+    review_context = review_calls[0]["holding_context"]
+    chart_context = chart_calls[0]["holding_context"]
+    assert review_context is chart_context
+    assert review_context.portfolio_id == portfolio.id
+    assert review_context.version == portfolio.version
+    assert review_context.version == earlier_portfolio.version + 1
+    assert review_calls[0]["reviewed_at"] is chart_calls[0]["reviewed_at"]
+    assert review_context.known_at is review_calls[0]["reviewed_at"]
+    assert review_calls[0]["decision_date"] == CUTOFF
+    assert chart_calls[0]["as_of"] == CUTOFF
+    assert len(publisher.published) == 1
+    assert publisher.revoked == []
+    assert isinstance(seen["root_url"], str)
+    assert seen["server_url"] == seen["root_url"]
+    assert seen["bark_url"] is None
+    assert outcome.event["image_accepted_channels"] == ["serverchan"]
+    log_text = (tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8")
+    assert "signature=opaque" not in log_text
+
+
+def test_uploaded_chart_is_revoked_when_serverchan_does_not_accept_the_image(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    publisher = _PrivatePublisher()
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=lambda *_args, **_kwargs: _holding_chart_result(portfolio),
+        _holding_chart_publisher=publisher,
+        _notifier=lambda _message: evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan", "bark"),
+            accepted_channels=("bark",),
+            failed_channels=("serverchan",),
+        ),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert len(publisher.published) == 1
+    assert publisher.revoked == ["holding-charts/0123456789abcdef0123456789abcdef.png"]
+
+
+def test_chart_is_revoked_if_holding_revision_changes_during_publication(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+
+    class ReplacingPublisher(_PrivatePublisher):
+        def publish_png(self, payload: bytes):
+            receipt = super().publish_png(payload)
+            replace_active_holdings(
+                repository,
+                tuple(
+                    HoldingPositionInput(
+                        symbol=position.symbol,
+                        name=position.name,
+                        entry_date=position.entry_date,
+                        stock_sleeve_weight=position.stock_sleeve_weight,
+                    )
+                    for position in portfolio.positions
+                ),
+                holding_weeks=portfolio.holding_weeks,
+                effective_at=datetime(2026, 8, 27, 22, tzinfo=UTC),
+                metadata={
+                    "holding_summary_delivery_channels": ["serverchan", "bark"],
+                    HOLDING_CHART_DELIVERY_CHANNELS_KEY: [],
+                    HOLDING_CHART_PUBLISHER_ID_KEY: None,
+                },
+            )
+            return receipt
+
+    publisher = ReplacingPublisher()
+    messages = []
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=lambda *_args, **_kwargs: _holding_chart_result(portfolio),
+        _holding_chart_publisher=publisher,
+        _notifier=lambda message: (
+            messages.append(message) or _accepted_summary("serverchan", "bark")
+        ),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert publisher.revoked == ["holding-charts/0123456789abcdef0123456789abcdef.png"]
+    assert messages[0].image_url is None
+
+
+def test_chart_authorization_stays_text_only_while_external_publisher_is_disabled(
+    tmp_path: Path,
+) -> None:
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_holding_channels(
+        repository,
+        ("serverchan",),
+        chart_channels=("serverchan",),
+        chart_publisher_id="cloudflare_r2",
+    )
+    chart_calls: list[object] = []
+    published: list[object] = []
+    seen: dict[str, object] = {}
+
+    def publisher(*_args, **_kwargs):
+        published.append(object())
+        raise AssertionError("disabled publisher must not be called")
+
+    def notifier(message):
+        seen["root_url"] = message.image_url
+        server = _message_for_channel(message, channel_name="serverchan")
+        bark = _message_for_channel(message, channel_name="bark")
+        assert server is not None
+        assert bark is not None
+        seen["server_url"] = server.image_url
+        seen["bark_url"] = bark.image_url
+        return _accepted_summary("serverchan", "bark")
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review(
+            portfolio.id, portfolio.version
+        ),
+        _build_holding_chart_report=lambda *_args, **_kwargs: (
+            chart_calls.append(object()) or _holding_chart_result(portfolio)
+        ),
+        _holding_chart_publisher=publisher,
+        _notifier=notifier,
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert seen == {
+        "root_url": None,
+        "server_url": None,
+        "bark_url": None,
+    }
+    assert chart_calls == []
+    assert published == []
+
+
+def test_holding_chart_failures_preserve_text_and_never_leak_private_details(
+    tmp_path: Path,
+) -> None:
+    for label, fail_at in (("builder", "builder"), ("publisher", "publisher")):
+        case_root = tmp_path / label
+        repository = _recommendation_repository(case_root)
+        portfolio = _register_holding_channels(
+            repository,
+            ("serverchan", "bark"),
+            chart_channels=("serverchan", "bark"),
+            chart_publisher_id="cloudflare_r2",
+        )
+        secret = f"600919 /private/{label}/chart.png?signature=do-not-log"
+        messages = []
+        build_calls: list[object] = []
+        publisher_calls: list[object] = []
+
+        def build_chart(
+            *_args,
+            _fail_at=fail_at,
+            _secret=secret,
+            _portfolio=portfolio,
+            _build_calls=build_calls,
+            **_kwargs,
+        ):
+            _build_calls.append(object())
+            if _fail_at == "builder":
+                raise RuntimeError(_secret)
+            return _holding_chart_result(_portfolio)
+
+        def publisher(
+            _payload,
+            _metadata,
+            *,
+            _fail_at=fail_at,
+            _secret=secret,
+            _publisher_calls=publisher_calls,
+        ):
+            _publisher_calls.append(object())
+            if _fail_at == "publisher":
+                raise RuntimeError(_secret)
+            return None
+
+        outcome = evening_report.run_evening_digest(
+            **_paths(case_root),
+            decision_date=CUTOFF,
+            _latest_cutoff=lambda _root: CUTOFF,
+            _next_trading_day=lambda _cutoff: FRIDAY,
+            _build_digest=lambda **_kwargs: _digest(),
+            _repository=repository,
+            _build_holding_review=lambda *_args, _portfolio=portfolio, **_kwargs: _holding_review(
+                _portfolio.id, _portfolio.version
+            ),
+            _build_holding_chart_report=build_chart,
+            _holding_chart_publisher=publisher,
+            _notifier=lambda message, _messages=messages: (
+                _messages.append(message) or _accepted_summary("serverchan", "bark")
+            ),
+        )
+
+        assert outcome.exit_code == evening_report.EXIT_OK
+        assert build_calls == []
+        assert publisher_calls == []
+        assert messages[0].image_url is None
+        assert "持仓摘要股票(600919)" in messages[0].body
+        log_text = (case_root / "logs" / "evening-report.jsonl").read_text(encoding="utf-8")
+        assert secret not in log_text
+        assert "600919" not in log_text
+        assert "/private/" not in log_text
+
+
+def test_disabled_chart_pipeline_never_reaches_stale_builder_or_publisher(
+    tmp_path: Path,
+) -> None:
+    for label in ("replacement", "revocation"):
+        case_root = tmp_path / label
+        repository = _recommendation_repository(case_root)
+        portfolio = _register_holding_channels(
+            repository,
+            ("serverchan", "bark"),
+            chart_channels=("serverchan", "bark"),
+            chart_publisher_id="cloudflare_r2",
+        )
+        builder_calls: list[object] = []
+        publisher_calls: list[object] = []
+        messages = []
+
+        def build_chart(
+            *_args,
+            _label=label,
+            _repository=repository,
+            _portfolio=portfolio,
+            _builder_calls=builder_calls,
+            **_kwargs,
+        ):
+            _builder_calls.append(object())
+            replacement_symbol = "601919" if _label == "replacement" else "600919"
+            replacement_name = "新组合" if _label == "replacement" else "持仓摘要股票"
+            replace_active_holdings(
+                _repository,
+                (
+                    HoldingPositionInput(
+                        symbol=replacement_symbol,
+                        name=replacement_name,
+                        entry_date=CUTOFF,
+                        stock_sleeve_weight=1.0,
+                    ),
+                ),
+                holding_weeks=4,
+                effective_at=datetime(2026, 8, 27, 22, tzinfo=UTC),
+                metadata={
+                    "holding_summary_delivery_channels": (
+                        ["serverchan", "bark"] if _label == "replacement" else []
+                    )
+                },
+            )
+            return _holding_chart_result(_portfolio)
+
+        outcome = evening_report.run_evening_digest(
+            **_paths(case_root),
+            decision_date=CUTOFF,
+            _latest_cutoff=lambda _root: CUTOFF,
+            _next_trading_day=lambda _cutoff: FRIDAY,
+            _build_digest=lambda **_kwargs: _digest(),
+            _repository=repository,
+            _build_holding_review=lambda *_args, _portfolio=portfolio, **_kwargs: _holding_review(
+                _portfolio.id, _portfolio.version
+            ),
+            _build_holding_chart_report=build_chart,
+            _holding_chart_publisher=lambda *_args, _calls=publisher_calls: (
+                _calls.append(object()) or "https://private.example/stale.png?signature=secret"
+            ),
+            _notifier=lambda message, _messages=messages: (
+                _messages.append(message) or _accepted_summary("serverchan", "bark")
+            ),
+        )
+
+        assert outcome.exit_code == evening_report.EXIT_OK
+        assert builder_calls == []
+        assert publisher_calls == []
+        assert messages[0].image_url is None
+        assert "持仓摘要股票" in messages[0].body
+        assert "601919" not in messages[0].body
 
 
 def test_provider_failure_does_not_mark_cutoff_as_accepted(tmp_path: Path) -> None:
@@ -149,6 +1036,12 @@ def test_provider_failure_does_not_mark_cutoff_as_accepted(tmp_path: Path) -> No
     assert outcome.event["reason"] == "notification_providers_not_accepted"
     assert outcome.event["delivery_confirmed"] is False
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+    reports = _recommendation_repository(tmp_path).list_recommendation_reports()
+    assert len(reports) == 1
+    delivery = _recommendation_repository(tmp_path).list_recommendation_delivery_events(
+        reports[0]["id"]
+    )
+    assert {row["provider_status"] for row in delivery} == {"provider_failed"}
 
 
 def test_no_configured_provider_does_not_write_deduplication_state(tmp_path: Path) -> None:
@@ -285,6 +1178,51 @@ def test_default_notifier_with_no_configured_channel_is_not_accepted(monkeypatch
 
     assert summary == evening_report.EveningNotificationSummary()
     assert summary.any_accepted is False
+
+
+def test_notifier_honors_serverchan_only_process_allow_list(monkeypatch) -> None:
+    from ashare_lab.cli import evening_digest
+
+    sent: list[str] = []
+
+    class Channel:
+        def __init__(self, name: str) -> None:
+            self.channel_name = name
+
+        def send(self, _message):
+            sent.append(self.channel_name)
+            return NotificationReceipt(
+                channel=self.channel_name,
+                accepted=True,
+                provider_status="provider_accepted",
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("ASHARE_EVENING_NOTIFICATION_CHANNELS", "serverchan")
+    monkeypatch.setattr(evening_digest, "load_serverchan_sendkey", lambda: "server-key")
+    monkeypatch.setattr(
+        evening_digest,
+        "load_bark_device_key",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("Bark key must not be read when the channel is disabled")
+        ),
+    )
+    monkeypatch.setattr(
+        evening_digest,
+        "ServerChanNotificationChannel",
+        lambda _key: Channel("serverchan"),
+    )
+
+    summary = evening_report.send_evening_digest(
+        evening_digest.NotificationMessage("行动单", "正文")
+    )
+
+    assert summary.configured_channels == ("serverchan",)
+    assert summary.accepted_channels == ("serverchan",)
+    assert summary.failed_channels == ()
+    assert sent == ["serverchan"]
 
 
 def test_default_notifier_keeps_full_serverchan_body_and_uses_compact_bark_body(

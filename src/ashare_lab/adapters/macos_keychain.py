@@ -18,8 +18,13 @@ from keyring.errors import KeyringError, PasswordDeleteError
 from ashare_lab.domain.errors import DataUnavailableError
 
 INFOWAY_KEYCHAIN_SERVICE = "io.openai.asharelab.infoway-api"
+TUSHARE_KEYCHAIN_SERVICE = "io.openai.asharelab.tushare-token"
 SERVERCHAN_KEYCHAIN_SERVICE = "io.openai.asharelab.serverchan-sendkey"
 BARK_KEYCHAIN_SERVICE = "io.openai.asharelab.bark-device-key"
+CLOUDFLARE_R2_ACCESS_KEY_ID_KEYCHAIN_SERVICE = "io.openai.asharelab.cloudflare-r2-access-key-id"
+CLOUDFLARE_R2_SECRET_ACCESS_KEY_KEYCHAIN_SERVICE = (
+    "io.openai.asharelab.cloudflare-r2-secret-access-key"
+)
 
 
 SecretGetter = Callable[[str, str], str | None]
@@ -54,6 +59,37 @@ def load_infoway_api_key(
 
 def infoway_key_is_configured() -> bool:
     return load_infoway_api_key() is not None
+
+
+def save_tushare_token(
+    token: str,
+    *,
+    setter: SecretSetter = keyring.set_password,
+    getter: SecretGetter = keyring.get_password,
+    deleter: SecretDeleter = keyring.delete_password,
+) -> None:
+    """Store the personal Tushare token without exposing it to project files."""
+
+    _save_secret(
+        TUSHARE_KEYCHAIN_SERVICE,
+        token,
+        empty_error="Tushare Token不能为空",
+        save_error="无法将Tushare Token保存到macOS钥匙串。",
+        setter=setter,
+        getter=getter,
+        deleter=deleter,
+    )
+
+
+def load_tushare_token(
+    *,
+    getter: SecretGetter = keyring.get_password,
+) -> str | None:
+    return _load_secret(TUSHARE_KEYCHAIN_SERVICE, getter=getter)
+
+
+def tushare_token_is_configured() -> bool:
+    return load_tushare_token() is not None
 
 
 def save_serverchan_sendkey(
@@ -128,6 +164,100 @@ def delete_bark_device_key(
     deleter: SecretDeleter = keyring.delete_password,
 ) -> None:
     _delete_secret(BARK_KEYCHAIN_SERVICE, getter=getter, deleter=deleter)
+
+
+def save_cloudflare_r2_access_key_id(
+    access_key_id: str,
+    *,
+    setter: SecretSetter = keyring.set_password,
+    getter: SecretGetter = keyring.get_password,
+    deleter: SecretDeleter = keyring.delete_password,
+) -> None:
+    _save_secret(
+        CLOUDFLARE_R2_ACCESS_KEY_ID_KEYCHAIN_SERVICE,
+        access_key_id,
+        empty_error="Cloudflare R2 Access Key ID不能为空",
+        save_error="无法将Cloudflare R2 Access Key ID保存到macOS钥匙串。",
+        setter=setter,
+        getter=getter,
+        deleter=deleter,
+    )
+
+
+def load_cloudflare_r2_access_key_id(
+    *,
+    getter: SecretGetter = keyring.get_password,
+) -> str | None:
+    return _load_secret(CLOUDFLARE_R2_ACCESS_KEY_ID_KEYCHAIN_SERVICE, getter=getter)
+
+
+def cloudflare_r2_access_key_id_is_configured() -> bool:
+    return load_cloudflare_r2_access_key_id() is not None
+
+
+def delete_cloudflare_r2_access_key_id(
+    *,
+    getter: SecretGetter = keyring.get_password,
+    deleter: SecretDeleter = keyring.delete_password,
+) -> None:
+    _delete_secret(
+        CLOUDFLARE_R2_ACCESS_KEY_ID_KEYCHAIN_SERVICE,
+        getter=getter,
+        deleter=deleter,
+    )
+
+
+def save_cloudflare_r2_secret_access_key(
+    secret_access_key: str,
+    *,
+    setter: SecretSetter = keyring.set_password,
+    getter: SecretGetter = keyring.get_password,
+    deleter: SecretDeleter = keyring.delete_password,
+) -> None:
+    _save_secret(
+        CLOUDFLARE_R2_SECRET_ACCESS_KEY_KEYCHAIN_SERVICE,
+        secret_access_key,
+        empty_error="Cloudflare R2 Secret Access Key不能为空",
+        save_error="无法将Cloudflare R2 Secret Access Key保存到macOS钥匙串。",
+        setter=setter,
+        getter=getter,
+        deleter=deleter,
+    )
+
+
+def load_cloudflare_r2_secret_access_key(
+    *,
+    getter: SecretGetter = keyring.get_password,
+) -> str | None:
+    return _load_secret(CLOUDFLARE_R2_SECRET_ACCESS_KEY_KEYCHAIN_SERVICE, getter=getter)
+
+
+def cloudflare_r2_secret_access_key_is_configured() -> bool:
+    return load_cloudflare_r2_secret_access_key() is not None
+
+
+def cloudflare_r2_credentials_are_configured(
+    *,
+    getter: SecretGetter = keyring.get_password,
+) -> bool:
+    """Require both independent Keychain items before enabling an R2 client."""
+
+    return bool(
+        load_cloudflare_r2_access_key_id(getter=getter)
+        and load_cloudflare_r2_secret_access_key(getter=getter)
+    )
+
+
+def delete_cloudflare_r2_secret_access_key(
+    *,
+    getter: SecretGetter = keyring.get_password,
+    deleter: SecretDeleter = keyring.delete_password,
+) -> None:
+    _delete_secret(
+        CLOUDFLARE_R2_SECRET_ACCESS_KEY_KEYCHAIN_SERVICE,
+        getter=getter,
+        deleter=deleter,
+    )
 
 
 def _save_secret(

@@ -154,6 +154,38 @@ def test_protocol_and_range_add_25_and_26_after_24_baseline(tmp_path: Path) -> N
     )
 
 
+def test_range_with_no_provider_sessions_skips_stock_universe_fetch(tmp_path: Path) -> None:
+    class NoSessionProvider(FakeDailyIncrementProvider):
+        def fetch_cn_trading_days(self, start: date, end: date) -> tuple[date, ...]:
+            self.calendar_calls.append((start, end))
+            return ()
+
+        def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+            raise AssertionError("stock universe must not be requested without a trading session")
+
+    provider = NoSessionProvider()
+    store = MarketOverlayStore(tmp_path / "overlay")
+
+    report = sync_daily_overlay_range(
+        provider,
+        store,
+        baseline_cutoff=BASELINE,
+        through_date=DAY_26,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert provider.calendar_calls == [(DAY_25, DAY_26)]
+    assert provider.calls == []
+    assert report.started_cutoff == BASELINE
+    assert report.verified_cutoff == BASELINE
+    assert report.expected_sessions == ()
+    assert report.completed_sessions == ()
+    assert report.results == ()
+    assert report.ready_through_requested_date is True
+    assert store.read_verified_manifest(source_id="infoway").empty
+
+
 def test_partial_index_fetch_failure_is_quarantined_and_cutoff_does_not_advance(
     tmp_path: Path,
 ) -> None:

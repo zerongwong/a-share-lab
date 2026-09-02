@@ -18,6 +18,14 @@
     <array>
         <dict>
             <key>Weekday</key>
+            <integer>0</integer>
+            <key>Hour</key>
+            <integer>21</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
             <integer>1</integer>
             <key>Hour</key>
             <integer>21</integer>
@@ -48,14 +56,6 @@
             <key>Minute</key>
             <integer>0</integer>
         </dict>
-        <dict>
-            <key>Weekday</key>
-            <integer>5</integer>
-            <key>Hour</key>
-            <integer>21</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
     </array>
     <key>ProcessType</key>
     <string>Background</string>
@@ -77,6 +77,8 @@
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>ASHARE_EVENING_NOTIFICATION_CHANNELS</key>
+        <string>serverchan</string>
     </dict>
 </dict>
 </plist>

@@ -24,9 +24,9 @@ def test_update_page_masks_key_and_explains_all_fail_closed_boundaries() -> None
     source = PAGE.read_text(encoding="utf-8")
 
     assert 'type="password"' in source
-    assert "save_infoway_api_key" in source
+    assert "save_tushare_token" in source
     assert "macOS钥匙串" in source
-    assert "旧密钥应先在Infoway后台轮换" in source
+    assert "不要发到聊天、截图或GitHub" in source
     assert "历史基线截止" in source
     assert "自动增量截止" in source
     assert "共同截止" in source
@@ -34,14 +34,14 @@ def test_update_page_masks_key_and_explains_all_fail_closed_boundaries() -> None
     assert "不含北交所" in source
     assert "盘中不会把今天" in source
     assert "不完整数据会被隔离，18:30再复核" in source
-    assert "供应商字段契约变化，请更新适配器" in source
-    assert "没有自动尝试vm、替换vw" in source
+    assert "三源字段、单位或交叉核验合同可能发生变化" in source
+    assert "没有猜测单位，也没有用AKShare替换Tushare数据" in source
     assert "只有使用者主动运行安装脚本后" in source
     assert "每日15:30首次同步、18:30质量复核" in source
     assert "不依赖本网页" in source
     assert "daily_update_lock" in source
     assert "正在另一个进程中运行" in source
-    assert "st.write(api_key)" not in source
+    assert "st.write(token)" not in source
     assert "os.environ" not in source
 
 

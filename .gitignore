@@ -30,6 +30,7 @@ var/
 data/
 cache/
 reports/
+tmp/
 raw_data/
 licensed_data/
 vendor_data/

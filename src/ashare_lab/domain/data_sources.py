@@ -23,12 +23,20 @@ class SourceId(StrEnum):
     IFIND = "ifind"
     CHOICE = "choice"
     TUSHARE = "tushare"
+    BAOSTOCK = "baostock"
+    ZERO_BUDGET_EOD = "zero_budget_eod"
     CSMAR = "csmar"
     INFOWAY = "infoway"
     CLS = "cls"
     STCN = "stcn"
     AKSHARE = "akshare"
     YAHOO = "yahoo"
+
+
+# All live research consumers read one provider-isolated overlay chain.  The
+# former Infoway chain remains on disk for audit/history, but new reports must
+# not silently mix rows from two providers.
+DEFAULT_MARKET_OVERLAY_SOURCE_ID = SourceId.ZERO_BUDGET_EOD.value
 
 
 class SourceStatus(StrEnum):

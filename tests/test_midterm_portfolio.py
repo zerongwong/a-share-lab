@@ -234,10 +234,21 @@ def test_builds_one_adaptive_research_portfolio_and_orders_weights() -> None:
         and item.conditional_entry_plan.structure_timeframe == "weekly_completed"
         for item in result.research_candidates
     )
+    for item in result.research_candidates:
+        expected_activity = float(
+            pd.to_numeric(histories[item.symbol]["amount_cny"], errors="coerce").tail(20).median()
+        )
+        assert item.conditional_entry_plan is not None
+        assert item.conditional_entry_plan.confirmation_activity_metric == "amount_cny"
+        assert item.conditional_entry_plan.confirmation_activity_min == pytest.approx(
+            1.20 * expected_activity
+        )
     assert all(
         item.conditional_entry_plan is not None
         and item.conditional_entry_plan.kind is ConditionalEntryPlanKind.VOLUME_BREAKOUT
         and item.conditional_entry_plan.trigger_price is not None
+        and item.conditional_entry_plan.confirmation_activity_min is not None
+        and item.conditional_entry_plan.confirmation_activity_min > 0.0
         and item.conditional_entry_plan.trigger_price > item.breakout_line
         for item in result.research_candidates
     )

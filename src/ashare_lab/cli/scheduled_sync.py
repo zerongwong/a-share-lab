@@ -15,10 +15,11 @@ import logging
 import os
 import plistlib
 import re
+from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import asdict, dataclass
+from datetime import UTC, date, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -27,16 +28,36 @@ from ashare_lab.adapters.macos_keychain import (
     load_bark_device_key,
     load_serverchan_sendkey,
 )
+from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.adapters.notification_channels import (
     BarkNotificationChannel,
     ServerChanNotificationChannel,
 )
-from ashare_lab.bootstrap import application_data_dir
+from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.bootstrap import application_data_dir, project_root
 from ashare_lab.domain.errors import AShareLabError
 from ashare_lab.ports.notifications import NotificationMessage, NotificationUrgency
+from ashare_lab.services.build_monthly_model_review import (
+    MonthlyModelReview,
+    build_monthly_model_review,
+    load_monthly_review_completion_state,
+    mark_monthly_review_completed,
+    monthly_review_due,
+)
 from ashare_lab.services.daily_update_lock import daily_update_lock
 from ashare_lab.services.dispatch_notifications import dispatch_notification
-from ashare_lab.services.run_daily_update import DailyUpdateReport, run_daily_update
+from ashare_lab.services.review_active_holdings import HoldingTreeReviewSummary
+from ashare_lab.services.run_active_holding_review import run_active_holding_review
+from ashare_lab.services.run_daily_update import DailyUpdateReport
+from ashare_lab.services.run_holding_stop_shadows import (
+    HoldingStopShadowRunSummary,
+    run_holding_stop_shadows,
+)
+from ashare_lab.services.run_recommendation_performance import (
+    RecommendationPerformanceRunSummary,
+    run_recommendation_performance,
+)
+from ashare_lab.services.run_zero_budget_daily_update import run_zero_budget_daily_update
 
 EXIT_CURRENT = 0
 EXIT_INCOMPLETE = 1
@@ -73,6 +94,19 @@ class NotificationSummary:
 class ScheduledSyncOutcome:
     exit_code: int
     event: dict[str, Any]
+
+
+PerformanceRunner = Callable[..., RecommendationPerformanceRunSummary]
+HoldingReviewRunner = Callable[..., HoldingTreeReviewSummary]
+HoldingShadowRunner = Callable[..., HoldingStopShadowRunSummary]
+MonthlyReviewBuilder = Callable[..., MonthlyModelReview]
+
+# Preserve the scheduler's injection seam while switching production to the
+# free, independently verified EOD chain.
+run_daily_update = run_zero_budget_daily_update
+
+_HOLDING_ACTIONS = ("hold", "tighten", "reduce", "exit", "review")
+_HOLDING_STATUSES = {"ready", "partial", "data_not_ready", "no_holdings"}
 
 
 def render_launchagent_plist(
@@ -161,6 +195,10 @@ def run_scheduled_sync(
     clock: Callable[[], datetime] | None = None,
     _run_update: Callable[..., DailyUpdateReport] = run_daily_update,
     _notifier: Callable[[NotificationMessage], NotificationSummary] = send_scheduled_notification,
+    _performance_runner: PerformanceRunner | None = None,
+    _holding_review_runner: HoldingReviewRunner | None = None,
+    _holding_shadow_runner: HoldingShadowRunner | None = None,
+    _monthly_review_builder: MonthlyReviewBuilder | None = None,
 ) -> ScheduledSyncOutcome:
     """Run one serialized update and return a process exit contract.
 
@@ -243,6 +281,48 @@ def run_scheduled_sync(
                         recovery.successful_channels
                     )
                     event["recovery_notification_failed_channels"] = list(recovery.failed_channels)
+                if _performance_runner is not None:
+                    _run_performance_reviews(
+                        event,
+                        runner=_performance_runner,
+                        overlay_root=Path(
+                            overlay_root or application_data_dir() / "cache" / "market_overlay"
+                        )
+                        .expanduser()
+                        .resolve(),
+                        scheduler_root=resolved_scheduler_root,
+                        common_cutoff=report.common_cutoff,
+                        notifier=_notifier,
+                        now=now,
+                    )
+                if _holding_review_runner is not None:
+                    _run_local_holding_review(
+                        event,
+                        runner=_holding_review_runner,
+                        csmar_root=csmar_root,
+                        overlay_root=overlay_root,
+                        scheduler_root=resolved_scheduler_root,
+                        common_cutoff=report.common_cutoff,
+                        now=now,
+                    )
+                if _holding_shadow_runner is not None:
+                    _run_local_holding_shadow(
+                        event,
+                        runner=_holding_shadow_runner,
+                        csmar_root=csmar_root,
+                        overlay_root=overlay_root,
+                        scheduler_root=resolved_scheduler_root,
+                        common_cutoff=report.common_cutoff,
+                        now=now,
+                    )
+                if _monthly_review_builder is not None:
+                    _run_local_monthly_review(
+                        event,
+                        builder=_monthly_review_builder,
+                        scheduler_root=resolved_scheduler_root,
+                        common_cutoff=report.common_cutoff,
+                        performance_ready=event.get("performance_status") in (None, "completed"),
+                    )
                 _write_state(
                     state_path,
                     {
@@ -287,7 +367,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--overlay-root",
         type=Path,
         default=application_data_dir() / "cache" / "market_overlay",
-        help="Infoway已验证收盘增量目录",
+        help="零预算三源已验证收盘增量目录",
     )
     parser.add_argument(
         "--scheduler-root",
@@ -311,9 +391,250 @@ def main(argv: list[str] | None = None) -> int:
         overlay_root=args.overlay_root,
         scheduler_root=args.scheduler_root,
         log_root=args.log_root,
+        _performance_runner=run_recommendation_performance,
+        _holding_review_runner=run_active_holding_review,
+        _holding_shadow_runner=run_holding_stop_shadows,
+        _monthly_review_builder=build_monthly_model_review,
     )
     print(json.dumps(outcome.event, ensure_ascii=False, sort_keys=True, default=str))
     return outcome.exit_code
+
+
+def _run_performance_reviews(
+    event: dict[str, Any],
+    *,
+    runner: PerformanceRunner,
+    overlay_root: Path,
+    scheduler_root: Path,
+    common_cutoff: date,
+    notifier: Callable[[NotificationMessage], NotificationSummary],
+    now: datetime,
+) -> None:
+    """Settle mature recommendation cohorts without changing sync success.
+
+    The daily data result remains authoritative.  A local archive or provider
+    failure is recorded as a stable category and retried by the next scheduled
+    run; exception text and recommendation payloads never enter this log.
+    """
+
+    try:
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db",
+            project_root() / "migrations",
+        )
+        summary = runner(
+            repository=repository,
+            overlay_store=MarketOverlayStore(overlay_root),
+            notifier=notifier,
+            as_of=common_cutoff,
+            clock=lambda: now,
+        )
+    except Exception as exc:  # noqa: BLE001 - non-fatal post-sync boundary
+        event["performance_status"] = "error_retry_later"
+        event["performance_error_type"] = type(exc).__name__
+        return
+
+    failed_batch_ids = tuple(getattr(summary, "failed_batch_ids", ()))
+    event.update(
+        {
+            "performance_status": ("partial_retry_later" if failed_batch_ids else "completed"),
+            "performance_pending_batches": summary.pending_batches,
+            "performance_evaluated_batches": summary.evaluated_batches,
+            "performance_mature_batches": summary.mature_batches,
+            "performance_notification_attempts": summary.notification_attempts,
+            "performance_notification_accepted_batches": (summary.notification_accepted_batches),
+            "performance_notification_failed_batches": summary.notification_failed_batches,
+            "performance_failed_batch_count": len(failed_batch_ids),
+        }
+    )
+
+
+def _run_local_holding_review(
+    event: dict[str, Any],
+    *,
+    runner: HoldingReviewRunner,
+    csmar_root: str | Path | None,
+    overlay_root: str | Path | None,
+    scheduler_root: Path,
+    common_cutoff: date,
+    now: datetime,
+) -> None:
+    """Review only the explicit local holding ledger after data are current.
+
+    The full rows stay in the private SQLite ledger.  This scheduler event is
+    intentionally aggregate-only: it cannot reveal a symbol, name, cost,
+    price, protection line, or reason string.  Failure is non-fatal and the
+    next scheduled run retries the same verified cutoff.
+    """
+
+    try:
+        resolved_csmar_root = (
+            Path(csmar_root or application_data_dir() / "cache" / "csmar").expanduser().resolve()
+        )
+        resolved_overlay_root = (
+            Path(overlay_root or application_data_dir() / "cache" / "market_overlay")
+            .expanduser()
+            .resolve()
+        )
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db",
+            project_root() / "migrations",
+        )
+        summary = runner(
+            repository,
+            dataset_root=resolved_csmar_root,
+            overlay_root=resolved_overlay_root,
+            as_of=common_cutoff,
+            reviewed_at=now,
+            persist=True,
+        )
+        raw_status = getattr(getattr(summary, "status", None), "value", None)
+        status = raw_status if raw_status in _HOLDING_STATUSES else "unknown"
+        rows = tuple(getattr(summary, "rows", ()))
+        raw_counts = Counter(
+            getattr(getattr(row, "action", None), "value", "unknown") for row in rows
+        )
+        action_counts = {action: int(raw_counts.get(action, 0)) for action in _HOLDING_ACTIONS}
+        unknown_count = sum(
+            count for action, count in raw_counts.items() if action not in _HOLDING_ACTIONS
+        )
+        if unknown_count:
+            action_counts["unknown"] = int(unknown_count)
+        event.update(
+            {
+                "holding_review_status": status,
+                "holding_review_row_count": len(rows),
+                "holding_review_ready_count": sum(
+                    getattr(getattr(row, "status", None), "value", None) == "ready" for row in rows
+                ),
+                "holding_review_urgent_count": sum(
+                    bool(getattr(row, "urgent", False)) for row in rows
+                ),
+                "holding_review_action_counts": action_counts,
+            }
+        )
+    except Exception:  # noqa: BLE001 - non-fatal private post-sync boundary
+        event["holding_review_status"] = "error_retry_later"
+
+
+def _run_local_holding_shadow(
+    event: dict[str, Any],
+    *,
+    runner: HoldingShadowRunner,
+    csmar_root: str | Path | None,
+    overlay_root: str | Path | None,
+    scheduler_root: Path,
+    common_cutoff: date,
+    now: datetime,
+) -> None:
+    """Archive local-only stop experiments after the production review.
+
+    The runner receives no notifier and its result contributes aggregate
+    counters only.  A shadow failure is retryable and never changes the daily
+    data result or any production holding action.
+    """
+
+    try:
+        resolved_csmar_root = (
+            Path(csmar_root or application_data_dir() / "cache" / "csmar").expanduser().resolve()
+        )
+        resolved_overlay_root = (
+            Path(overlay_root or application_data_dir() / "cache" / "market_overlay")
+            .expanduser()
+            .resolve()
+        )
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db",
+            project_root() / "migrations",
+        )
+        summary = runner(
+            repository,
+            dataset_root=resolved_csmar_root,
+            overlay_root=resolved_overlay_root,
+            as_of=common_cutoff,
+            evaluated_at=now,
+            persist=True,
+        )
+        raw_status = getattr(getattr(summary, "status", None), "value", None)
+        status = (
+            raw_status
+            if raw_status in {"completed", "partial", "data_not_ready", "no_holdings"}
+            else "unknown"
+        )
+        event.update(
+            {
+                "holding_shadow_status": status,
+                "holding_shadow_row_count": int(getattr(summary, "observation_count", 0)),
+                "holding_shadow_variant_count": int(getattr(summary, "variant_count", 0)),
+            }
+        )
+    except Exception:  # noqa: BLE001 - non-fatal private experiment boundary
+        event["holding_shadow_status"] = "error_retry_later"
+
+
+def _run_local_monthly_review(
+    event: dict[str, Any],
+    *,
+    builder: MonthlyReviewBuilder,
+    scheduler_root: Path,
+    common_cutoff: date,
+    performance_ready: bool,
+) -> None:
+    """Generate one private previous-month audit after its first verified session.
+
+    No notification channel is accepted here.  The complete payload is written
+    atomically with owner-only permissions; the public scheduler event records
+    only a month key, stable status, and aggregate counts.  Completion is
+    marked strictly after the archive write succeeds, so every failed step is
+    retryable.
+    """
+
+    if not performance_ready:
+        event["monthly_review_status"] = "deferred_performance_incomplete"
+        return
+    state_path = scheduler_root / "monthly-model-review-state.json"
+    try:
+        _ensure_private_directory(scheduler_root)
+        completion = load_monthly_review_completion_state(state_path)
+        due_month = monthly_review_due(
+            as_of=common_cutoff,
+            latest_verified_session=common_cutoff,
+            completed_months=completion.completed_months,
+        )
+        if due_month is None:
+            event["monthly_review_status"] = "not_due"
+            return
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db",
+            project_root() / "migrations",
+        )
+        review = builder(
+            repository,
+            review_month=due_month,
+            as_of=common_cutoff,
+        )
+        expected_month = due_month.strftime("%Y-%m")
+        if review.review_month != expected_month or review.generated_as_of != common_cutoff:
+            raise ValueError("monthly review identity does not match its due cutoff")
+        archive_path = scheduler_root / "monthly-model-reviews" / f"{expected_month}.json"
+        _write_private_json(archive_path, asdict(review))
+        mark_monthly_review_completed(state_path, review_month=expected_month)
+        os.chmod(state_path, 0o600)
+        event.update(
+            {
+                "monthly_review_status": "completed_local_only",
+                "monthly_review_month": expected_month,
+                "monthly_review_horizon_count": len(review.horizon_reviews),
+                "monthly_review_mature_batch_count": sum(
+                    item.mature_batch_count for item in review.horizon_reviews
+                ),
+                "monthly_review_proposal_count": len(review.experiment_proposals),
+                "monthly_review_excluded_batch_count": len(review.excluded_batches),
+                "monthly_review_evidence_gap_count": len(review.evidence_gaps),
+            }
+        )
+    except Exception:  # noqa: BLE001 - non-fatal private post-sync boundary
+        event["monthly_review_status"] = "error_retry_later"
 
 
 def _report_event(report: DailyUpdateReport, now: datetime) -> dict[str, Any]:
@@ -488,9 +809,40 @@ def _write_state(path: Path, document: dict[str, Any]) -> None:
             temporary.unlink()
 
 
+def _write_private_json(path: Path, document: Any) -> None:
+    """Atomically write a complete local artifact with owner-only access."""
+
+    _ensure_private_directory(path.parent)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                default=_json_default,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def _ensure_private_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path, 0o700)
+
+
+def _json_default(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def _aware_utc(value: datetime) -> datetime:

@@ -137,6 +137,8 @@ class ConditionalEntryPlan:
     primary_structure_reference_price: float | None = None
     invalidation_source_timeframe: str | None = None
     reduction_review_source_timeframe: str | None = None
+    confirmation_activity_metric: str | None = None
+    confirmation_activity_min: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1595,10 +1597,17 @@ def _build_horizon_price_observation_plan(
             confirmation_rule="完整日线收盘重新站回期限执行线",
             **common,
         )
+    activity_confirmation = _activity_confirmation_threshold(prepared)
+    if activity_confirmation is None:
+        return None
+    activity_metric, activity_min = activity_confirmation
+    activity_label = "成交额" if activity_metric == "amount_cny" else "成交量"
     return ConditionalEntryPlan(
         kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
         trigger_price=round(entry_line + 0.10 * atr, 4),
-        confirmation_rule=("完整日线收盘越过期限执行线，且成交活跃度达到滚动中位数确认"),
+        confirmation_activity_metric=activity_metric,
+        confirmation_activity_min=activity_min,
+        confirmation_rule=(f"完整日线收盘越过期限执行线，且{activity_label}达到20日中位数1.2倍"),
         **common,
     )
 
@@ -1677,12 +1686,46 @@ def _build_one_week_price_observation_plan(
             **common,
         )
     if entry_pattern is EntryPattern.VOLUME_BREAKOUT:
+        activity_confirmation = _activity_confirmation_threshold(prepared)
+        if activity_confirmation is None:
+            return None
+        activity_metric, activity_min = activity_confirmation
+        activity_label = "成交额" if activity_metric == "amount_cny" else "成交量"
         return ConditionalEntryPlan(
             kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
             trigger_price=one_week.breakout_trigger,
-            confirmation_rule=one_week.breakout_confirmation_rule,
+            confirmation_activity_metric=activity_metric,
+            confirmation_activity_min=activity_min,
+            confirmation_rule=(
+                f"以收盘价确认突破，且当日{activity_label}不低于截止日已冻结的"
+                "20期中位数1.2倍；盘中瞬间越线不算有效突破"
+            ),
             **common,
         )
+    return None
+
+
+def _activity_confirmation_threshold(frame: pd.DataFrame) -> tuple[str, float] | None:
+    """Freeze one cutoff-known 1.2x 20-session activity threshold.
+
+    CSMAR-derived histories may not carry share volume, while they do carry
+    turnover amount.  Prefer amount so an archived breakout remains replayable
+    across the immutable history and the verified unadjusted overlay; fall back to share
+    volume only when a complete amount window is unavailable.  A partial or
+    non-positive window cannot be filled or guessed.
+    """
+
+    if frame.empty:
+        return None
+    for column in ("amount_cny", "volume_shares"):
+        if column not in frame.columns:
+            continue
+        values = pd.to_numeric(frame[column], errors="coerce").tail(20)
+        if len(values) != 20 or bool(values.isna().any()):
+            continue
+        median = float(values.median())
+        if math.isfinite(median) and median > 0.0:
+            return column, round(1.20 * median, 4)
     return None
 
 

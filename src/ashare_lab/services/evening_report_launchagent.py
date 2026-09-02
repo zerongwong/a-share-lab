@@ -8,10 +8,12 @@ from pathlib import Path
 
 EVENING_REPORT_LAUNCHAGENT_LABEL = "com.zerong.asharelab.evening-report"
 EVENING_REPORT_MODULE = "ashare_lab.cli.evening_report"
-# macOS launchd uses 1=Sunday, 2=Monday, ..., 7=Saturday.  Friday and
-# Saturday are intentionally absent; the CLI also enforces this calendar-day
-# boundary because RunAtLoad is independent of StartCalendarInterval.
-EVENING_REPORT_SCHEDULE = [{"Weekday": weekday, "Hour": 21, "Minute": 0} for weekday in range(1, 6)]
+# macOS ``launchd`` follows the cron weekday numbering used by
+# ``StartCalendarInterval``: 0 (or 7) is Sunday, 1 is Monday, and 6 is
+# Saturday. Use 0..4 for Sunday through Thursday. Friday and Saturday are
+# intentionally absent; the CLI also enforces this calendar-day boundary
+# because RunAtLoad is independent of StartCalendarInterval.
+EVENING_REPORT_SCHEDULE = [{"Weekday": weekday, "Hour": 21, "Minute": 0} for weekday in range(0, 5)]
 
 
 def render_evening_report_launchagent_plist(

@@ -11,7 +11,7 @@ Apache-2.0 只授权本项目源码，不授权任何第三方市场数据、新
 
 ## 不得进入仓库
 
-- CSMAR、iFinD、Choice、Infoway、LongBridge 等原始或转换数据；
+- CSMAR、Tushare、BaoStock、AKShare、iFinD、Choice、Infoway、LongBridge 等原始或转换数据；
 - Excel、ZIP、Parquet、DuckDB、SQLite、缓存和研究报告；
 - 新闻或研报正文；
 - API Key、OAuth Token、Server酱 SendKey、Bark 设备 Key、券商凭据；
@@ -29,15 +29,16 @@ Apache-2.0 只授权本项目源码，不授权任何第三方市场数据、新
 
 ## 本机混合数据边界
 
-- CSMAR 历史基线与 Infoway 收盘增量分目录保存，不把外源数据冒充 CSMAR；
-- Infoway 原始/标准化 Parquet、manifest、receipt 与 quarantine 都属于个人授权数据，必须
+- CSMAR 历史基线、当前 `zero_budget_eod` 收盘链和旧 Infoway 链分目录保存，不把外源
+  数据冒充 CSMAR，也不跨链拼接；
+- Tushare/BaoStock/AKShare 与 Infoway 的标准化 Parquet、manifest、receipt、quarantine 都属于个人研究数据，必须
   留在本机并由 `.gitignore` 排除；
 - 自动更新目前只声明沪深 A 股覆盖。北交所、新闻、财务与公告不会因价格源可用而被推定
   为已授权或已覆盖；
 - 只有完整通过质量门的交易日才能进入研究。失败批次可以保留作本地审计，但不得作为
   “部分可用”数据静默拼入；
-- 同一供应商字段或单位发生变化时停止更新并提示升级适配器，不自动尝试另一个字段、
-  猜测倍数或混用其他来源。
+- 任一供应商字段或单位发生变化时停止更新并提示升级适配器，不猜测倍数；AKShare 只核验，
+  不会被当作 Tushare 的修补或静默替代源。
 
 公开 App、多人服务和市场行情再展示需要独立的数据授权、隐私与证券业务合规审查；个人
 本地研究许可不能自动扩大为商业再分发许可。

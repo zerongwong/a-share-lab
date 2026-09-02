@@ -45,6 +45,13 @@ from ashare_lab.services.load_hybrid_universe import (
     HybridUniverseLoad,
     load_hybrid_universe,
 )
+from ashare_lab.services.review_active_holdings import (
+    HoldingAction,
+    HoldingReviewRowStatus,
+    HoldingReviewSummaryStatus,
+    HoldingTreeReviewRow,
+    HoldingTreeReviewSummary,
+)
 
 EVENING_DIGEST_HORIZONS = (1, 2, 4, 13, 26, 52)
 EVENING_DIGEST_METHOD_VERSION = "evening-six-horizon-digest-v0.4.0"
@@ -123,6 +130,23 @@ class EveningDigestCandidate:
     multi_timeframe_method_version: str | None = None
     timeframe_holding_weeks: int | None = None
     price_plan_sessions: int | None = None
+    # Structured, derived plan fields are archived for later point-in-time
+    # outcome evaluation.  They deliberately remain separate from the display
+    # string above: ``price_plan_evaluation_price`` is a reference used to
+    # evaluate the condition, never evidence that an order was filled there.
+    operational_stock_sleeve_weight: float | None = None
+    operational_account_weight: float | None = None
+    price_plan_kind: str | None = None
+    price_plan_low: float | None = None
+    price_plan_high: float | None = None
+    price_plan_trigger: float | None = None
+    price_plan_evaluation_price: float | None = None
+    price_plan_confirmation_rule: str | None = None
+    price_plan_confirmation_activity_metric: str | None = None
+    price_plan_confirmation_activity_min: float | None = None
+    price_plan_invalidation_price: float | None = None
+    price_plan_cutoff: date | None = None
+    price_plan_method_version: str | None = None
 
 
 DifferenceReason = Literal[
@@ -225,6 +249,13 @@ class EveningPeriodDigest:
     ranked_pool_count: int | None = None
     central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
     multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    performance_nature: Literal[
+        "official_action",
+        "risk_qualified_observation",
+        "observation_only",
+        "full_cash",
+        "data_unavailable",
+    ] = "full_cash"
 
 
 @dataclass(frozen=True, slots=True)
@@ -416,119 +447,37 @@ def build_evening_research_digest(
     )
 
 
-def render_evening_digest_markdown(digest: EveningResearchDigest) -> str:
-    """Render concise ServerChan-compatible Markdown from derived fields."""
+def render_evening_digest_markdown(
+    digest: EveningResearchDigest,
+    holding_review: HoldingTreeReviewSummary | None = None,
+    *,
+    include_holding_summary: bool = False,
+) -> str:
+    """Render a calm ServerChan summary; holding disclosure defaults off."""
 
     if not isinstance(digest, EveningResearchDigest):
         raise TypeError("digest must be an EveningResearchDigest")
-    cutoff = digest.common_cutoff.isoformat()
-    strictness = _ENTRY_STRICTNESS_LABELS.get(
-        digest.entry_strictness,
-        _clean_text(digest.entry_strictness),
-    )
-    agreement = (
-        "不可用"
-        if digest.cycle_rule_agreement is None
-        else f"{digest.cycle_rule_agreement:.1%}（规则一致度，不是未来方向概率）"
-    )
-    if digest.plan_for_date is None:
-        plan_line = "- **计划适用日：尚未通过官方交易日历确认**；不得据此执行"
-    else:
-        plan_line = (
-            f"- **计划适用日：{format_cn_plan_date(digest.plan_for_date)}**；"
-            "开盘前仍须复核停牌、涨停和跳空等可买性"
+    for name_bytes, price_bytes, cycle_bytes in _NOTIFICATION_LAYOUT_BUDGETS:
+        body = _render_notification_summary(
+            digest,
+            holding_review=holding_review,
+            include_holding_summary=include_holding_summary,
+            markdown=True,
+            name_bytes=name_bytes,
+            price_bytes=price_bytes,
+            cycle_bytes=cycle_bytes,
         )
-    lines = [
-        "# A股六周期研究日报",
-        f"- **共同截止日：{cutoff}**",
-        f"- 实现状态：`{digest.central_implementation_status}`；"
-        f"组件：`{digest.multi_timeframe_component_status}`",
-        plan_line,
-        "- 仅作研究，不连接券商、不自动下单",
-        "",
-        "## 市场价格周期",
-        f"- 状态：**{_clean_text(digest.cycle_label)}**",
-        f"- 介入严格度：{strictness}",
-        f"- 股票敞口上限：{digest.max_stock_exposure:.0%}；最低现金：{digest.minimum_cash_weight:.0%}",
-        f"- 置信说明：{agreement}",
-    ]
-
-    if digest.candidate_pairwise_overlaps or digest.horizon_overlaps:
-        candidate_overlaps = (
-            digest.candidate_pairwise_overlaps
-            if digest.candidate_pairwise_overlaps
-            else digest.horizon_overlaps
-        )
-        lines.extend(
-            (
-                "",
-                "## 六期限重合与差异审计",
-                f"- 候选{len(candidate_overlaps)}对：" + _overlap_line(candidate_overlaps),
-                "- 风险合格组合：" + _overlap_line(digest.risk_qualified_pairwise_overlaps),
-                "- 行动组合：" + _overlap_line(digest.action_pairwise_overlaps),
-                "- 重复只表示集合重合；必须逐期限独立记录慢周期、主结构、风险和价格门，"
-                "不能自动称为多周期共振。",
-            )
-        )
-        if digest.repeated_symbol_attributions:
-            lines.append("- 重复股票差异归因：")
-            lines.extend(
-                f"  - **{item.name} {item.symbol}**｜{_attribution_markdown(item)}"
-                for item in digest.repeated_symbol_attributions
-            )
-        difference_rows = tuple(
-            item
-            for item in (
-                *candidate_overlaps,
-                *digest.risk_qualified_pairwise_overlaps,
-                *digest.action_pairwise_overlaps,
-            )
-            if item.left_only or item.right_only
-        )
-        if difference_rows:
-            lines.append("- 仅左/仅右逐股原因：")
-            lines.extend(f"  - {_pair_difference_line(item)}" for item in difference_rows)
-
-    for period in digest.periods:
-        lines.extend(("", f"## {period.label}（{period.holding_sessions}个交易日）"))
-        if period.failure_code is not None:
-            lines.append(
-                f"- 数据不足：{_failure_label(period.failure_code)}；本周期不生成股票、配比或价格。"
-            )
-            continue
-        lines.append(
-            f"- 行动性质：{_clean_text(period.action_nature)}；"
-            f"行动层股票/现金 {period.action_stock_exposure:.0%}/{period.action_cash_weight:.0%}"
-        )
-        lines.append(f"- 风险性质：{_clean_text(period.risk_nature)}")
-        if not period.candidates:
-            lines.append("- 没有通过个股资格门的候选；不以次优股票凑数。")
-            continue
-        for candidate in period.candidates:
-            allocation = _allocation_label(candidate)
-            action = _ACTION_LABELS.get(candidate.action, _clean_text(candidate.action))
-            if candidate.evidence_pending:
-                action += "（财务、公告或可买性待核验）"
-            lines.append(
-                f"{candidate.rank}. **{_clean_text(candidate.name)} {candidate.symbol}**｜"
-                f"{allocation}｜{_candidate_timeframe_label(candidate)}｜"
-                f"{candidate.price_condition}｜{action}"
-            )
-
-    lines.extend(
-        (
-            "",
-            "> 10%档均指股票仓内部比例；观察配比不是资金仓位。价格观察线触及不等于可买。",
-            "> 本日报不是收益预测、投资建议或最大回撤保证。",
-        )
-    )
-    body = "\n".join(lines).strip()
-    if len(body) > 7_800:
-        raise ValueError("evening digest exceeds notification-safe length")
-    return body
+        if len(body.encode("utf-8")) <= MAX_COMPACT_NOTIFICATION_BODY_BYTES:
+            return body
+    raise ValueError("ServerChan digest exceeds the safe UTF-8 byte budget")
 
 
-def render_evening_digest_bark_compact(digest: EveningResearchDigest) -> str:
+def render_evening_digest_bark_compact(
+    digest: EveningResearchDigest,
+    holding_review: HoldingTreeReviewSummary | None = None,
+    *,
+    include_holding_summary: bool = False,
+) -> str:
     """Render a six-horizon plain-text Bark body within the APNs-safe budget.
 
     The compact body is derived from the same audited digest as the full
@@ -543,19 +492,12 @@ def render_evening_digest_bark_compact(digest: EveningResearchDigest) -> str:
     if any(len(period.candidates) > 5 for period in digest.periods):
         raise ValueError("Bark compact digest supports at most five candidates per period")
 
-    # Four increasingly compact layouts retain every period and every
-    # candidate. The ordinary 3-5-stock/six-period report fits the first or
-    # second layout; later layouts protect against unexpectedly long names.
-    budgets = (
-        (18, 54, 60),
-        (15, 42, 48),
-        (12, 30, 36),
-        (9, 21, 24),
-        (6, 15, 18),
-    )
-    for name_bytes, price_bytes, cycle_bytes in budgets:
-        body = _render_bark_compact_with_budgets(
+    for name_bytes, price_bytes, cycle_bytes in _NOTIFICATION_LAYOUT_BUDGETS:
+        body = _render_notification_summary(
             digest,
+            holding_review=holding_review,
+            include_holding_summary=include_holding_summary,
+            markdown=False,
             name_bytes=name_bytes,
             price_bytes=price_bytes,
             cycle_bytes=cycle_bytes,
@@ -565,9 +507,21 @@ def render_evening_digest_bark_compact(digest: EveningResearchDigest) -> str:
     raise ValueError("Bark compact digest exceeds the safe UTF-8 byte budget")
 
 
-def _render_bark_compact_with_budgets(
+_NOTIFICATION_LAYOUT_BUDGETS = (
+    (18, 45, 54),
+    (15, 36, 45),
+    (12, 30, 36),
+    (9, 24, 30),
+    (6, 18, 24),
+)
+
+
+def _render_notification_summary(
     digest: EveningResearchDigest,
     *,
+    holding_review: HoldingTreeReviewSummary | None,
+    include_holding_summary: bool,
+    markdown: bool,
     name_bytes: int,
     price_bytes: int,
     cycle_bytes: int,
@@ -578,33 +532,33 @@ def _render_bark_compact_with_budgets(
         else format_cn_plan_date(digest.plan_for_date).replace("（", "").replace("）", "")
     )
     cycle = _truncate_utf8(_clean_text(digest.cycle_label), cycle_bytes)
+    posture = _cycle_posture(digest.entry_strictness)
+    title = f"# {plan} A股研究计划" if markdown else f"{plan} A股研究计划"
     lines = [
-        f"A股六周期｜数据{digest.common_cutoff.isoformat()}｜计划{plan}",
-        f"实现:{digest.central_implementation_status}",
-        f"周期：{cycle}｜股≤{digest.max_stock_exposure:.0%}/现≥{digest.minimum_cash_weight:.0%}",
+        title,
+        f"数据{digest.common_cutoff.isoformat()}｜{cycle}｜{posture}｜"
+        f"股≤{digest.max_stock_exposure:.0%}/现≥{digest.minimum_cash_weight:.0%}",
     ]
-    overlaps = digest.candidate_pairwise_overlaps or digest.horizon_overlaps
-    if overlaps:
-        lines.append(f"候选重合：{_compact_overlap_line(overlaps)}")
-        if digest.risk_qualified_pairwise_overlaps:
-            lines.append(
-                "风险组合重合：" + _compact_overlap_line(digest.risk_qualified_pairwise_overlaps)
+    if digest.plan_for_date is None:
+        lines.append("计划日未通过交易日历确认｜不据此执行")
+    if include_holding_summary:
+        lines.extend(("", "## 当前持仓修枝" if markdown else "当前持仓修枝"))
+        lines.extend(
+            _holding_review_lines(
+                holding_review,
+                name_bytes=name_bytes,
+                reason_bytes=price_bytes,
             )
-        if digest.action_pairwise_overlaps:
-            lines.append("行动组合重合：" + _compact_overlap_line(digest.action_pairwise_overlaps))
-        repeated_count = len(digest.repeated_symbol_attributions)
-        if repeated_count:
-            lines.append(f"重复{repeated_count}只；各期限独立过门才有效，重复≠自动共振。")
+        )
+    lines.extend(("", "## 六期限计划" if markdown else "六期限计划"))
     for period in digest.periods:
         if period.failure_code is not None:
-            lines.append(f"{period.label}｜数据不足")
+            lines.append(f"- {period.label}｜数据不足")
             continue
-        lines.append(
-            f"{period.label}｜股{period.action_stock_exposure:.0%}/现{period.action_cash_weight:.0%}"
-        )
         if not period.candidates:
-            lines.append("  无候选")
+            lines.append(f"- {period.label}｜无合格")
             continue
+        candidates: list[str] = []
         for candidate in period.candidates:
             symbol = _truncate_utf8(_symbol(candidate.symbol), 12)
             name = _truncate_utf8(_clean_text(candidate.name), name_bytes)
@@ -617,15 +571,99 @@ def _render_bark_compact_with_budgets(
                 _compact_price_condition(candidate.price_condition),
                 price_bytes,
             )
-            structure = _compact_timeframe_label(candidate)
-            action = _compact_action(candidate.action)
-            price_nature = _compact_price_nature(candidate.price_nature)
-            lines.append(
-                f"  {candidate.rank}.{symbol}{name} 仓{sleeve} {structure}"
-                f"/{action}/{price_nature} {price}"
-            )
-    lines.append("仅研究；仓%=股票仓内10%档；价格为条件/观察线；不自动下单。")
+            candidates.append(f"{name}({symbol}) {sleeve}@{price}")
+        lines.append(f"- {period.label}｜" + "；".join(candidates))
+    lines.extend(
+        (
+            "",
+            "仅研究｜仓%=股票仓内10%档｜价格为条件/观察线｜不自动下单。",
+        )
+    )
     return "\n".join(lines).strip()
+
+
+def _cycle_posture(entry_strictness: str) -> str:
+    return {
+        EntryStrictness.STANDARD.value: "偏进攻",
+        EntryStrictness.TIGHT.value: "均衡偏防守",
+        EntryStrictness.DEFENSIVE.value: "防守",
+        EntryStrictness.EXCEPTION_ONLY.value: "强防守",
+        EntryStrictness.UNAVAILABLE.value: "观望",
+    }.get(entry_strictness, "观望")
+
+
+def _holding_review_lines(
+    review: HoldingTreeReviewSummary | None,
+    *,
+    name_bytes: int,
+    reason_bytes: int,
+) -> list[str]:
+    if review is None:
+        return ["- 持仓复核不可用｜本次不生成持仓动作"]
+    if review.status is HoldingReviewSummaryStatus.NO_HOLDINGS:
+        if review.portfolio_id is not None:
+            return ["- 已明确空仓｜如有变化请重新登记"]
+        return ["- 未登记持仓｜告诉我股票和周期后开始每日修枝"]
+    if not review.rows:
+        return ["- 持仓数据待复核｜本次不生成减仓或退出结论"]
+    priority = {
+        HoldingAction.EXIT: 0,
+        HoldingAction.REDUCE: 1,
+        HoldingAction.REVIEW: 2,
+        HoldingAction.TIGHTEN: 3,
+        HoldingAction.HOLD: 4,
+    }
+    rows = sorted(review.rows, key=lambda row: (priority[row.action], row.symbol))
+    return [
+        _holding_review_row_line(
+            row,
+            name_bytes=name_bytes,
+            reason_bytes=reason_bytes,
+        )
+        for row in rows
+    ]
+
+
+def _holding_review_row_line(
+    row: HoldingTreeReviewRow,
+    *,
+    name_bytes: int,
+    reason_bytes: int,
+) -> str:
+    name = _truncate_utf8(_clean_text(row.name), name_bytes)
+    action = {
+        HoldingAction.HOLD: "HOLD",
+        HoldingAction.TIGHTEN: "收紧",
+        HoldingAction.REDUCE: "减仓",
+        HoldingAction.EXIT: "退出",
+        HoldingAction.REVIEW: "复核",
+    }[row.action]
+    horizon = _HORIZON_LABELS.get(row.holding_weeks, f"{row.holding_weeks}周")
+    protection = "保护线待核验" if row.effective_stop is None else f"保护线{row.effective_stop:.2f}"
+    reason = _truncate_utf8(_holding_reason(row), reason_bytes)
+    return f"- {name}({_symbol(row.symbol)})｜{horizon}｜{action}｜{protection}｜{reason}"
+
+
+def _holding_reason(row: HoldingTreeReviewRow) -> str:
+    if row.status is HoldingReviewRowStatus.DATA_NOT_READY:
+        if any("company_action_evidence_blocks" in reason for reason in row.reasons):
+            return "除权/分红证据待核验，不作动作"
+        return "数据不足，不作持仓动作"
+    labels = (
+        ("complete_close_confirmed_below_effective_stop", "收盘已跌破保护线"),
+        ("multiple_timeframe_weakness_confirmed", "多周期转弱确认"),
+        (
+            "single_dimension_weakness_warning_not_multi_timeframe_confirmation",
+            "单维度转弱预警",
+        ),
+        ("completed_multitimeframe_weakness", "多周期结构转弱"),
+        ("confirmed_pivot_raised_protection_line", "新基准点上移"),
+        ("no_completed_close_exit_or_reduce_signal", "结构仍完整"),
+    )
+    for prefix, label in labels:
+        if any(reason.startswith(prefix) for reason in row.reasons):
+            return label
+    return "等待下一完整收盘复核"
 
 
 def _compact_price_condition(value: str) -> str:
@@ -768,6 +806,7 @@ def _summarize_period(result: MidtermPortfolioResult, *, weeks: int) -> EveningP
         ranked_pool_count=_nonnegative_int_optional(result.horizon_candidate_count),
         central_implementation_status=result.central_implementation_status,
         multi_timeframe_component_status=result.multi_timeframe_component_status,
+        performance_nature=_period_performance_nature(result, rows),
     )
 
 
@@ -792,6 +831,11 @@ def _candidate_from_position(
     )
     sleeve = _operational_weight(position.operational_stock_sleeve_weight)
     account = _finite_optional_fraction(position.operational_account_weight)
+    selected_plan = _selected_structured_plan(
+        price_nature=price_nature,
+        conditional_plan=conditional,
+        observation_plan=position.price_observation_plan,
+    )
     return EveningDigestCandidate(
         rank=int(position.rank),
         symbol=_symbol(position.symbol),
@@ -803,10 +847,13 @@ def _candidate_from_position(
         price_condition=price,
         price_nature=price_nature,
         evidence_pending=evidence_pending,
+        operational_stock_sleeve_weight=sleeve,
+        operational_account_weight=account,
         price_plan_sessions=_selected_plan_sessions(
             conditional_plan=conditional,
             observation_plan=position.price_observation_plan,
         ),
+        **_structured_plan_fields(selected_plan),
         **_candidate_timeframe_fields(getattr(position, "timeframe", None)),
     )
 
@@ -839,6 +886,11 @@ def _candidate_from_research(
     else:
         sleeve = None
         account = None
+    selected_plan = _selected_structured_plan(
+        price_nature=price_nature,
+        conditional_plan=conditional,
+        observation_plan=candidate.price_observation_plan,
+    )
     return EveningDigestCandidate(
         rank=int(candidate.rank),
         symbol=_symbol(candidate.symbol),
@@ -850,12 +902,48 @@ def _candidate_from_research(
         price_condition=price,
         price_nature=price_nature,
         evidence_pending=evidence_pending,
+        operational_stock_sleeve_weight=(
+            sleeve if allocation_nature == "risk_qualified_research" else None
+        ),
+        operational_account_weight=(
+            account if allocation_nature == "risk_qualified_research" else None
+        ),
         price_plan_sessions=_selected_plan_sessions(
             conditional_plan=conditional,
             observation_plan=candidate.price_observation_plan,
         ),
+        **_structured_plan_fields(selected_plan),
         **_candidate_timeframe_fields(getattr(candidate, "timeframe", None)),
     )
+
+
+def _period_performance_nature(
+    result: MidtermPortfolioResult,
+    rows: tuple[EveningDigestCandidate, ...],
+) -> Literal[
+    "official_action",
+    "risk_qualified_observation",
+    "observation_only",
+    "full_cash",
+    "data_unavailable",
+]:
+    """Classify what may later enter each explicitly separated scorecard."""
+
+    has_archivable_action = any(
+        candidate.allocation_nature == "action_research"
+        and candidate.action == CandidateAction.CONDITIONAL_ENTRY.value
+        and candidate.price_nature == "conditional_entry"
+        and candidate.operational_stock_sleeve_weight is not None
+        and candidate.operational_account_weight is not None
+        for candidate in rows
+    )
+    if result.positions and result.evaluation is not None and has_archivable_action:
+        return "official_action"
+    if result.research_evaluation is not None:
+        return "risk_qualified_observation"
+    if result.observation_evaluation is not None:
+        return "observation_only"
+    return "full_cash"
 
 
 def _price_label(
@@ -922,6 +1010,56 @@ def _selected_plan_sessions(
 ) -> int | None:
     plan = conditional_plan if conditional_plan is not None else observation_plan
     return None if plan is None else _positive_int_optional(getattr(plan, "sessions", None))
+
+
+def _selected_structured_plan(
+    *,
+    price_nature: Literal["conditional_entry", "observation_only", "unavailable"],
+    conditional_plan: ConditionalEntryPlan | None,
+    observation_plan: ConditionalEntryPlan | None,
+) -> ConditionalEntryPlan | None:
+    """Return only the plan that actually produced the audited display row."""
+
+    if price_nature == "conditional_entry":
+        return conditional_plan
+    if price_nature == "observation_only":
+        return observation_plan
+    return None
+
+
+def _structured_plan_fields(plan: ConditionalEntryPlan | None) -> dict[str, Any]:
+    """Extract safe scalar plan evidence; no OHLCV frame enters the digest."""
+
+    if plan is None:
+        return {}
+    kind = getattr(plan.kind, "value", plan.kind)
+    cutoff = getattr(plan, "data_cutoff", None)
+    evaluation_price = (
+        getattr(plan, "price_high", None)
+        if kind == ConditionalEntryPlanKind.HEALTHY_PULLBACK.value
+        else getattr(plan, "trigger_price", None)
+    )
+    return {
+        "price_plan_kind": _clean_text(kind),
+        "price_plan_low": _positive_optional(getattr(plan, "price_low", None)),
+        "price_plan_high": _positive_optional(getattr(plan, "price_high", None)),
+        "price_plan_trigger": _positive_optional(getattr(plan, "trigger_price", None)),
+        "price_plan_evaluation_price": _positive_optional(evaluation_price),
+        "price_plan_confirmation_rule": _clean_optional_text(
+            getattr(plan, "confirmation_rule", None)
+        ),
+        "price_plan_confirmation_activity_metric": _clean_optional_text(
+            getattr(plan, "confirmation_activity_metric", None)
+        ),
+        "price_plan_confirmation_activity_min": _positive_optional(
+            getattr(plan, "confirmation_activity_min", None)
+        ),
+        "price_plan_invalidation_price": _positive_optional(
+            getattr(plan, "invalidation_price", None)
+        ),
+        "price_plan_cutoff": None if cutoff is None else _as_date(cutoff),
+        "price_plan_method_version": _clean_optional_text(getattr(plan, "method_version", None)),
+    }
 
 
 def _candidate_timeframe_label(candidate: EveningDigestCandidate) -> str:
@@ -1413,6 +1551,7 @@ def _data_unavailable_period(
         action_stock_exposure=0.0,
         action_cash_weight=1.0,
         failure_code=failure_code,
+        performance_nature="data_unavailable",
     )
 
 
@@ -1594,3 +1733,10 @@ def _symbol(value: object) -> str:
 def _clean_text(value: object, *, limit: int = 120) -> str:
     text = " ".join(str(value).replace("|", "／").split())
     return text[:limit] or "—"
+
+
+def _clean_optional_text(value: object, *, limit: int = 240) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).replace("|", "／").split())
+    return text[:limit] or None

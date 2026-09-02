@@ -64,7 +64,9 @@ def test_default_registry_has_expected_fail_closed_states() -> None:
     assert {source.source_id for source in registry.all()} == set(SourceId)
     assert registry.get(SourceId.IFIND).status is SourceStatus.NOT_CONNECTED
     assert registry.get(SourceId.CHOICE).status is SourceStatus.NOT_CONNECTED
-    assert registry.get(SourceId.TUSHARE).status is SourceStatus.NOT_CONNECTED
+    assert registry.get(SourceId.TUSHARE).status is SourceStatus.EXPERIMENTAL
+    assert registry.get(SourceId.BAOSTOCK).status is SourceStatus.EXPERIMENTAL
+    assert registry.get(SourceId.ZERO_BUDGET_EOD).status is SourceStatus.EXPERIMENTAL
     assert registry.get(SourceId.INFOWAY).status is SourceStatus.EXPERIMENTAL
     assert registry.get(SourceId.CLS).status is SourceStatus.BLOCKED_REQUIRE_WRITTEN_AUTHORIZATION
     assert registry.get(SourceId.STCN).status is SourceStatus.BLOCKED_REQUIRE_WRITTEN_AUTHORIZATION
@@ -74,7 +76,7 @@ def test_default_registry_has_expected_fail_closed_states() -> None:
 
 def test_not_connected_commercial_sources_are_denied() -> None:
     policy = RightsPolicy(SourceRegistry.load_default())
-    for source_id in (SourceId.IFIND, SourceId.CHOICE, SourceId.TUSHARE):
+    for source_id in (SourceId.IFIND, SourceId.CHOICE):
         with pytest.raises(RightsViolationError):
             policy.require(source_id, DataAction.MARKET_DATA_READ)
 
@@ -97,7 +99,16 @@ def test_news_bodies_are_blocked_without_written_authorization(
         policy.require(source_id, action)
 
 
-@pytest.mark.parametrize("source_id", [SourceId.AKSHARE, SourceId.YAHOO])
+@pytest.mark.parametrize(
+    "source_id",
+    [
+        SourceId.TUSHARE,
+        SourceId.BAOSTOCK,
+        SourceId.ZERO_BUDGET_EOD,
+        SourceId.AKSHARE,
+        SourceId.YAHOO,
+    ],
+)
 def test_personal_research_price_sources_are_narrowly_scoped(source_id: SourceId) -> None:
     policy = RightsPolicy(SourceRegistry.load_default())
     assert policy.require(source_id, DataAction.MARKET_DATA_READ).source_id is source_id

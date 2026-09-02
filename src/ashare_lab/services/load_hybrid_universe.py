@@ -17,6 +17,7 @@ from typing import Literal, Protocol
 import numpy as np
 import pandas as pd
 
+from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
 from ashare_lab.domain.errors import DataQualityError, DataUnavailableError
 from ashare_lab.services.load_csmar_universe import (
     DEFAULT_CORE_INDEX_CODES,
@@ -99,7 +100,7 @@ def load_hybrid_universe(
     as_of: date,
     decision_date: date | None = None,
     mode: Literal["live", "historical"] = "live",
-    overlay_source_id: str = "infoway",
+    overlay_source_id: str = DEFAULT_MARKET_OVERLAY_SOURCE_ID,
     core_index_codes: tuple[str, ...] = DEFAULT_CORE_INDEX_CODES,
     overlay_store: _VerifiedOverlayReader | None = None,
     minimum_qualification_sessions: int = HYBRID_QUALIFICATION_MINIMUM_SESSIONS,

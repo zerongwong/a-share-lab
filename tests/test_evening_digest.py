@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pandas as pd
@@ -23,6 +23,13 @@ from ashare_lab.services.build_midterm_portfolio import (
     ConditionalEntryPlanKind,
     MidtermPortfolioResult,
     MidtermPortfolioStatus,
+)
+from ashare_lab.services.review_active_holdings import (
+    HoldingAction,
+    HoldingReviewRowStatus,
+    HoldingReviewSummaryStatus,
+    HoldingTreeReviewRow,
+    HoldingTreeReviewSummary,
 )
 
 CUTOFF = date(2026, 8, 27)
@@ -146,6 +153,59 @@ def _hybrid(token: object):
     return SimpleNamespace(snapshot=snapshot, common_cutoff=CUTOFF)
 
 
+def _holding_review() -> HoldingTreeReviewSummary:
+    common = {
+        "holding_weeks": 4,
+        "holding_version": 1,
+        "status": HoldingReviewRowStatus.READY,
+        "latest_close": 12.0,
+        "cost_price": 10.0,
+        "stock_sleeve_weight": 0.5,
+        "account_weight": 0.15,
+        "candidate_stop": 11.0,
+        "previous_stop": 10.8,
+        "effective_stop": 11.0,
+        "stop_raised": True,
+        "close_below_stop": False,
+        "source_timeframe": "daily",
+        "evidence_date": CUTOFF,
+        "slow_direction": "up",
+        "primary_structure": "volume_confirmed_breakout",
+        "daily_execution": "confirmed",
+    }
+    hold = HoldingTreeReviewRow(
+        symbol="600919",
+        name="江苏银行",
+        position_key="holding:600919:test",
+        action=HoldingAction.HOLD,
+        reasons=("no_completed_close_exit_or_reduce_signal",),
+        **common,
+    )
+    exit_row = HoldingTreeReviewRow(
+        symbol="601156",
+        name="东航物流",
+        position_key="holding:601156:test",
+        action=HoldingAction.EXIT,
+        latest_close=10.5,
+        close_below_stop=True,
+        reasons=("complete_close_confirmed_below_effective_stop",),
+        **{
+            key: value
+            for key, value in common.items()
+            if key not in {"latest_close", "close_below_stop"}
+        },
+    )
+    return HoldingTreeReviewSummary(
+        status=HoldingReviewSummaryStatus.READY,
+        portfolio_id="holding-revision:test",
+        holding_version=1,
+        holding_weeks=4,
+        reviewed_at=datetime(2026, 8, 27, 16, tzinfo=UTC),
+        data_cutoff=CUTOFF,
+        rows=(hold, exit_row),
+    )
+
+
 def test_six_horizons_share_only_equal_history_requirements() -> None:
     loads: list[tuple[int, int, object]] = []
     builds: list[tuple[int, object]] = []
@@ -225,19 +285,20 @@ def test_markdown_is_compact_derived_and_explicitly_non_actionable() -> None:
 
     markdown = render_evening_digest_markdown(digest)
 
-    assert "共同截止日：2026-08-27" in markdown
-    assert "实现状态：`partial_multiframe`" in markdown
-    assert "组件：`analytics_core_only`" in markdown
-    assert "计划适用日：2026-08-28（周五）" in markdown
+    assert "2026-08-28周五 A股研究计划" in markdown
+    assert "数据2026-08-27" in markdown
+    assert "中期下行｜短线修复反弹｜防守" in markdown
     assert "下一交易日" not in markdown
-    assert "规则一致度，不是未来方向概率" in markdown
-    assert "股票敞口上限：30%；最低现金：70%" in markdown
-    assert "观察配比30%股票仓（非资金仓位）" in markdown
-    assert "收盘站回观察线" in markdown
-    assert "触及不等于可买" in markdown
+    assert "股≤30%/现≥70%" in markdown
+    assert "当前持仓修枝" not in markdown
+    assert "持仓复核" not in markdown
+    assert "合成甲(SYN001) 30%@观察站回 ≥ 11.00" in markdown
+    assert "六期限重合与差异审计" not in markdown
+    assert "候选重合" not in markdown
+    assert "Jaccard" not in markdown
     assert "不自动下单" in markdown
     assert "private path" not in markdown
-    assert len(markdown) < 7_800
+    assert len(markdown.encode("utf-8")) <= 2_400
 
 
 def test_bark_compact_covers_all_six_horizons_candidates_weights_and_prices() -> None:
@@ -255,14 +316,108 @@ def test_bark_compact_covers_all_six_horizons_candidates_weights_and_prices() ->
 
     for label in ("1周", "2周", "1个月", "3个月", "6个月", "1年"):
         assert f"{label}｜" in compact
-    assert compact.count("SYN001合成甲") == 6
-    assert "仓30%" in compact
-    assert "观察站回 ≥ 11.00" in compact
+    assert compact.count("合成甲(SYN001)") == 6
+    assert "30%@观察站回 ≥ 11.00" in compact
     assert "仓%=股票仓内10%档" in compact
     assert "不自动下单" in compact
     assert len(compact.encode("utf-8")) <= 2_400
+    assert "候选重合" not in compact
+    assert "重复≠" not in compact
     assert "/Users/" not in compact
     assert "SCT" not in compact
+
+
+def test_holding_tree_summary_is_prioritized_concise_and_keeps_urgent_row_first() -> None:
+    digest = build_evening_research_digest(
+        dataset_root="csmar",
+        overlay_root="overlay",
+        reference_dataset_root="reference",
+        decision_date=CUTOFF,
+        _hybrid_loader=lambda *_args, **_kwargs: _hybrid(object()),
+        _portfolio_builder=lambda _histories, _metadata, *, holding_weeks, **_kwargs: _result(
+            holding_weeks
+        ),
+    )
+    digest = replace(digest, plan_for_date=PLAN_DATE)
+
+    default_markdown = render_evening_digest_markdown(digest, _holding_review())
+    default_bark = render_evening_digest_bark_compact(digest, _holding_review())
+    for body in (default_markdown, default_bark):
+        assert "当前持仓修枝" not in body
+        assert "持仓复核" not in body
+        assert "江苏银行" not in body
+
+    markdown = render_evening_digest_markdown(
+        digest,
+        _holding_review(),
+        include_holding_summary=True,
+    )
+    compact = render_evening_digest_bark_compact(
+        digest,
+        _holding_review(),
+        include_holding_summary=True,
+    )
+
+    for body in (markdown, compact):
+        assert "当前持仓修枝" in body
+        assert "东航物流(601156)｜1个月｜退出｜保护线11.00｜收盘已跌破保护线" in body
+        assert "江苏银行(600919)｜1个月｜HOLD｜保护线11.00｜结构仍完整" in body
+        assert body.index("东航物流") < body.index("江苏银行")
+        assert body.index("当前持仓修枝") < body.index("六期限计划")
+        assert "六期限重合与差异审计" not in body
+        assert len(body.encode("utf-8")) <= 2_400
+
+
+def test_holding_reason_distinguishes_evidence_block_and_weakness_strength() -> None:
+    digest = EveningResearchDigest(
+        common_cutoff=CUTOFF,
+        decision_date=CUTOFF,
+        cycle_label="中期下行",
+        entry_strictness=EntryStrictness.DEFENSIVE.value,
+        max_stock_exposure=0.3,
+        minimum_cash_weight=0.7,
+        cycle_rule_agreement=0.8,
+        periods=(),
+        plan_for_date=PLAN_DATE,
+    )
+    base = _holding_review().rows[0]
+    rows = (
+        replace(
+            base,
+            symbol="600001",
+            name="证据待核验",
+            action=HoldingAction.REVIEW,
+            status=HoldingReviewRowStatus.DATA_NOT_READY,
+            reasons=(
+                "company_action_evidence_blocks_reduce:company_action_clearance_missing_or_stale",
+            ),
+        ),
+        replace(
+            base,
+            symbol="600002",
+            name="单维度转弱",
+            action=HoldingAction.REDUCE,
+            reasons=("single_dimension_weakness_warning_not_multi_timeframe_confirmation",),
+        ),
+        replace(
+            base,
+            symbol="600003",
+            name="多周期转弱",
+            action=HoldingAction.REDUCE,
+            reasons=("multiple_timeframe_weakness_confirmed",),
+        ),
+    )
+    review = replace(_holding_review(), rows=rows)
+
+    body = render_evening_digest_markdown(
+        digest,
+        review,
+        include_holding_summary=True,
+    )
+
+    assert "除权/分红证据待核验，不作动作" in body
+    assert "单维度转弱预警" in body
+    assert "多周期转弱确认" in body
 
 
 def test_no_successful_hybrid_load_fails_without_fabricating_digest() -> None:
@@ -316,8 +471,8 @@ def test_markdown_without_verified_plan_date_is_explicitly_non_executable() -> N
 
     markdown = render_evening_digest_markdown(digest)
 
-    assert "尚未通过官方交易日历确认" in markdown
-    assert "不得据此执行" in markdown
+    assert "计划日未通过交易日历确认" in markdown
+    assert "不据此执行" in markdown
 
 
 def test_all_fifteen_candidate_pairs_and_qualified_portfolio_pairs_are_audited() -> None:
@@ -372,9 +527,9 @@ def test_repeated_symbol_attribution_documents_each_horizon_without_auto_conflue
     assert {item.price_nature for item in first.appearances} == {"observation_only"}
 
     markdown = render_evening_digest_markdown(digest)
-    assert "候选15对" in markdown
-    assert "风险合格组合：15对均不可比较" in markdown
-    assert "各期独立门已有记录，但重合本身仍不是自动共振" in markdown
+    assert "候选15对" not in markdown
+    assert "重合" not in markdown
+    assert "合成甲(SYN001)" in markdown
 
 
 def test_repeated_attribution_uses_the_same_audit_candidates_as_candidate_overlap() -> None:
@@ -443,7 +598,7 @@ def test_misaligned_price_plan_sessions_fail_closed_for_its_period() -> None:
     assert three_month_attribution.independent_gate_documented is False
 
 
-def test_bark_remains_under_budget_with_full_pairwise_overlap_audit() -> None:
+def test_bark_remains_under_budget_without_exposing_pairwise_overlap_audit() -> None:
     digest = build_evening_research_digest(
         dataset_root="csmar",
         overlay_root="overlay",
@@ -458,10 +613,10 @@ def test_bark_remains_under_budget_with_full_pairwise_overlap_audit() -> None:
 
     compact = render_evening_digest_bark_compact(replace(digest, plan_for_date=PLAN_DATE))
 
-    assert "候选重合：15对=100%" in compact
-    assert "风险组合重合：15对=100%" in compact
-    assert "行动组合重合：15对=100%" in compact
-    assert "重复≠自动共振" in compact
+    assert "候选重合" not in compact
+    assert "风险组合重合" not in compact
+    assert "行动组合重合" not in compact
+    assert "重复≠自动共振" not in compact
     assert "/Users/" not in compact
     assert len(compact.encode("utf-8")) <= 2_400
 

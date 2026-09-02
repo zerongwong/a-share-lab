@@ -7,10 +7,15 @@ A Share Lab 是本地优先的确定性研究程序。UI、MCP 和通知都只�
 flowchart TB
     subgraph DATA["① 合法数据与共同截止"]
         C["CSMAR\n只读历史基线"]
-        I["Infoway EOD\n沪深每日增量"]
+        T["Tushare 免费日线\n沪深股票"]
+        B["BaoStock\n日历·清单·六指数"]
+        AKV["AKShare\n确定性抽样核验"]
         V["Staging → Verified / Quarantine\n覆盖·单位·连续性"]
         H["Hybrid Loader\n来源隔离、显式拼接"]
-        I --> V --> H
+        T --> V
+        B --> V
+        AKV --> V
+        V --> H
         C --> H
     end
 
@@ -138,13 +143,15 @@ bar 截止、每个期限的结构门结果与原因、风险预算版本、forw
 ## 每日收盘增量
 
 - `csmar.duckdb` 永久作为只读历史基线；自动更新不会向它写入任何记录；
-- Infoway 日线按供应商、未复权口径和交易日写入独立 `market_overlay`；
+- 当前 `zero_budget_eod` 链按来源、未复权口径和交易日写入独立 `market_overlay`；旧
+  Infoway 链保留审计但不与当前链混用；
 - 每个交易日先进入 staging。沪深股票覆盖率不低于 98%、六个核心指数齐全、交易日连续、
   日期/单位/OHLC/前收均合法后，股票与指数才一起写入 verified manifest；
 - 不完整批次进入 quarantine，不能推进共同截止日；后续交易日不能越过失败日；
-- 股票成交量按已校准合同由“手”转换为“股”，成交额为人民币元，并逐行验证隐含成交价
-  落在当日高低价内；指数使用成分证券合计量额，不与指数点位相除；
-- Infoway 当前自动母集明确为沪深 A 股，不包含北交所，也排除其清单中混入的指数和 B 股；
+- Tushare 股票成交量由“手”转换为“股”、成交额由千元转换为人民币元；BaoStock 指数
+  使用股和人民币元。两者都逐行验证量额隐含成交价，股票再由 AKShare 独立抽样复核；
+- 当前自动母集来自 BaoStock 的沪深上市 A 股清单，不包含北交所、指数和 B 股；停牌导致
+  的少量缺行由统一 98% 覆盖门处理；
 - 混合读取只追加历史基线之后的 verified 交易日。重叠数据不覆盖 CSMAR，新代码若不在
   CSMAR 证券主表中则隔离，所有行继续保留来源与取得时间。
 

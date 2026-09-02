@@ -59,7 +59,7 @@ def test_initialize_is_idempotent_and_records_version(repository: SQLiteReposito
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert [row["version"] for row in versions] == [1]
+    assert [row["version"] for row in versions] == [1, 2, 3, 4]
 
 
 def test_archive_bundle_round_trip(repository: SQLiteRepository) -> None:
@@ -237,3 +237,383 @@ def test_position_is_mutable_local_state(repository: SQLiteRepository) -> None:
     assert position["id"] == "position-2"
     assert position["shares"] == pytest.approx(800)
     assert position["as_of"] == "2026-08-24"
+
+
+def _recommendation_report() -> dict:
+    return {
+        "id": "report-20260828",
+        "content_hash": "digest-content-sha256",
+        "archive_nature": "original",
+        "decision_date": "2026-08-27",
+        "plan_for_date": "2026-08-28",
+        "common_cutoff": "2026-08-27",
+        "method_version": "evening-six-horizon-digest-v0.4.0",
+        "cycle_label": "震荡防守",
+        "entry_strictness": "加强确认",
+        "max_stock_exposure": 0.3,
+        "minimum_cash_weight": 0.7,
+        "created_at": "2026-08-27T21:00:00+08:00",
+        "metadata_json": {"raw_data_exposed": False, "orders_enabled": False},
+    }
+
+
+def _recommendation_batch() -> dict:
+    return {
+        "id": "batch-20260828-1w",
+        "report_id": "report-20260828",
+        "holding_weeks": 1,
+        "holding_sessions": 5,
+        "label": "1周",
+        "data_cutoff": "2026-08-27",
+        "source_status": "ready",
+        "allocation_nature": "action_research",
+        "action_stock_exposure": 0.3,
+        "action_cash_weight": 0.7,
+        "member_count": 1,
+        "status": "pending",
+    }
+
+
+def _recommendation_member() -> dict:
+    return {
+        "id": "member-20260828-1w-1",
+        "batch_id": "batch-20260828-1w",
+        "rank": 1,
+        "symbol": "601919.SH",
+        "name": "中远海控",
+        "action": "条件介入研究",
+        "allocation_nature": "action_research",
+        "operational_stock_sleeve_weight": 1.0,
+        "operational_account_weight": 0.3,
+        "price_nature": "conditional_entry",
+        "plan_kind": "breakout_or_pullback",
+        "price_low": 14.8,
+        "price_high": 15.1,
+        "trigger_price": 15.3,
+        "evaluation_price": 15.0,
+        "confirmation_rule": "plan_day_close_confirms_then_next_session_open",
+        "invalidation_price": 14.2,
+        "plan_cutoff": "2026-08-27",
+        "plan_sessions": 5,
+        "plan_method_version": "conditional-entry-v1",
+        "price_condition": "回踩14.80–15.10或放量站上15.30",
+        "evidence_pending": False,
+        "primary_timeframe": "daily",
+        "primary_structure": "near_breakout",
+        "entry_rule_json": {
+            "kind": "reclaim_close_confirmation",
+            "trigger_price": 15.3,
+            "trigger_valid_sessions": 1,
+        },
+    }
+
+
+def _accepted_delivery_event(
+    *,
+    event_id: str,
+    delivery_kind: str,
+    batch_id=None,
+    attempted_at: str = "2026-08-27T21:01:00+08:00",
+    detail_json: dict | None = None,
+) -> dict:
+    return {
+        "id": event_id,
+        "report_id": "report-20260828",
+        "batch_id": batch_id,
+        "delivery_kind": delivery_kind,
+        "channel": "serverchan",
+        "attempted_at": attempted_at,
+        "provider_status": "provider_accepted",
+        "provider_receipt_id": "receipt-redacted",
+        "detail_json": detail_json or {"delivery_confirmed": False},
+    }
+
+
+def test_recommendation_archive_is_atomic_immutable_and_queryable(
+    repository: SQLiteRepository,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+        delivery_events=[
+            _accepted_delivery_event(
+                event_id="delivery-evening-1",
+                delivery_kind="evening_provider_accepted",
+            )
+        ],
+    )
+    repository.archive_recommendation_report(
+        {**_recommendation_report(), "created_at": "2026-08-27T21:05:00+08:00"},
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+        delivery_events=[
+            _accepted_delivery_event(
+                event_id="delivery-evening-1",
+                delivery_kind="evening_provider_accepted",
+            )
+        ],
+    )
+
+    report = repository.get_recommendation_report("report-20260828")
+    assert report is not None
+    assert report["metadata_json"]["orders_enabled"] is False
+    assert repository.get_recommendation_report_by_content_hash("digest-content-sha256") == report
+
+    batches = repository.list_recommendation_batches("report-20260828")
+    assert len(batches) == 1
+    assert batches[0]["horizon_key"] == "1w"
+    assert batches[0]["evaluation_mode"] == "action_simulation"
+    assert batches[0]["cohort_nature"] == "action_qualified"
+    assert batches[0]["delivery_accepted"] == 1
+
+    members = repository.list_recommendation_members("batch-20260828-1w")
+    assert members[0]["entry_plan_json"]["trigger_valid_sessions"] == 1
+    assert members[0]["sleeve_weight"] == pytest.approx(1.0)
+    assert members[0]["entry_reference_price"] == pytest.approx(15.0)
+    assert members[0]["observation_anchor"] is None
+
+    from ashare_lab.services.settle_recommendation_performance import (
+        archived_batch_from_mapping,
+        archived_member_from_mapping,
+        archived_report_from_mapping,
+    )
+
+    assert archived_report_from_mapping(batches[0]).plan_for_date.isoformat() == "2026-08-28"
+    assert archived_batch_from_mapping(batches[0]).holding_sessions == 5
+    assert archived_member_from_mapping(members[0]).entry_plan is not None
+
+    pending = repository.list_recommendation_batches_pending_settlement(as_of="2026-08-31")
+    assert [row["id"] for row in pending] == ["batch-20260828-1w"]
+
+    with repository.connection() as connection, pytest.raises(sqlite3.IntegrityError):
+        connection.execute(
+            "UPDATE recommendation_members SET symbol = '000001.SZ' WHERE id = ?",
+            ("member-20260828-1w-1",),
+        )
+
+
+def test_recommendation_archive_rejects_incomplete_bundle_atomically(
+    repository: SQLiteRepository,
+) -> None:
+    batch = {**_recommendation_batch(), "member_count": 2}
+    with pytest.raises(ValueError, match="declares 2 members"):
+        repository.archive_recommendation_report(
+            _recommendation_report(),
+            batches=[batch],
+            members=[_recommendation_member()],
+        )
+    assert repository.get_recommendation_report("report-20260828") is None
+
+
+def test_recommendation_maturity_results_are_idempotent_and_notified_once(
+    repository: SQLiteRepository,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    pending_member = {
+        "member_id": "member-20260828-1w-1",
+        "evaluated_at": "2026-09-03T16:00:00+08:00",
+        "status": "pending",
+        "holding_sessions_observed": 4,
+        "reason_code": "horizon_not_elapsed",
+        "data_cutoff": "2026-09-03",
+        "method_version": "maturity-v1",
+    }
+    repository.record_recommendation_member_result(pending_member)
+    repository.record_recommendation_member_result(
+        {
+            **pending_member,
+            "evaluated_at": "2026-09-04T16:00:00+08:00",
+            "status": "resolved",
+            "entry_date": "2026-08-31",
+            "entry_price": 15.2,
+            "due_date": "2026-09-04",
+            "due_close": 15.96,
+            "return_pct": 0.05,
+            "holding_sessions_observed": 5,
+            "reason_code": "maturity_close_verified",
+            "company_action_clear": True,
+            "data_cutoff": "2026-09-04",
+        }
+    )
+    member_result = repository.get_recommendation_member_result("member-20260828-1w-1")
+    assert member_result is not None
+    assert member_result["status"] == "resolved"
+    assert member_result["realized_return"] == pytest.approx(0.05)
+    assert member_result["maturity_date"] == "2026-09-04"
+
+    batch_result = {
+        "batch_id": "batch-20260828-1w",
+        "evaluated_at": "2026-09-04T16:01:00+08:00",
+        "status": "resolved",
+        "due_date": "2026-09-04",
+        "stock_sleeve_return": 0.05,
+        "account_return": 0.015,
+        "entered_weight": 1.0,
+        "entered_account_weight": 0.3,
+        "cash_weight": 0.7,
+        "resolved_member_count": 1,
+        "total_member_count": 1,
+        "reason_code": "all_entered_members_resolved",
+        "data_cutoff": "2026-09-04",
+        "method_version": "maturity-v1",
+    }
+    repository.record_recommendation_batch_result(batch_result)
+    repository.record_recommendation_batch_result(batch_result)
+    assert repository.get_recommendation_batch_result("batch-20260828-1w")[
+        "account_return"
+    ] == pytest.approx(0.015)
+    assert len(repository.list_recommendation_member_results("batch-20260828-1w")) == 1
+    performance = repository.get_recommendation_batch_performance("batch-20260828-1w")
+    assert performance is not None
+    assert performance["batch"]["horizon_key"] == "1w"
+    assert performance["members"][0]["result"]["status"] == "resolved"
+
+    due_notifications = repository.list_maturity_results_pending_notification()
+    assert [row["batch_id"] for row in due_notifications] == ["batch-20260828-1w"]
+
+    repository.record_recommendation_delivery_event(
+        _accepted_delivery_event(
+            event_id="delivery-maturity-1",
+            delivery_kind="maturity_provider_accepted",
+            batch_id="batch-20260828-1w",
+            attempted_at="2026-09-04T16:02:00+08:00",
+            detail_json={
+                "result_status": "resolved",
+                "result_method_version": "maturity-v1",
+            },
+        )
+    )
+    assert repository.list_maturity_results_pending_notification() == []
+    assert repository.list_recommendation_batches_pending_settlement() == []
+
+
+def test_needs_review_without_maturity_date_is_never_notified(
+    repository: SQLiteRepository,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    repository.record_recommendation_batch_result(
+        {
+            "batch_id": "batch-20260828-1w",
+            "evaluated_at": "2026-08-31T16:00:00+08:00",
+            "status": "needs_review",
+            "maturity_date": None,
+            "resolved_member_count": 0,
+            "total_member_count": 1,
+            "reason_code": "pre_maturity_archive_review",
+            "data_cutoff": "2026-08-31",
+            "method_version": "maturity-v1",
+        }
+    )
+
+    assert repository.list_maturity_results_pending_notification() == []
+
+
+def test_needs_review_and_final_result_notifications_are_separately_idempotent(
+    repository: SQLiteRepository,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    needs_review = {
+        "batch_id": "batch-20260828-1w",
+        "evaluated_at": "2026-09-04T16:00:00+08:00",
+        "updated_at": "2026-09-04T16:00:00+08:00",
+        "status": "needs_review",
+        "maturity_date": "2026-09-04",
+        "resolved_member_count": 1,
+        "total_member_count": 1,
+        "reason_code": "corporate_action_evidence_unknown",
+        "data_cutoff": "2026-09-04",
+        "method_version": "maturity-v1",
+    }
+    repository.record_recommendation_batch_result(needs_review)
+    assert [row["batch_id"] for row in repository.list_maturity_results_pending_notification()] == [
+        "batch-20260828-1w"
+    ]
+    assert [row["id"] for row in repository.list_recommendation_batches_pending_settlement()] == [
+        "batch-20260828-1w"
+    ]
+
+    repository.record_recommendation_delivery_event(
+        _accepted_delivery_event(
+            event_id="delivery-maturity-review",
+            delivery_kind="maturity_provider_accepted",
+            batch_id="batch-20260828-1w",
+            attempted_at="2026-09-04T16:01:00+08:00",
+            detail_json={
+                "result_status": "needs_review",
+                "result_method_version": "maturity-v1",
+            },
+        )
+    )
+    assert repository.list_maturity_results_pending_notification() == []
+
+    repository.record_recommendation_batch_result(
+        {
+            **needs_review,
+            "evaluated_at": "2026-09-05T16:00:00+08:00",
+            "updated_at": "2026-09-05T16:00:00+08:00",
+            "status": "resolved",
+            "stock_sleeve_return": 0.04,
+            "account_return": 0.02,
+            "reason_code": "settled",
+            "data_cutoff": "2026-09-05",
+        }
+    )
+    assert [row["batch_id"] for row in repository.list_maturity_results_pending_notification()] == [
+        "batch-20260828-1w"
+    ]
+    assert repository.list_recommendation_batches_pending_settlement() == []
+
+    repository.record_recommendation_delivery_event(
+        _accepted_delivery_event(
+            event_id="delivery-maturity-final",
+            delivery_kind="maturity_provider_accepted",
+            batch_id="batch-20260828-1w",
+            attempted_at="2026-09-05T16:01:00+08:00",
+            detail_json={
+                "result_status": "resolved",
+                "result_method_version": "maturity-v1",
+            },
+        )
+    )
+    assert repository.list_maturity_results_pending_notification() == []
+
+
+def test_partial_entry_result_is_terminal_for_settlement(
+    repository: SQLiteRepository,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    repository.record_recommendation_batch_result(
+        {
+            "batch_id": "batch-20260828-1w",
+            "evaluated_at": "2026-09-04T16:00:00+08:00",
+            "updated_at": "2026-09-04T16:00:00+08:00",
+            "status": "settled_partial_entry",
+            "maturity_date": "2026-09-04",
+            "stock_sleeve_return": 0.04,
+            "account_return": 0.02,
+            "resolved_member_count": 1,
+            "total_member_count": 1,
+            "reason_code": "settled_partial_entry",
+            "data_cutoff": "2026-09-04",
+            "method_version": "maturity-v1",
+        }
+    )
+
+    assert repository.list_recommendation_batches_pending_settlement() == []

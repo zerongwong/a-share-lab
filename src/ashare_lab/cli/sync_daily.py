@@ -1,4 +1,4 @@
-"""CLI entrypoint for a Keychain-authenticated completed-session update."""
+"""CLI entrypoint for the verified zero-budget completed-session update."""
 
 from __future__ import annotations
 
@@ -11,13 +11,17 @@ from pathlib import Path
 from ashare_lab.bootstrap import application_data_dir
 from ashare_lab.domain.errors import AShareLabError
 from ashare_lab.services.daily_update_lock import daily_update_lock
-from ashare_lab.services.run_daily_update import run_daily_update
+from ashare_lab.services.run_zero_budget_daily_update import run_zero_budget_daily_update
+
+# Keep the public seam stable for tests and existing wrappers.
+run_daily_update = run_zero_budget_daily_update
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "从macOS钥匙串读取Infoway密钥，将缺失的已完成沪深收盘数据写入独立overlay；"
+            "从macOS钥匙串读取Tushare Token，以Tushare日线、BaoStock日历/指数、"
+            "AKShare交叉核验补齐沪深收盘数据；"
             "不会修改CSMAR，也不会读取交易账户。"
         )
     )
@@ -31,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--overlay-root",
         type=Path,
         default=application_data_dir() / "cache" / "market_overlay",
-        help="Infoway已验证收盘增量目录",
+        help="零预算三源已验证收盘增量目录",
     )
     return parser
 

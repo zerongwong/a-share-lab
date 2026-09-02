@@ -271,6 +271,18 @@ def sync_daily_overlay_range(
         start=started_cutoff + timedelta(days=1),
         end=through_date,
     )
+    if not calendar:
+        return DailyOverlayRangeReport(
+            source_id=source_id,
+            baseline_cutoff=baseline_cutoff,
+            requested_through=through_date,
+            started_cutoff=started_cutoff,
+            verified_cutoff=started_cutoff,
+            expected_sessions=(),
+            completed_sessions=(),
+            results=(),
+            ready_through_requested_date=True,
+        )
     stocks_requested = tuple(stock_symbols or provider.fetch_cn_stock_symbols())
     if not stocks_requested:
         raise DataUnavailableError("provider stock universe is empty")
