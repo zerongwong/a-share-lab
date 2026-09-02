@@ -761,6 +761,7 @@ def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
     assert document["StartCalendarInterval"] == [
         {"Hour": 15, "Minute": 30},
         {"Hour": 18, "Minute": 30},
+        {"Hour": 20, "Minute": 0},
     ]
     assert "KeepAlive" not in document
     assert document["ProcessType"] == "Background"
@@ -802,6 +803,7 @@ def test_launchagent_renderer_replaces_placeholders_without_inserting_arguments(
     assert document["StartCalendarInterval"] == [
         {"Hour": 15, "Minute": 30},
         {"Hour": 18, "Minute": 30},
+        {"Hour": 20, "Minute": 0},
     ]
     assert "__PYTHON_BIN__" not in document["ProgramArguments"]
     assert output.stat().st_mode & 0o777 == 0o600
@@ -820,7 +822,7 @@ def test_installers_only_manage_daily_label_and_preserve_data_and_keys() -> None
     assert "import ashare_lab.cli.scheduled_sync" in install
     assert "render_launchagent_plist" in install
     assert "plutil -replace ProgramArguments.0" not in install
-    assert "15:30首次同步，18:30质量复核" in install
+    assert "15:30首次同步，18:30质量复核，20:00晚报前预检" in install
     assert "BACKUP_PLIST" in install
     assert "正在恢复安装前状态" in install
     assert "research.db" not in uninstall

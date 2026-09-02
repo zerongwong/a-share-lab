@@ -8,6 +8,7 @@ import pandas as pd
 import pytest
 
 from ashare_lab.adapters.tushare_daily import (
+    TUSHARE_DAILY_RETRY_DELAYS_SECONDS,
     TUSHARE_DAILY_ROW_LIMIT,
     TUSHARE_DAILY_SOURCE,
     TushareDailyClient,
@@ -143,13 +144,18 @@ def test_rejects_duplicate_symbols_and_naive_retrieval_time() -> None:
 def test_provider_failures_are_redacted() -> None:
     secret = "token-should-never-escape"
     raw_message = "upstream request rejected"
+    calls = 0
+    delays: list[float] = []
 
     def fail(**_: str) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
         raise RuntimeError(f"{raw_message}; token={secret}")
 
     adapter = TushareDailyClient(
         client=SimpleNamespace(daily=fail),
         clock=lambda: RETRIEVED,
+        sleeper=delays.append,
     )
     with pytest.raises(DataUnavailableError) as captured:
         adapter.fetch_daily(TARGET)
@@ -157,9 +163,62 @@ def test_provider_failures_are_redacted() -> None:
     assert secret not in str(captured.value)
     assert raw_message not in str(captured.value)
     assert captured.value.__suppress_context__ is True
+    assert calls == 3
+    assert delays == list(TUSHARE_DAILY_RETRY_DELAYS_SECONDS)
+
+
+def test_transient_provider_failure_recovers_without_switching_source() -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def transient(**_: str) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionError("temporary transport failure")
+        return _raw()
+
+    result = TushareDailyClient(
+        client=SimpleNamespace(daily=transient),
+        clock=lambda: RETRIEVED,
+        sleeper=delays.append,
+    ).fetch_daily(TARGET)
+
+    assert calls == 2
+    assert delays == [TUSHARE_DAILY_RETRY_DELAYS_SECONDS[0]]
+    assert set(result.frame["source"]) == {TUSHARE_DAILY_SOURCE}
+
+
+def test_quality_failure_is_not_retried() -> None:
+    calls = 0
+    delays: list[float] = []
+
+    def invalid(**_: str) -> pd.DataFrame:
+        nonlocal calls
+        calls += 1
+        return _raw().drop(columns="pre_close")
+
+    adapter = TushareDailyClient(
+        client=SimpleNamespace(daily=invalid),
+        clock=lambda: RETRIEVED,
+        sleeper=delays.append,
+    )
+    with pytest.raises(DataQualityError, match="缺少字段"):
+        adapter.fetch_daily(TARGET)
+
+    assert calls == 1
+    assert delays == []
 
 
 def test_empty_response_is_unavailable_not_a_valid_zero_stock_session() -> None:
     client = _Client(pd.DataFrame())
+    delays: list[float] = []
     with pytest.raises(DataUnavailableError, match="没有返回日线数据"):
-        TushareDailyClient(client=client, clock=lambda: RETRIEVED).fetch_daily(TARGET)
+        TushareDailyClient(
+            client=client,
+            clock=lambda: RETRIEVED,
+            sleeper=delays.append,
+        ).fetch_daily(TARGET)
+
+    assert len(client.calls) == 3
+    assert delays == list(TUSHARE_DAILY_RETRY_DELAYS_SECONDS)

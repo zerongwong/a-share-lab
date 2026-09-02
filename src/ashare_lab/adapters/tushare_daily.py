@@ -1,16 +1,17 @@
 """Strict single-session Tushare Pro daily cross-section adapter.
 
 This module is intentionally lower level than :class:`DailyIncrementPort`.
-It performs exactly one ``daily(trade_date=...)`` request and converts the
-provider's unadjusted A-share rows into the canonical daily schema.  Trading
-calendars, security masters, credentials and scheduling remain the caller's
-responsibility.
+It performs one bounded retry sequence for ``daily(trade_date=...)`` and
+converts the provider's unadjusted A-share rows into the canonical daily
+schema.  Trading calendars, security masters, credentials and scheduling
+remain the caller's responsibility.
 """
 
 from __future__ import annotations
 
 import importlib
 import re
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -25,6 +26,7 @@ from ashare_lab.ports.market_data import CANONICAL_DAILY_COLUMNS
 
 TUSHARE_DAILY_ROW_LIMIT = 6_000
 TUSHARE_DAILY_SOURCE = "tushare:daily_unadjusted:stocks"
+TUSHARE_DAILY_RETRY_DELAYS_SECONDS = (2.0, 5.0)
 
 _PROVIDER_CODE = re.compile(r"^(?P<symbol>\d{6})\.(?:SH|SZ|BJ)$")
 _REQUIRED_COLUMNS = (
@@ -90,6 +92,7 @@ class TushareDailyClient:
         client: object | None = None,
         client_factory: Callable[[str], object] | None = None,
         clock: Callable[[], datetime] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         if client is not None:
             if token is not None or client_factory is not None:
@@ -108,37 +111,60 @@ class TushareDailyClient:
                 # Provider exceptions may echo credentials or request details.
                 raise DataUnavailableError("Tushare 客户端初始化失败，原始错误已脱敏。") from None
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._sleeper = sleeper or time.sleep
 
     def fetch_daily(self, trade_date: date) -> TushareDailyFetch:
-        """Return one canonical cross-section using exactly one provider call."""
+        """Return one canonical cross-section after a bounded same-source retry.
+
+        Only provider unavailability and an empty response are retryable.
+        Schema, unit, identity and price-quality failures still fail closed on
+        the first observation and can never be hidden by a later response.
+        """
 
         target_date = _validate_target_date(trade_date)
         endpoint = getattr(self._client, "daily", None)
         if not callable(endpoint):
             raise DataUnavailableError("Tushare Pro 客户端没有 daily 日线接口。")
-        try:
-            raw = endpoint(trade_date=target_date.strftime("%Y%m%d"))
-        except Exception:
-            # Never propagate provider text: it may contain a token or request.
-            raise DataUnavailableError("Tushare 日线请求失败，原始错误已脱敏。") from None
+        attempt_count = len(TUSHARE_DAILY_RETRY_DELAYS_SECONDS) + 1
+        for attempt in range(attempt_count):
+            try:
+                raw = endpoint(trade_date=target_date.strftime("%Y%m%d"))
+            except Exception:
+                # Never propagate provider text: it may contain a token or
+                # request.  A bounded retry remains on the same provider and
+                # does not weaken the cross-source verification contract.
+                if attempt + 1 == attempt_count:
+                    raise DataUnavailableError(
+                        "Tushare 日线请求失败，有限重试后仍不可用，原始错误已脱敏。"
+                    ) from None
+                self._sleeper(TUSHARE_DAILY_RETRY_DELAYS_SECONDS[attempt])
+                continue
 
-        fetched_at = _aware_utc(self._clock())
-        frame = normalize_tushare_daily(
-            raw,
-            target_date=target_date,
-            retrieved_at=fetched_at,
-        )
-        return TushareDailyFetch(
-            frame=frame,
-            requested_trade_date=target_date,
-            received_trade_dates=(target_date,),
-            received_symbols=tuple(frame["symbol"].astype(str)),
-            fetched_at=fetched_at,
-            # The Tushare Python SDK's DataFrame response exposes no provider
-            # trace identifier.  An empty tuple is honest and auditable; do not
-            # invent a local value that could be mistaken for a provider trace.
-            trace_ids=(),
-        )
+            fetched_at = _aware_utc(self._clock())
+            try:
+                frame = normalize_tushare_daily(
+                    raw,
+                    target_date=target_date,
+                    retrieved_at=fetched_at,
+                )
+            except DataUnavailableError:
+                if attempt + 1 == attempt_count:
+                    raise
+                self._sleeper(TUSHARE_DAILY_RETRY_DELAYS_SECONDS[attempt])
+                continue
+            return TushareDailyFetch(
+                frame=frame,
+                requested_trade_date=target_date,
+                received_trade_dates=(target_date,),
+                received_symbols=tuple(frame["symbol"].astype(str)),
+                fetched_at=fetched_at,
+                # The Tushare Python SDK's DataFrame response exposes no
+                # provider trace identifier.  An empty tuple is honest and
+                # auditable; do not invent a local value that could be
+                # mistaken for a provider trace.
+                trace_ids=(),
+            )
+        raise AssertionError("bounded Tushare retry loop exhausted unexpectedly")
 
 
 # Compatibility name for code that describes adapters as market-data objects.
@@ -319,6 +345,7 @@ def _aware_utc(value: datetime) -> datetime:
 
 __all__ = [
     "TUSHARE_DAILY_ROW_LIMIT",
+    "TUSHARE_DAILY_RETRY_DELAYS_SECONDS",
     "TUSHARE_DAILY_SOURCE",
     "TushareDailyClient",
     "TushareDailyFetch",

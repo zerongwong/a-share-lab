@@ -5,6 +5,11 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Improve the zero-budget close pipeline without weakening its source contract: Tushare transport
+  failures or empty same-session responses receive two bounded same-source retries, while schema,
+  unit, identity, and price-quality failures still stop immediately. Add a third idempotent 20:00
+  pre-report sync after the existing 15:30 and 18:30 runs so late-publishing free endpoints have one
+  final opportunity before the independent 21:00 digest.
 - Add an isolated `holding-stop-shadow-runner-v0.1.0` research track for a strict daily-bar
   Edwards--Magee translation. The `magee-shadow-daily-v0.1.0` engine keeps
   `three_day_escape_6pct` and `new_high_3pct_6pct` separate, scans only entry-date-through-cutoff
@@ -38,7 +43,7 @@ strategy and data-schema versions are tracked separately in research archives.
   versioned experiments, but never change the production model without user approval and a fresh purged
   walk-forward comparison.
 - Add immutable six-horizon recommendation archives and idempotent maturity-settlement components.
-  Maturity is measured 5/10/20/60/120/252 verified sessions after `plan_for_date`; the 15:30/18:30
+  Maturity is measured 5/10/20/60/120/252 verified sessions after `plan_for_date`; the 15:30/18:30/20:00
   daily-sync path invokes settlement only after a verified close, while the independent 21:00 task
   remains a new-plan publisher. Results are separated into official action, original observation,
   and reconstructed-observation populations. They use unadjusted price returns, exclude dividends,

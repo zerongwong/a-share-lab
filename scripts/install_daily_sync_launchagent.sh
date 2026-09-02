@@ -77,7 +77,7 @@ if ! /bin/launchctl print "$SERVICE" >/dev/null 2>&1; then
     exit 2
 fi
 
-echo "每日收盘同步已安装并登记：15:30首次同步，18:30质量复核。"
+echo "每日收盘同步已安装并登记：15:30首次同步，18:30质量复核，20:00晚报前预检。"
 echo "它与本地网页服务相互独立；不会连接券商或自动下单。"
 echo "首次RunAtLoad结果请查看：$LOG_DIR/daily-sync.jsonl"
 echo "查看状态：launchctl print $SERVICE"

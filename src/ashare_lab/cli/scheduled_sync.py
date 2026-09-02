@@ -138,8 +138,9 @@ def render_launchagent_plist(
     if document.get("StartCalendarInterval") != [
         {"Hour": 15, "Minute": 30},
         {"Hour": 18, "Minute": 30},
+        {"Hour": 20, "Minute": 0},
     ]:
-        raise ValueError("daily sync LaunchAgent schedule is not the approved two-run contract")
+        raise ValueError("daily sync LaunchAgent schedule is not the approved three-run contract")
     document["ProgramArguments"] = [interpreter, "-m", _LAUNCHAGENT_MODULE]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))
