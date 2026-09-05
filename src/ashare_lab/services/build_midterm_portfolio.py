@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
 from typing import Any
 
@@ -72,16 +73,19 @@ from ashare_lab.analytics.multi_timeframe import (
     MultiTimeframeDataError,
     StructureState,
     assess_multi_timeframe,
+    build_completed_timeframes,
     horizon_contract,
 )
+from ashare_lab.services.review_active_holdings import HOLDING_TREE_METHOD_VERSION, _candidate_stop
 
 RESEARCH_DISCLAIMER = (
     "本结果是共同截止日历史数据上的确定性研究筛选。持有期收益下界尚未经过严格的"
     "point-in-time walk-forward、费用、滑点和不可成交验证，不是未来收益预测、上涨概率、"
     "投资建议或最大回撤保证。"
 )
-MIDTERM_METHOD_VERSION = "midterm-maintrend-multitimeframe-v0.7.0"
+MIDTERM_METHOD_VERSION = "midterm-maintrend-multitimeframe-v0.8.0"
 CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS = "partial_multiframe"
+MAX_INITIAL_ENTRY_RISK = 0.08
 
 
 class MidtermPortfolioStatus(StrEnum):
@@ -139,6 +143,18 @@ class ConditionalEntryPlan:
     reduction_review_source_timeframe: str | None = None
     confirmation_activity_metric: str | None = None
     confirmation_activity_min: float | None = None
+    # New plans assess risk from their prospective buy price, never today's
+    # close.  Missing values on legacy archived plans remain unavailable.
+    initial_risk_reference_price: float | None = None
+    initial_risk_fraction: float | None = None
+    maximum_entry_price: float | None = None
+    initial_risk_qualified: bool | None = None
+    initial_risk_reason: str | None = None
+    initial_protection_support: float | None = None
+    initial_protection_atr: float | None = None
+    initial_protection_evidence_date: str | None = None
+    initial_protection_atr_cutoff: str | None = None
+    initial_protection_method_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +185,7 @@ class MidtermCandidate:
     risk_history_reasons: tuple[str, ...] = ()
     risk_history_available_returns: int | None = None
     risk_history_required_returns: int | None = None
+    price_observation_plan: ConditionalEntryPlan | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -564,6 +581,21 @@ def build_midterm_portfolio(
         if raw_candidates
         else []
     )
+    # Freeze the same plan used by the action gate and by the user-facing
+    # shortlist before any actionable portfolio is searched.
+    candidates = [
+        replace(
+            candidate,
+            price_observation_plan=_build_horizon_price_observation_plan(
+                normalized_histories.get(candidate.symbol),
+                cutoff=cutoff,
+                holding_weeks=holding_weeks,
+                timeframe=candidate.timeframe,
+                entry_pattern=_observation_entry_pattern(candidate),
+            ),
+        )
+        for candidate in candidates
+    ]
     candidate_actions = {
         candidate.symbol: _candidate_action(candidate, price_cycle) for candidate in candidates
     }
@@ -1294,6 +1326,13 @@ def _candidate_action(
             "risk_history_unavailable_for_portfolio_weighting",
             *candidate.risk_history_reasons,
         )
+    plan = candidate.price_observation_plan
+    if plan is None:
+        return CandidateAction.OBSERVE_ONLY, ("initial_entry_risk_structure_plan_unavailable",)
+    if plan.initial_risk_qualified is not True:
+        return CandidateAction.OBSERVE_ONLY, (
+            plan.initial_risk_reason or "initial_entry_risk_not_assessed",
+        )
     strictness = EntryStrictness.STANDARD if cycle is None else cycle.policy.entry_strictness
     if not candidate.timeframe.execution_ready:
         action = (
@@ -1422,13 +1461,7 @@ def _build_research_shortlist(
     for rank, candidate in enumerate(selected, start=1):
         action = actions[candidate.symbol][0]
         observation_pattern = _observation_entry_pattern(candidate)
-        price_observation_plan = _build_horizon_price_observation_plan(
-            histories.get(candidate.symbol),
-            cutoff=cutoff,
-            holding_weeks=holding_weeks,
-            timeframe=candidate.timeframe,
-            entry_pattern=observation_pattern,
-        )
+        price_observation_plan = candidate.price_observation_plan
         rows.append(
             MidtermResearchCandidate(
                 rank=rank,
@@ -1469,6 +1502,8 @@ def _build_research_shortlist(
                     price_observation_plan
                     if action is CandidateAction.CONDITIONAL_ENTRY
                     and not candidate.evidence_unknown
+                    and price_observation_plan is not None
+                    and price_observation_plan.initial_risk_qualified is True
                     else None
                 ),
                 observation_stock_sleeve_weight=(
@@ -1546,6 +1581,22 @@ def _build_horizon_price_observation_plan(
         return None
     execution_line = _finite_optional(timeframe.execution.breakout_line)
     primary_structure_line = _finite_optional(timeframe.structure.breakout_line)
+    if not timeframe.structure.qualified or primary_structure_line is None:
+        # A daily trigger cannot manufacture a missing holding-horizon
+        # structure or a protection line simply to satisfy the risk cap.
+        return None
+    try:
+        # The initial line must match the existing holding-review method:
+        # confirmed holding-horizon base support minus its 0.5 ATR buffer,
+        # rounded down to a price tick.  The former breakout-line-minus-ATR
+        # observation line is not a substitute for the actual protection.
+        protection = _candidate_stop(
+            build_completed_timeframes(prepared, as_of=cutoff),
+            timeframe,
+            entry_date=cutoff.date(),
+        )
+    except (MultiTimeframeDataError, ValueError, TypeError, KeyError):
+        return None
     entry_line = execution_line if execution_line is not None else primary_structure_line
     price_source_timeframe = (
         "daily" if execution_line is not None else timeframe.structure.timeframe.value
@@ -1572,7 +1623,7 @@ def _build_horizon_price_observation_plan(
         "price_source_timeframe": price_source_timeframe,
         "primary_structure_timeframe": timeframe.structure.timeframe.value,
         "primary_structure_cutoff": timeframe.structure_bar_cutoff,
-        "invalidation_price": round(max(0.01, risk_reference_line - atr), 4),
+        "invalidation_price": protection.stop,
         "reduction_review_price": round(max(0.01, risk_reference_line - 0.50 * atr), 4),
         "entry_reference_price": round(entry_line, 4),
         "primary_structure_reference_price": (
@@ -1580,35 +1631,98 @@ def _build_horizon_price_observation_plan(
         ),
         "invalidation_source_timeframe": risk_source_timeframe,
         "reduction_review_source_timeframe": risk_source_timeframe,
+        "initial_protection_support": protection.support,
+        "initial_protection_atr": protection.atr14,
+        "initial_protection_evidence_date": protection.evidence_date.isoformat(),
+        "initial_protection_atr_cutoff": protection.atr_cutoff.isoformat(),
+        "initial_protection_method_version": HOLDING_TREE_METHOD_VERSION,
     }
     if entry_pattern is EntryPattern.HEALTHY_PULLBACK:
         reference_label = "日线执行线" if price_source_timeframe == "daily" else "期限主结构线"
-        return ConditionalEntryPlan(
-            kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK,
-            price_low=round(max(0.01, entry_line - 0.25 * atr), 4),
-            price_high=round(entry_line + 0.15 * atr, 4),
-            confirmation_rule=f"回踩{reference_label}附近且完整日线未失效",
-            **common,
+        return _with_initial_entry_risk(
+            ConditionalEntryPlan(
+                kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK,
+                price_low=round(max(0.01, entry_line - 0.25 * atr), 4),
+                price_high=round(entry_line + 0.15 * atr, 4),
+                confirmation_rule=f"回踩{reference_label}附近且完整日线未失效",
+                **common,
+            )
         )
     if entry_pattern is EntryPattern.BREAKOUT_RECLAIM:
-        return ConditionalEntryPlan(
-            kind=ConditionalEntryPlanKind.RECLAIM,
-            trigger_price=round(entry_line + 0.05 * atr, 4),
-            confirmation_rule="完整日线收盘重新站回期限执行线",
-            **common,
+        return _with_initial_entry_risk(
+            ConditionalEntryPlan(
+                kind=ConditionalEntryPlanKind.RECLAIM,
+                trigger_price=round(entry_line + 0.05 * atr, 4),
+                confirmation_rule="完整日线收盘重新站回期限执行线",
+                **common,
+            )
         )
     activity_confirmation = _activity_confirmation_threshold(prepared)
     if activity_confirmation is None:
         return None
     activity_metric, activity_min = activity_confirmation
     activity_label = "成交额" if activity_metric == "amount_cny" else "成交量"
-    return ConditionalEntryPlan(
-        kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
-        trigger_price=round(entry_line + 0.10 * atr, 4),
-        confirmation_activity_metric=activity_metric,
-        confirmation_activity_min=activity_min,
-        confirmation_rule=(f"完整日线收盘越过期限执行线，且{activity_label}达到20日中位数1.2倍"),
-        **common,
+    return _with_initial_entry_risk(
+        ConditionalEntryPlan(
+            kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
+            trigger_price=round(entry_line + 0.10 * atr, 4),
+            confirmation_activity_metric=activity_metric,
+            confirmation_activity_min=activity_min,
+            confirmation_rule=(
+                f"完整日线收盘越过期限执行线，且{activity_label}达到20日中位数1.2倍"
+            ),
+            **common,
+        )
+    )
+
+
+def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan:
+    """Assess a structural stop without moving it to force an eight-percent fit.
+
+    For a range the upper bound is the worst permitted buy price.  For a
+    breakout/reclaim use the frozen trigger.  A higher actual fill requires
+    a fresh check against ``maximum_entry_price``; the cap is a planned price
+    distance, not a guarantee on realizable losses or corporate-action basis.
+    """
+
+    stop = _finite_optional(plan.invalidation_price)
+    is_range = plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK
+    reference = _finite_optional(plan.price_high if is_range else plan.trigger_price)
+    low = _finite_optional(plan.price_low) if is_range else reference
+    maximum = (
+        float(
+            (Decimal(str(stop)) / Decimal("0.92")).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
+        )
+        if stop is not None
+        else None
+    )
+    risk = None if reference is None or stop is None else (reference - stop) / reference
+    if (
+        stop is None
+        or _finite_optional(plan.primary_structure_reference_price) is None
+        or plan.primary_structure_cutoff is None
+        or plan.invalidation_source_timeframe is None
+    ):
+        qualified, reason = False, "initial_entry_risk_structure_unavailable"
+    elif reference is None or low is None or low > reference:
+        qualified, reason = False, "initial_entry_risk_buy_price_unavailable_or_invalid"
+    elif stop >= low:
+        qualified, reason = False, "initial_entry_risk_structure_stop_not_below_buy_price"
+    elif risk is not None and risk > MAX_INITIAL_ENTRY_RISK + 1e-12:
+        qualified, reason = False, "initial_entry_risk_exceeds_8pct_wait_for_better_setup"
+    elif Decimal(str(low)).quantize(Decimal("0.01"), rounding=ROUND_CEILING) > Decimal(
+        str(min(reference, maximum) if is_range else maximum)
+    ).quantize(Decimal("0.01"), rounding=ROUND_FLOOR):
+        qualified, reason = False, "initial_entry_risk_no_executable_price_tick"
+    else:
+        qualified, reason = True, "initial_entry_risk_within_8pct_of_planned_buy_price"
+    return replace(
+        plan,
+        initial_risk_reference_price=reference,
+        initial_risk_fraction=risk,
+        maximum_entry_price=maximum,
+        initial_risk_qualified=qualified,
+        initial_risk_reason=reason,
     )
 
 

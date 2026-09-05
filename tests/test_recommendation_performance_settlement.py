@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 
 import pandas as pd
@@ -15,9 +16,14 @@ from ashare_lab.services.settle_recommendation_performance import (
     CohortNature,
     EntryPlanKind,
     EvaluationMode,
+    HoldingClock,
     MemberSettlementStatus,
     ObservationAnchor,
     VerifiedDailyEvidence,
+    archived_batch_from_mapping,
+    archived_member_from_mapping,
+    calendar_maturity_target,
+    member_performance_record,
     settle_recommendation_performance,
 )
 
@@ -29,6 +35,229 @@ SESSIONS = (
     date(2026, 9, 3),
     date(2026, 9, 4),
 )
+
+
+def test_calendar_anniversary_and_legacy_clock_remain_distinct() -> None:
+    sessions = tuple(pd.bdate_range("2026-08-28", "2026-09-29").date)
+    frame = _frame(
+        {"600001": [(12.0, 13.0, 11.0, 12.0, 1000.0)] * len(sessions)}, sessions=sessions
+    )
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    batch = replace(_action_batch(), holding_weeks=4, holding_sessions=20)
+    evidence = _evidence(frame, sessions=sessions, covered=("600001",))
+    legacy = settle_recommendation_performance(
+        report=_report(), batch=batch, members=[member], evidence=evidence
+    )
+    natural = settle_recommendation_performance(
+        report=_report(),
+        batch=replace(batch, holding_clock=HoldingClock.CALENDAR),
+        members=[member],
+        evidence=evidence,
+    )
+    assert legacy.maturity_date == date(2026, 9, 25)
+    assert natural.maturity_date == date(2026, 9, 28)
+    assert natural.members[0].holding_sessions_observed == 21
+    assert calendar_maturity_target(date(2024, 2, 29), 52) == date(2025, 2, 28)
+    assert calendar_maturity_target(date(2026, 1, 31), 4) == date(2026, 2, 28)
+
+
+def test_calendar_non_session_rolls_forward_and_is_never_settled_early() -> None:
+    sessions = tuple(pd.bdate_range("2026-04-30", "2026-06-01").date)
+    report = replace(_report(), plan_for_date=date(2026, 4, 30), common_cutoff=date(2026, 4, 29))
+    batch = replace(
+        _action_batch(), holding_weeks=4, holding_sessions=20, holding_clock=HoldingClock.CALENDAR
+    )
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    frame = _frame(
+        {"600001": [(12.0, 13.0, 11.0, 12.0, 1000.0)] * len(sessions)}, sessions=sessions
+    )
+    pending = settle_recommendation_performance(
+        report=report,
+        batch=batch,
+        members=[member],
+        evidence=_evidence(frame.iloc[:-1], sessions=sessions[:-1], covered=("600001",)),
+    )
+    assert pending.status is BatchSettlementStatus.PENDING
+    ready = settle_recommendation_performance(
+        report=report,
+        batch=batch,
+        members=[member],
+        evidence=_evidence(frame, sessions=sessions, covered=("600001",)),
+    )
+    assert ready.maturity_date == date(2026, 6, 1)
+
+
+def test_old_archive_defaults_to_unchanged_trading_clock() -> None:
+    row = {
+        "id": "b",
+        "report_id": "r",
+        "holding_weeks": 1,
+        "holding_sessions": 5,
+        "evaluation_mode": "observation_simulation",
+        "cohort_nature": "risk_qualified",
+        "stock_exposure": 0.3,
+    }
+    assert archived_batch_from_mapping(row).holding_clock is HoldingClock.TRADING_SESSIONS
+    assert (
+        archived_batch_from_mapping(
+            {**row, "metadata_json": {"holding_clock": "calendar"}}
+        ).holding_clock
+        is HoldingClock.CALENDAR
+    )
+
+
+@pytest.mark.parametrize("limit,entered", [(None, True), (12.0, True), (11.5, False)])
+def test_frozen_maximum_buy_price_blocks_gap_entry_without_changing_legacy(limit, entered) -> None:
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    member = replace(member, entry_plan=replace(member.entry_plan, maximum_entry_price=limit))
+    frame = _frame({"600001": _bars(plan_close=11.0, entry_open=12.0, maturity_close=15.0)})
+    result = settle_recommendation_performance(
+        report=_report(),
+        batch=_action_batch(),
+        members=[member],
+        evidence=_evidence(frame, covered=("600001",)),
+    )
+    row = result.members[0]
+    assert row.condition_triggered is True
+    assert row.entry_price == (12.0 if entered else None)
+    assert result.simulated_action_stock_sleeve_return == pytest.approx(0.25 if entered else 0.0)
+    assert result.stock_sleeve_cash_weight == (0.0 if entered else 1.0)
+    assert result.status is (
+        BatchSettlementStatus.SETTLED if entered else BatchSettlementStatus.NO_ENTRY
+    )
+    if not entered:
+        assert row.status is MemberSettlementStatus.ENTRY_PRICE_LIMIT_EXCEEDED
+        assert row.reason_code == "entry_price_limit_exceeded"
+        assert row.entry_date is None
+    details = member_performance_record(row)["details_json"]
+    assert details["maximum_entry_price"] == limit
+    assert details["entry_execution_rule_version"] == (
+        "legacy-next-open-v1" if limit is None else "archived-entry-price-bounds-v1"
+    )
+
+
+@pytest.mark.parametrize(
+    "open_price,cap,entered",
+    [(7.99, 12.0, False), (8.0, 12.0, False), (8.01, 12.0, True), (7.99, None, True)],
+)
+def test_new_plan_cannot_enter_at_or_below_frozen_stop_but_legacy_is_unchanged(
+    open_price, cap, entered
+) -> None:
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    member = replace(member, entry_plan=replace(member.entry_plan, maximum_entry_price=cap))
+    frame = _frame({"600001": _bars(plan_close=11.0, entry_open=open_price, maturity_close=15.0)})
+    result = settle_recommendation_performance(
+        report=_report(),
+        batch=_action_batch(),
+        members=[member],
+        evidence=_evidence(frame, covered=("600001",)),
+    )
+    row = result.members[0]
+    assert row.condition_triggered is True
+    assert row.entry_price == (open_price if entered else None)
+    assert result.simulated_action_stock_sleeve_return == pytest.approx(
+        (15.0 / open_price - 1) if entered else 0.0
+    )
+    assert result.account_cash_weight == (0.5 if entered else 1.0)
+    if not entered:
+        assert row.status is MemberSettlementStatus.ENTRY_INVALIDATED_BEFORE_FILL
+        assert row.entry_date is None
+    assert member_performance_record(row)["details_json"][
+        "legacy_entry_execution_compatibility"
+    ] is (cap is None)
+
+
+def test_invalidated_open_before_maturity_remains_pending_cash() -> None:
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    member = replace(member, entry_plan=replace(member.entry_plan, maximum_entry_price=12.0))
+    frame = _frame({"600001": _bars(plan_close=11.0, entry_open=7.5, maturity_close=15.0)})
+    result = settle_recommendation_performance(
+        report=_report(),
+        batch=_action_batch(),
+        members=[member],
+        evidence=_evidence(frame.iloc[:2], sessions=SESSIONS[:2], covered=("600001",)),
+    )
+    assert result.status is BatchSettlementStatus.PENDING
+    assert result.members[0].reason_code == "entry_invalidated_before_fill"
+    assert result.members[0].entry_price is None
+    assert result.account_cash_weight == 1.0
+
+
+@pytest.mark.parametrize(
+    "stop,cap",
+    [
+        (None, 12.0),
+        (float("nan"), 12.0),
+        (8.0, float("inf")),
+        (8.0, float("nan")),
+        (12.0, 12.0),
+        (13.0, 12.0),
+    ],
+)
+def test_new_entry_contract_requires_two_finite_strictly_ordered_bounds(stop, cap) -> None:
+    member = _reclaim_member(member_id="m", symbol="600001", trigger=10.0, sleeve=1.0)
+    member = replace(
+        member,
+        entry_plan=replace(member.entry_plan, invalidation_price=stop, maximum_entry_price=cap),
+    )
+    frame = _frame({"600001": _bars(plan_close=11.0, entry_open=12.0, maturity_close=15.0)})
+    result = settle_recommendation_performance(
+        report=_report(),
+        batch=_action_batch(),
+        members=[member],
+        evidence=_evidence(frame, covered=("600001",)),
+    )
+    assert result.members[0].status is MemberSettlementStatus.ENTRY_RULE_INCOMPLETE
+    assert result.members[0].entry_price is None
+
+
+def test_gap_rejected_weight_is_not_redistributed_to_other_entered_stock() -> None:
+    first = _reclaim_member(member_id="m1", symbol="600001", trigger=10.0, sleeve=0.6)
+    first = replace(first, entry_plan=replace(first.entry_plan, maximum_entry_price=11.5))
+    second = _reclaim_member(member_id="m2", symbol="600002", trigger=20.0, sleeve=0.4)
+    frame = _frame(
+        {
+            "600001": _bars(plan_close=11.0, entry_open=12.0, maturity_close=15.0),
+            "600002": _bars(plan_close=20.0, entry_open=21.0, maturity_close=24.0),
+        }
+    )
+    result = settle_recommendation_performance(
+        report=_report(), batch=_action_batch(), members=[first, second], evidence=_evidence(frame)
+    )
+    assert result.status is BatchSettlementStatus.SETTLED_PARTIAL_ENTRY
+    assert result.simulated_action_stock_sleeve_return == pytest.approx(0.4 * (24 / 21 - 1))
+    assert result.stock_sleeve_cash_weight == pytest.approx(0.6)
+    assert result.account_cash_weight == pytest.approx(0.8)
+
+
+def test_archived_maximum_buy_price_is_optional_and_invalid_cap_fails_closed() -> None:
+    row = {
+        "id": "m",
+        "batch_id": "batch-1w-action",
+        "symbol": "600001",
+        "stock_sleeve_weight": 1.0,
+        "account_weight": 0.5,
+        "reference_price": 10.0,
+        "entry_plan_json": {
+            "kind": "reclaim_close_confirmation",
+            "trigger_price": 10.0,
+            "invalidation_price": 8.0,
+        },
+    }
+    legacy = archived_member_from_mapping(row)
+    assert legacy.entry_plan.maximum_entry_price is None
+    invalid = archived_member_from_mapping(
+        {**row, "entry_plan_json": {**row["entry_plan_json"], "maximum_entry_price": -1.0}}
+    )
+    frame = _frame({"600001": _bars(plan_close=11.0, entry_open=12.0, maturity_close=15.0)})
+    result = settle_recommendation_performance(
+        report=_report(),
+        batch=_action_batch(),
+        members=[invalid],
+        evidence=_evidence(frame, covered=("600001",)),
+    )
+    assert result.members[0].status is MemberSettlementStatus.ENTRY_RULE_INCOMPLETE
+    assert result.members[0].entry_price is None
 
 
 def _report(*, reconstructed: bool = False) -> ArchivedRecommendationReport:

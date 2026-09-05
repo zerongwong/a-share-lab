@@ -25,11 +25,12 @@ does not silently become a zero return.
 
 from __future__ import annotations
 
+import calendar
 import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from enum import StrEnum
 from typing import Literal
 
@@ -65,6 +66,11 @@ class EvaluationMode(StrEnum):
     RECONSTRUCTED_OBSERVATION = "reconstructed_observation"
 
 
+class HoldingClock(StrEnum):
+    TRADING_SESSIONS = "trading_sessions"
+    CALENDAR = "calendar"
+
+
 class EntryPlanKind(StrEnum):
     HEALTHY_PULLBACK = "healthy_pullback_range"
     RECLAIM = "reclaim_close_confirmation"
@@ -80,6 +86,8 @@ class MemberSettlementStatus(StrEnum):
     PENDING = "pending_maturity_session"
     SETTLED = "settled"
     EXPIRED_UNTRIGGERED = "expired_untriggered"
+    ENTRY_PRICE_LIMIT_EXCEEDED = "entry_price_limit_exceeded"
+    ENTRY_INVALIDATED_BEFORE_FILL = "entry_invalidated_before_fill"
     ARCHIVE_INELIGIBLE = "archive_ineligible"
     ENTRY_RULE_INCOMPLETE = "entry_rule_incomplete"
     SOURCE_ADJUSTMENT_INVALID = "source_adjustment_invalid"
@@ -124,6 +132,7 @@ class ArchivedRecommendationBatch:
     evaluation_mode: EvaluationMode
     cohort_nature: CohortNature
     stock_exposure: float | None
+    holding_clock: HoldingClock = HoldingClock.TRADING_SESSIONS
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +149,7 @@ class ArchivedEntryPlan:
     # Read compatibility for archives created before activity metric names
     # were frozen.  New archives never write this volume-only field.
     confirmation_volume_min: float | None = None
+    maximum_entry_price: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +211,8 @@ class RecommendationMemberPerformance:
     reason_code: str
     method_version: str = PERFORMANCE_METHOD_VERSION
     raw_unadjusted_price_change: float | None = None
+    maximum_entry_price: float | None = None
+    entry_execution_rule_version: str = "legacy-next-open-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +240,7 @@ class RecommendationBatchPerformance:
     method_version: str = PERFORMANCE_METHOD_VERSION
     raw_unadjusted_stock_sleeve_change: float | None = None
     raw_unadjusted_account_change: float | None = None
+    holding_clock: HoldingClock = HoldingClock.TRADING_SESSIONS
 
 
 def archived_report_from_mapping(row: Mapping[str, object]) -> ArchivedRecommendationReport:
@@ -247,6 +260,11 @@ def archived_batch_from_mapping(row: Mapping[str, object]) -> ArchivedRecommenda
     """Adapt a stored horizon batch while preserving the immutable session count."""
 
     stock_exposure = _optional_float(_first_present(row, "stock_exposure", "action_stock_exposure"))
+    metadata = row.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        metadata = json.loads(metadata)
+    if not isinstance(metadata, Mapping):
+        raise ValueError("batch metadata must be an object")
     return ArchivedRecommendationBatch(
         batch_id=str(_required(row, "batch_id", "id")),
         report_id=str(_required(row, "report_id")),
@@ -255,6 +273,7 @@ def archived_batch_from_mapping(row: Mapping[str, object]) -> ArchivedRecommenda
         evaluation_mode=EvaluationMode(str(_required(row, "evaluation_mode"))),
         cohort_nature=CohortNature(str(_required(row, "cohort_nature"))),
         stock_exposure=stock_exposure,
+        holding_clock=HoldingClock(str(metadata.get("holding_clock", "trading_sessions"))),
     )
 
 
@@ -325,6 +344,9 @@ def member_performance_record(
             ),
             "simulated_action_account_contribution": (result.simulated_action_account_contribution),
             "raw_unadjusted_price_change": result.raw_unadjusted_price_change,
+            "maximum_entry_price": result.maximum_entry_price,
+            "entry_execution_rule_version": result.entry_execution_rule_version,
+            "legacy_entry_execution_compatibility": result.maximum_entry_price is None,
         },
     }
 
@@ -355,6 +377,8 @@ def batch_performance_record(
             "cohort_nature": result.cohort_nature.value,
             "holding_weeks": result.holding_weeks,
             "holding_sessions": result.holding_sessions,
+            "holding_clock": result.holding_clock.value,
+            "performance_basis": "fixed_horizon_price_simulation_not_dynamic_holding_returns",
             "simulated_action_stock_sleeve_return": (result.simulated_action_stock_sleeve_return),
             "simulated_action_account_return": result.simulated_action_account_return,
             "stock_sleeve_cash_weight": result.stock_sleeve_cash_weight,
@@ -395,6 +419,8 @@ _FATAL_MEMBER_STATUSES = frozenset(
         MemberSettlementStatus.PENDING,
         MemberSettlementStatus.SETTLED,
         MemberSettlementStatus.EXPIRED_UNTRIGGERED,
+        MemberSettlementStatus.ENTRY_PRICE_LIMIT_EXCEEDED,
+        MemberSettlementStatus.ENTRY_INVALIDATED_BEFORE_FILL,
     }
 )
 
@@ -408,10 +434,12 @@ def settle_recommendation_performance(
 ) -> RecommendationBatchPerformance:
     """Settle one immutable horizon batch without reading or writing state.
 
-    Maturity is session based.  If ``plan_for_date`` is session index ``i``,
+    Legacy maturity is session based. If ``plan_for_date`` is session index ``i``,
     both supported modes mature at ``i + holding_sessions``.  For action
     simulation, a confirmed plan enters at session ``i + 1`` open, making the
-    maturity close the Nth holding-session close.
+    maturity close the Nth holding-session close. Explicit calendar archives
+    use the calendar anniversary, rolling non-sessions forward without changing
+    the archived clock or legacy session counts.
     """
 
     normalized_members = tuple(members)
@@ -447,10 +475,7 @@ def settle_recommendation_performance(
             status=MemberSettlementStatus.PLAN_SESSION_MISSING,
         )
 
-    maturity_index = plan_index + batch.holding_sessions
-    maturity_date = (
-        prepared.sessions[maturity_index] if maturity_index < len(prepared.sessions) else None
-    )
+    maturity_date = _maturity_date(report, batch, prepared.sessions, plan_index)
     member_results = tuple(
         _settle_member(
             report=report,
@@ -469,6 +494,29 @@ def settle_recommendation_performance(
         maturity_date=maturity_date,
         data_cutoff=data_cutoff,
     )
+
+
+def calendar_maturity_target(plan_date: date, holding_weeks: int) -> date:
+    """Calendar anniversaries clamp month-end, then execution rolls forward."""
+
+    if holding_weeks in (1, 2):
+        return plan_date + timedelta(days=holding_weeks * 7)
+    months = {4: 1, 13: 3, 26: 6, 52: 12}.get(holding_weeks)
+    if months is None:
+        raise ValueError("unsupported calendar horizon")
+    month_index = plan_date.year * 12 + plan_date.month - 1 + months
+    year, month_zero = divmod(month_index, 12)
+    month = month_zero + 1
+    day = min(plan_date.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _maturity_date(report, batch, sessions, plan_index) -> date | None:
+    if batch.holding_clock is HoldingClock.CALENDAR:
+        target = calendar_maturity_target(report.plan_for_date, batch.holding_weeks)
+        return next((session for session in sessions if session >= target), None)
+    index = plan_index + batch.holding_sessions
+    return sessions[index] if index < len(sessions) else None
 
 
 def _validate_archive(
@@ -709,6 +757,37 @@ def _settle_action_member(
             entry_failure,
             entry_date=entry_date,
         )
+    execution_block = None
+    if plan.maximum_entry_price is not None:
+        if float(entry_read.value) > plan.maximum_entry_price:
+            execution_block = MemberSettlementStatus.ENTRY_PRICE_LIMIT_EXCEEDED
+        elif float(entry_read.value) <= float(plan.invalidation_price):
+            execution_block = MemberSettlementStatus.ENTRY_INVALIDATED_BEFORE_FILL
+    if execution_block is not None:
+        # Confirmation and execution are separate: a gap beyond either frozen
+        # entry bound leaves this allocation in cash, without a later intraday
+        # fill being inferred from OHLC data. Legacy plans retain their clock
+        # and execution rules when no maximum-entry contract was archived.
+        if maturity_date is None:
+            return _member_result(
+                report=report,
+                batch=batch,
+                member=member,
+                status=MemberSettlementStatus.PENDING,
+                published_reference_price=member.reference_price,
+                condition_triggered=True,
+                reason_code=execution_block.value,
+            )
+        return _complete_member(
+            report=report,
+            batch=batch,
+            member=member,
+            prepared=prepared,
+            published_reference_price=float(member.reference_price),
+            maturity_date=maturity_date,
+            condition_triggered=True,
+            execution_block=execution_block,
+        )
     if maturity_date is None:
         return _member_result(
             report=report,
@@ -787,6 +866,7 @@ def _complete_member(
     condition_triggered: bool | None,
     simulated_entry_date: date | None = None,
     simulated_entry_price: float | None = None,
+    execution_block: MemberSettlementStatus | None = None,
 ) -> RecommendationMemberPerformance:
     symbol = normalize_symbol(member.symbol)
     maturity_read = _read_price(prepared, symbol, maturity_date, "close")
@@ -849,7 +929,9 @@ def _complete_member(
         else float(maturity_read.value) / simulated_entry_price - 1.0
     )
     status = (
-        MemberSettlementStatus.EXPIRED_UNTRIGGERED
+        execution_block
+        if execution_block is not None
+        else MemberSettlementStatus.EXPIRED_UNTRIGGERED
         if condition_triggered is False
         else MemberSettlementStatus.SETTLED
     )
@@ -882,7 +964,9 @@ def _complete_member(
             if simulated_return is None or member.operational_account_weight is None
             else member.operational_account_weight * simulated_return
         ),
-        holding_sessions_observed=batch.holding_sessions,
+        holding_sessions_observed=sum(
+            report.plan_for_date < session <= maturity_date for session in prepared.sessions
+        ),
         company_action_clear=True,
         reason_code=status.value,
         raw_unadjusted_price_change=raw_price_change,
@@ -894,6 +978,16 @@ def _entry_plan_complete(plan: ArchivedEntryPlan) -> bool:
         return False
     if plan.invalidation_price is not None and not _valid_positive(plan.invalidation_price):
         return False
+    if plan.maximum_entry_price is not None:
+        if not _valid_positive(plan.maximum_entry_price) or not _valid_positive(
+            plan.invalidation_price
+        ):
+            return False
+        if (
+            plan.invalidation_price is not None
+            and plan.maximum_entry_price <= plan.invalidation_price
+        ):
+            return False
     if plan.kind is EntryPlanKind.HEALTHY_PULLBACK:
         return (
             _valid_positive(plan.price_low)
@@ -1093,7 +1187,12 @@ def _aggregate_batch(
             result
             for result in member_results
             if result.status
-            in {MemberSettlementStatus.SETTLED, MemberSettlementStatus.EXPIRED_UNTRIGGERED}
+            in {
+                MemberSettlementStatus.SETTLED,
+                MemberSettlementStatus.EXPIRED_UNTRIGGERED,
+                MemberSettlementStatus.ENTRY_PRICE_LIMIT_EXCEEDED,
+                MemberSettlementStatus.ENTRY_INVALIDATED_BEFORE_FILL,
+            }
         ]
         settled = [
             result for result in evaluated if result.status is MemberSettlementStatus.SETTLED
@@ -1101,7 +1200,12 @@ def _aggregate_batch(
         untriggered = [
             result
             for result in member_results
-            if result.status is MemberSettlementStatus.EXPIRED_UNTRIGGERED
+            if result.status
+            in {
+                MemberSettlementStatus.EXPIRED_UNTRIGGERED,
+                MemberSettlementStatus.ENTRY_PRICE_LIMIT_EXCEEDED,
+                MemberSettlementStatus.ENTRY_INVALIDATED_BEFORE_FILL,
+            }
         ]
         stock_sleeve_return = sum(float(result.stock_sleeve_contribution) for result in evaluated)
         account_return = (
@@ -1134,11 +1238,11 @@ def _aggregate_batch(
         if result.status in {MemberSettlementStatus.SETTLED, MemberSettlementStatus.PENDING}
         and result.entry_price is not None
     ]
-    entered_sleeve = sum(result.operational_stock_sleeve_weight for result in entered)
+    entered_sleeve = _unit_weight_sum(result.operational_stock_sleeve_weight for result in entered)
     entered_account = (
         None
         if any(result.operational_account_weight is None for result in entered)
-        else sum(float(result.operational_account_weight) for result in entered)
+        else _unit_weight_sum(float(result.operational_account_weight) for result in entered)
     )
     cash_is_meaningful = batch.evaluation_mode is EvaluationMode.ACTION_SIMULATION
     return RecommendationBatchPerformance(
@@ -1168,7 +1272,17 @@ def _aggregate_batch(
         reason_code=reason_code,
         raw_unadjusted_stock_sleeve_change=raw_stock_sleeve_change,
         raw_unadjusted_account_change=raw_account_change,
+        holding_clock=batch.holding_clock,
     )
+
+
+def _unit_weight_sum(values) -> float:
+    """Remove only boundary-sized roundoff; reject materially invalid exposure."""
+
+    total = math.fsum(values)
+    if not math.isfinite(total) or total < -1e-8 or total > 1.0 + 1e-8:
+        raise ValueError("aggregate allocation weight is outside [0, 1]")
+    return min(1.0, max(0.0, total))
 
 
 def _pending_batch(
@@ -1297,6 +1411,14 @@ def _member_result(
         holding_sessions_observed=holding_sessions_observed,
         company_action_clear=company_action_clear,
         reason_code=reason_code,
+        maximum_entry_price=(
+            None if member.entry_plan is None else member.entry_plan.maximum_entry_price
+        ),
+        entry_execution_rule_version=(
+            "archived-entry-price-bounds-v1"
+            if member.entry_plan is not None and member.entry_plan.maximum_entry_price is not None
+            else "legacy-next-open-v1"
+        ),
     )
 
 
@@ -1354,6 +1476,7 @@ def _entry_plan_from_payload(value: object) -> ArchivedEntryPlan | None:
         confirmation_activity_metric=_optional_text(payload.get("confirmation_activity_metric")),
         confirmation_activity_min=_optional_float(payload.get("confirmation_activity_min")),
         confirmation_volume_min=_optional_float(payload.get("confirmation_volume_min")),
+        maximum_entry_price=_optional_float(payload.get("maximum_entry_price")),
     )
 
 

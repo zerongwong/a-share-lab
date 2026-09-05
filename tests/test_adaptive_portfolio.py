@@ -12,6 +12,8 @@ from ashare_lab.analytics.adaptive_portfolio import (
     AdaptiveCandidate,
     AdaptivePortfolioDataError,
     AdaptiveRiskBudget,
+    _fixed_share_daily_returns,
+    _fixed_share_rolling_drawdown_magnitudes,
     evaluate_adaptive_portfolio,
     evaluate_operational_adaptive_portfolio,
     optimize_adaptive_portfolio,
@@ -376,14 +378,24 @@ def test_metrics_match_the_documented_formulas() -> None:
     weights = np.asarray([position.weight for position in result.positions])
     exact_target = np.asarray([weight for _symbol, weight in result.exact_target_weights])
     assert not np.array_equal(weights, exact_target)
-    daily_portfolio = returns @ weights
+    blocks = returns.reshape(13, 20, 4)
+    account_equity = 1.0 - weights.sum() + np.cumprod(1.0 + blocks, axis=1) @ weights
+    prior_equity = np.concatenate((np.ones((13, 1)), account_equity[:, :-1]), axis=1)
+    daily_portfolio = (account_equity / prior_equity - 1.0).reshape(-1)
 
     expected_downside_volatility = np.sqrt(
         np.mean(np.square(np.minimum(daily_portfolio, 0.0)))
     ) * np.sqrt(252)
     drawdowns = []
     for start in range(len(daily_portfolio) - 60 + 1):
-        equity = np.concatenate(([1.0], np.cumprod(1.0 + daily_portfolio[start : start + 60])))
+        equity = np.concatenate(
+            (
+                [1.0],
+                1.0
+                - weights.sum()
+                + np.cumprod(1.0 + returns[start : start + 60], axis=0) @ weights,
+            )
+        )
         drawdowns.append(max(0.0, -float((equity / np.maximum.accumulate(equity) - 1).min())))
 
     five_day_blocks = returns.reshape(52, 5, 4)
@@ -438,13 +450,14 @@ def test_horizon_rolling_drawdown_uses_each_holding_window(
     ordered = tuple(sorted(candidates, key=lambda item: item.symbol))
     returns = np.column_stack([item.returns.to_numpy() for item in ordered])
     weights = np.asarray([position.weight for position in result.positions])
-    daily_portfolio = returns @ weights
     expected_drawdowns = []
     for start in range(periods - holding_sessions + 1):
         equity = np.concatenate(
             (
                 [1.0],
-                np.cumprod(1.0 + daily_portfolio[start : start + holding_sessions]),
+                1.0
+                - weights.sum()
+                + np.cumprod(1.0 + returns[start : start + holding_sessions], axis=0) @ weights,
             )
         )
         expected_drawdowns.append(
@@ -462,6 +475,31 @@ def test_horizon_rolling_drawdown_uses_each_holding_window(
     assert result.risk_budget.rolling_drawdown_passed == (
         result.risk_budget.horizon_rolling_drawdown_passed
     )
+
+
+def test_fixed_share_drawdown_keeps_appreciated_position_and_cash_until_window_end() -> None:
+    # At the high, the winning stock has grown beyond its original 40% weight.
+    # Selling it back to 40% every day would understate the subsequent loss.
+    returns = np.column_stack(
+        (np.r_[np.full(10, 0.10), np.full(10, -0.05)], np.zeros(20), np.zeros(20))
+    )
+    weights = np.array([0.40, 0.20, 0.20])
+    result = _fixed_share_rolling_drawdown_magnitudes(returns, weights, 20)
+    peak = 0.60 + 0.40 * 1.10**10
+    ending = 0.60 + 0.40 * 1.10**10 * 0.95**10
+    assert result[0] == pytest.approx(1.0 - ending / peak)
+    assert result[0] == pytest.approx(0.25423510357847)
+    daily = _fixed_share_daily_returns(returns, weights, 20)
+    assert np.prod(1.0 + daily) == pytest.approx(ending)
+    assert result[0] > 1.0 - 0.98**10  # the wrong daily-rebalanced drawdown
+
+
+def test_fixed_share_daily_path_resets_only_at_explicit_holding_block_boundaries() -> None:
+    returns = np.tile(np.array([[0.10, 0.0], [-0.05, 0.0]]), (3, 1))
+    weights = np.array([0.50, 0.25])
+    daily = _fixed_share_daily_returns(returns, weights, sessions=2)
+    expected = np.array([0.05, (0.5 + 0.5 * 1.1 * 0.95) / 1.05 - 1.0])
+    assert daily == pytest.approx(np.tile(expected, 3))
 
 
 def test_legacy_60_day_drawdown_is_report_only_while_horizon_budget_binds() -> None:

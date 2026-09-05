@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -16,11 +17,13 @@ from ashare_lab.analytics.multi_timeframe import (
     ExecutionState,
     StructureState,
     assess_multi_timeframe,
+    build_completed_timeframes,
 )
 from ashare_lab.services.build_midterm_portfolio import (
     CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS,
     HOLDING_PERIOD_SESSIONS,
     CandidateAction,
+    ConditionalEntryPlan,
     ConditionalEntryPlanKind,
     MidtermPortfolioStatus,
     _build_horizon_price_observation_plan,
@@ -32,9 +35,11 @@ from ashare_lab.services.build_midterm_portfolio import (
     _select_observation_portfolio,
     _select_stock_count,
     _viable_sort_key,
+    _with_initial_entry_risk,
     build_midterm_portfolio,
     horizon_history_requirements,
 )
+from ashare_lab.services.review_active_holdings import _candidate_stop
 
 
 def test_observation_pattern_never_falls_back_to_legacy_sixty_day_entry() -> None:
@@ -76,6 +81,143 @@ def test_horizon_plan_separates_daily_entry_from_primary_structure_risk_line() -
         timeframe.structure.breakout_line
     )
     assert "日线执行线" in (plan.confirmation_rule or "")
+    actual_initial_stop = _candidate_stop(
+        build_completed_timeframes(frame, as_of=cutoff), timeframe, entry_date=cutoff.date()
+    )
+    assert plan.invalidation_price == actual_initial_stop.stop
+    assert plan.initial_protection_support == actual_initial_stop.support
+    assert plan.initial_protection_atr == actual_initial_stop.atr14
+    assert plan.initial_protection_evidence_date == actual_initial_stop.evidence_date.isoformat()
+    assert plan.initial_protection_atr_cutoff == actual_initial_stop.atr_cutoff.isoformat()
+
+
+def _risk_plan(*, stop: float | None = 92.0, kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT):
+    return ConditionalEntryPlan(
+        kind=kind,
+        data_cutoff=pd.Timestamp("2026-09-04"),
+        horizon="一周",
+        sessions=5,
+        trigger_price=100.0,
+        price_low=99.0 if kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK else None,
+        price_high=100.0 if kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK else None,
+        entry_reference_price=80.0,  # This is not the prospective buy price.
+        primary_structure_reference_price=94.0,
+        primary_structure_cutoff=pd.Timestamp("2026-09-04"),
+        invalidation_price=stop,
+        invalidation_source_timeframe="daily",
+    )
+
+
+@pytest.mark.parametrize("kind", tuple(ConditionalEntryPlanKind))
+@pytest.mark.parametrize("stop,qualified", ((92.0001, True), (92.0, True), (91.9999, False)))
+def test_initial_risk_cap_uses_prospective_trigger_or_range_upper_bound(
+    kind: ConditionalEntryPlanKind, stop: float, qualified: bool
+) -> None:
+    original = _risk_plan(stop=stop, kind=kind)
+    plan = _with_initial_entry_risk(original)
+    assert plan.initial_risk_reference_price == 100.0
+    assert plan.initial_risk_fraction == pytest.approx((100.0 - stop) / 100.0)
+    assert plan.initial_risk_qualified is qualified
+    assert plan.invalidation_price == original.invalidation_price
+    assert original.initial_risk_qualified is None
+    if stop == 92.0:
+        assert plan.maximum_entry_price == 100.0
+
+
+@pytest.mark.parametrize(
+    "updates,reason",
+    (
+        ({"invalidation_price": None}, "structure_unavailable"),
+        ({"primary_structure_reference_price": None}, "structure_unavailable"),
+        ({"primary_structure_cutoff": None}, "structure_unavailable"),
+        ({"trigger_price": None}, "buy_price_unavailable_or_invalid"),
+        ({"invalidation_price": 100.0}, "structure_stop_not_below_buy_price"),
+    ),
+)
+def test_initial_risk_missing_or_inverted_structure_is_not_invented(updates, reason) -> None:
+    plan = _with_initial_entry_risk(replace(_risk_plan(), **updates))
+    assert plan.initial_risk_qualified is False
+    assert reason in plan.initial_risk_reason
+
+
+def test_initial_risk_does_not_allow_a_trigger_without_an_executable_cent_tick() -> None:
+    plan = _with_initial_entry_risk(replace(_risk_plan(stop=92.001), trigger_price=100.001))
+    assert plan.initial_risk_fraction < 0.08
+    assert plan.maximum_entry_price < 100.01
+    assert not plan.initial_risk_qualified
+    assert plan.initial_risk_reason == "initial_entry_risk_no_executable_price_tick"
+
+
+def test_range_stop_must_be_below_the_entire_entry_range() -> None:
+    plan = _with_initial_entry_risk(
+        replace(_risk_plan(kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK), price_low=91.0)
+    )
+    assert not plan.initial_risk_qualified
+    assert plan.initial_risk_reason == "initial_entry_risk_structure_stop_not_below_buy_price"
+
+
+def test_horizon_plan_cannot_use_daily_trigger_to_invent_a_missing_primary_structure() -> None:
+    frame = _breakout_history(77)
+    cutoff = pd.Timestamp(frame.iloc[-1]["trade_date"]).normalize()
+    timeframe = assess_multi_timeframe(frame, as_of=cutoff, holding_weeks=13)
+    missing = replace(timeframe, structure=replace(timeframe.structure, breakout_line=None))
+    assert (
+        _build_horizon_price_observation_plan(
+            frame,
+            cutoff=cutoff,
+            holding_weeks=13,
+            timeframe=missing,
+            entry_pattern=EntryPattern.VOLUME_BREAKOUT,
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("holding_weeks", (1, 2, 4, 13, 26, 52))
+def test_all_horizon_action_pools_reject_structural_risk_above_eight_percent(
+    monkeypatch, holding_weeks: int
+) -> None:
+    import importlib
+
+    module = importlib.import_module("ashare_lab.services.build_midterm_portfolio")
+    actual_stop = module._candidate_stop
+
+    def distant_structure(*args, **kwargs):
+        protection = actual_stop(*args, **kwargs)
+        return replace(protection, stop=protection.stop * 0.5)
+
+    monkeypatch.setattr(module, "_candidate_stop", distant_structure)
+    histories, metadata = _universe()
+    sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
+    periods = max(620, sessions * 8 + 1)
+    if periods > 620:
+        histories = {
+            symbol: _breakout_history(index + 201, periods=periods)
+            for index, symbol in enumerate(histories)
+        }
+    first = next(iter(histories.values()))
+    result = build_midterm_portfolio(
+        histories,
+        metadata,
+        as_of=first.iloc[-1]["trade_date"],
+        holding_weeks=holding_weeks,
+        market_index_histories=_uptrend_indices(first["trade_date"]),
+        risk_budget=_loose_budget(holding_sessions=sessions),
+        minimum_historical_return_lcb=-1.0,
+        candidate_pool_size=8,
+        beam_width=8,
+        minimum_universe_size=3,
+    )
+    assert result.research_candidates
+    assert not result.positions
+    assert result.actionable_candidate_count == 0
+    assert result.stock_exposure == 0.0
+    for candidate in result.research_candidates:
+        plan = candidate.price_observation_plan
+        assert plan is not None and plan.initial_risk_fraction > 0.08
+        assert candidate.action is CandidateAction.OBSERVE_ONLY
+        assert candidate.conditional_entry_plan is None
+        assert "initial_entry_risk_exceeds_8pct_wait_for_better_setup" in candidate.action_reasons
 
 
 def _breakout_history(seed: int, *, periods: int = 620, downtrend: bool = False) -> pd.DataFrame:

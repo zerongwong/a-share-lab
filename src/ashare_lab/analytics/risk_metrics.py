@@ -11,7 +11,9 @@ def max_drawdown(returns: pd.Series) -> float:
     if clean.empty:
         return float("nan")
     equity = (1 + clean).cumprod()
-    drawdown = equity / equity.cummax() - 1
+    # The initial investment is a peak too: a loss on the first observation
+    # must not disappear from the drawdown history.
+    drawdown = equity / equity.cummax().clip(lower=1.0) - 1
     return float(drawdown.min())
 
 
@@ -30,7 +32,9 @@ def risk_metrics(returns: pd.Series, *, annual_sessions: int = 252) -> dict[str,
         if clean.std(ddof=1)
         else float("nan")
     )
-    downside = clean[clean < 0].std(ddof=1)
+    # Zero-target downside deviation includes every observation in the
+    # denominator.  Dispersion *among* negative returns is not downside risk.
+    downside = float(np.sqrt(np.mean(np.square(np.minimum(clean, 0.0)))))
     sortino = (
         float(clean.mean() / downside * math.sqrt(annual_sessions))
         if downside and not np.isnan(downside)

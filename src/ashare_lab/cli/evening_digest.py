@@ -86,6 +86,7 @@ _LOG_BACKUPS = 5
 _TRADING_CALENDAR_LOOKAHEAD_DAYS = 14
 _HOLDING_CHART_CHANNELS = frozenset({"serverchan"})
 _HOLDING_CHART_MAX_URL_TTL_SECONDS = 3_600
+_MAX_CHART_ATTEMPTS = 4
 _NOTIFICATION_CHANNELS_ENV = "ASHARE_EVENING_NOTIFICATION_CHANNELS"
 _SUPPORTED_NOTIFICATION_CHANNELS = ("serverchan", "bark")
 _LOG_EVENT_KEYS = (
@@ -103,6 +104,10 @@ _LOG_EVENT_KEYS = (
     "delivery_confirmed",
     "raw_data_exposed",
     "orders_enabled",
+    "chart_status",
+    "chart_reason",
+    "chart_attempts",
+    "text_already_accepted",
 )
 
 
@@ -170,6 +175,7 @@ def run_evening_digest(
     _build_holding_review: HoldingReviewBuilder = build_evening_holding_review,
     _build_holding_chart_report: HoldingChartBuilder = build_holding_chart_report,
     _holding_chart_publisher: HoldingChartPublisher | None = None,
+    _clock: Callable[[], datetime] | None = None,
 ) -> EveningDigestOutcome:
     """Build/send once per verified common cutoff; never place an order."""
 
@@ -197,7 +203,11 @@ def run_evening_digest(
             .expanduser()
             .resolve()
         )
-        target_date = decision_date or datetime.now(_SHANGHAI).date()
+        now = (_clock or (lambda: datetime.now(_SHANGHAI)))()
+        if now.tzinfo is None:
+            raise ValueError("evening clock must be timezone aware")
+        now = now.astimezone(_SHANGHAI)
+        target_date = decision_date or now.date()
         if not isinstance(target_date, date):
             raise TypeError("decision_date must be a date")
     except (OSError, TypeError, ValueError):
@@ -233,6 +243,8 @@ def run_evening_digest(
                 _event("noop_weekend_send_window_closed"),
             )
         )
+    if now.hour != 21:
+        return finish(EveningDigestOutcome(EXIT_OK, _event("noop_outside_evening_window")))
 
     try:
         with daily_update_lock(lock_path) as acquired:
@@ -247,7 +259,18 @@ def run_evening_digest(
             prior_state = _read_state(state_path)
             last_sent = _state_cutoff(prior_state)
             latest = latest_reader(resolved_overlay)
-            if latest is not None and last_sent is not None and latest <= last_sent:
+            retry_chart = (
+                prior_state.get("chart_status") == "pending"
+                and int(prior_state.get("chart_attempts", 0)) < _MAX_CHART_ATTEMPTS
+                and _state_plan_for_date(prior_state)
+                == (target_date + timedelta(days=1)).isoformat()
+            )
+            if (
+                latest is not None
+                and last_sent is not None
+                and latest <= last_sent
+                and not retry_chart
+            ):
                 return finish(
                     EveningDigestOutcome(
                         EXIT_OK,
@@ -265,7 +288,8 @@ def run_evening_digest(
                 reference_dataset_root=resolved_reference,
                 decision_date=target_date,
             )
-            if last_sent is not None and digest.common_cutoff <= last_sent:
+            text_already_accepted = last_sent == digest.common_cutoff
+            if last_sent is not None and digest.common_cutoff <= last_sent and not retry_chart:
                 return finish(
                     EveningDigestOutcome(
                         EXIT_OK,
@@ -292,13 +316,24 @@ def run_evening_digest(
                     )
                 )
             digest = replace(digest, plan_for_date=plan_for_date)
+            if plan_for_date != target_date + timedelta(days=1):
+                return finish(
+                    EveningDigestOutcome(
+                        EXIT_OK,
+                        _event(
+                            "noop_not_next_session_eve",
+                            common_cutoff=cutoff,
+                            plan_for_date=plan_for_date.isoformat(),
+                        ),
+                    )
+                )
             # Freeze the exact derived report before submitting it. Provider
             # outcomes and later maturity observations are append-only and can
             # never rewrite this recommendation snapshot.
             archive = archiver(digest, repository)
             holding_identity: tuple[str, int] | None = None
             holding_context = None
-            holding_known_at = datetime.now(_SHANGHAI)
+            holding_known_at = now
             chart_channels: frozenset[str] = frozenset()
             chart_publisher_id: str | None = None
             try:
@@ -363,6 +398,17 @@ def run_evening_digest(
                 include_holding_summary="bark" in holding_channels,
             )
             publication: _PublishedHoldingChart | None = None
+            chart_requested = bool(
+                holding_identity is not None
+                and holding_channels.issuperset(_HOLDING_CHART_CHANNELS)
+                and chart_channels == _HOLDING_CHART_CHANNELS
+                and chart_publisher_id == CLOUDFLARE_R2_PUBLISHER_ID
+            )
+            chart_status = "pending" if chart_requested else "not_requested"
+            chart_reason = "publisher_or_holding_review_unavailable" if chart_requested else None
+            chart_attempts = (
+                int(prior_state.get("chart_attempts", 0)) if text_already_accepted else 0
+            ) + int(chart_requested)
             chart_delivery_authorized = bool(
                 holding_review is not None
                 and holding_identity is not None
@@ -401,6 +447,7 @@ def run_evening_digest(
                         _holding_chart_publisher,
                         chart_payload,
                     )
+                    chart_reason = None
                     if not _holding_chart_authorization_matches(
                         repository,
                         expected_identity=holding_identity,
@@ -408,10 +455,56 @@ def run_evening_digest(
                     ):
                         publication.revoke_once()
                         publication = None
+                        chart_status = "cancelled"
+                        chart_reason = "holding_authorization_changed"
                 except Exception:  # noqa: BLE001 - chart failure keeps the text report usable
                     if publication is not None:
                         publication.revoke_once()
                     publication = None
+                    chart_reason = "chart_generation_or_upload_failed"
+
+            # A successful text submission is never repeated to retry its image.
+            # Every image retry builds a new publication and therefore a fresh
+            # signed URL; signed URLs are never stored in delivery state.
+            if text_already_accepted and publication is None:
+                chart_status = (
+                    "exhausted" if chart_attempts >= _MAX_CHART_ATTEMPTS else chart_status
+                )
+                _write_state(
+                    state_path,
+                    {
+                        **prior_state,
+                        "chart_status": chart_status,
+                        "chart_attempts": chart_attempts,
+                        "chart_reason": chart_reason,
+                    },
+                )
+                return finish(
+                    EveningDigestOutcome(
+                        EXIT_RETRY if chart_status == "pending" else EXIT_OK,
+                        _event(
+                            "chart_pending" if chart_status == "pending" else "chart_not_sent",
+                            common_cutoff=cutoff,
+                            plan_for_date=plan_for_date.isoformat(),
+                            chart_status=chart_status,
+                            chart_reason=chart_reason,
+                            chart_attempts=chart_attempts,
+                            text_already_accepted=True,
+                        ),
+                    )
+                )
+
+            if chart_requested and publication is None:
+                body += "\n\n🩷 持仓日/周图暂缺，今晚稍后自动补图。"
+            if text_already_accepted:
+                body = (
+                    f"# 🩵 {format_cn_plan_date(plan_for_date)} 持仓日/周图补充\n"
+                    f"对应数据 {cutoff} 的同一期研究计划；文字建议已提交。\n"
+                    "图中蓝线为介入参考，粉线为保护参考；请留意图内核验状态。"
+                )
+                compact_body = body
+                public_body = "持仓图授权已变化，本次补图已取消。"
+                public_compact_body = public_body
 
             plan_label = format_cn_plan_date(plan_for_date)
             holding_guard = None
@@ -437,7 +530,7 @@ def run_evening_digest(
 
                 image_guard = image_guard_impl
             message = NotificationMessage(
-                title=f"A股日报｜{plan_label}计划",
+                title=f"A股{'补图' if text_already_accepted else '日报'}｜{plan_label}计划",
                 body=body,
                 group="A股研究室·晚间日报",
                 compact_body=compact_body,
@@ -451,11 +544,27 @@ def run_evening_digest(
                 unauthorized_compact_body=(None if holding_guard is None else public_compact_body),
                 image_revoke_callback=(None if publication is None else publication.revoke_once),
             )
+            send_now = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
+            if send_now.hour != 21 or send_now.date() != now.date():
+                if publication is not None:
+                    publication.revoke_once()
+                return finish(
+                    EveningDigestOutcome(
+                        EXIT_OK,
+                        _event("noop_evening_window_ended_before_submission"),
+                    )
+                )
             notification = notifier(message)
             if not isinstance(notification, EveningNotificationSummary):
                 raise TypeError("notifier must return EveningNotificationSummary")
             if publication is not None and "serverchan" not in notification.image_accepted_channels:
                 publication.revoke_once()
+                chart_reason = "image_provider_not_accepted"
+            if "serverchan" in notification.image_accepted_channels:
+                chart_status = "accepted"
+                chart_reason = None
+            elif chart_status == "pending" and chart_attempts >= _MAX_CHART_ATTEMPTS:
+                chart_status = "exhausted"
             notification_event = {
                 "configured_channels": list(notification.configured_channels),
                 "accepted_channels": list(notification.accepted_channels),
@@ -464,6 +573,10 @@ def run_evening_digest(
                 "image_accepted_channels": list(notification.image_accepted_channels),
                 "delivery_confirmed": False,
                 "plan_for_date": plan_for_date.isoformat(),
+                "chart_status": chart_status,
+                "chart_reason": chart_reason,
+                "chart_attempts": chart_attempts,
+                "text_already_accepted": text_already_accepted,
             }
             _record_evening_delivery_events(
                 repository,
@@ -471,6 +584,16 @@ def run_evening_digest(
                 notification=notification,
             )
             if not notification.any_accepted:
+                if text_already_accepted:
+                    _write_state(
+                        state_path,
+                        {
+                            **prior_state,
+                            "chart_status": chart_status,
+                            "chart_attempts": chart_attempts,
+                            "chart_reason": chart_reason,
+                        },
+                    )
                 reason = (
                     "notification_channels_not_configured"
                     if not notification.configured_channels and not notification.failed_channels
@@ -483,10 +606,13 @@ def run_evening_digest(
                 {
                     "last_provider_accepted_common_cutoff": cutoff,
                     "plan_for_date": plan_for_date.isoformat(),
-                    "provider_accepted_at": datetime.now(_SHANGHAI).isoformat(),
+                    "provider_accepted_at": now.isoformat(),
                     "accepted_channels": list(notification.accepted_channels),
                     "provider_receipt_ids": list(notification.provider_receipt_ids),
                     "delivery_confirmed": False,
+                    "chart_status": chart_status,
+                    "chart_attempts": chart_attempts,
+                    "chart_reason": chart_reason,
                 },
             )
             return finish(
@@ -696,9 +822,7 @@ def send_evening_digest(message: NotificationMessage) -> EveningNotificationSumm
         ("bark", load_bark_device_key, BarkNotificationChannel),
     )
     enabled_channels = _enabled_notification_channels()
-    channel_specs = tuple(
-        spec for spec in channel_specs if spec[0] in enabled_channels
-    )
+    channel_specs = tuple(spec for spec in channel_specs if spec[0] in enabled_channels)
     try:
         for name, loader, constructor in channel_specs:
             try:
@@ -752,11 +876,11 @@ def send_evening_digest(message: NotificationMessage) -> EveningNotificationSumm
 
 
 def _enabled_notification_channels() -> tuple[str, ...]:
-    """Read a secret-free process allow-list; absence preserves both channels."""
+    """Default personal evening reports to the user's ServerChan channel."""
 
     raw = os.environ.get(_NOTIFICATION_CHANNELS_ENV)
     if raw is None:
-        return _SUPPORTED_NOTIFICATION_CHANNELS
+        return ("serverchan",)
     values = tuple(
         dict.fromkeys(value.strip().lower() for value in raw.split(",") if value.strip())
     )

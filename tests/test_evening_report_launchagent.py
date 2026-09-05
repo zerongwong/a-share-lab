@@ -34,14 +34,10 @@ def test_evening_report_template_is_independent_secret_free_and_sun_thu_21_only(
     assert document["RunAtLoad"] is True
     assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
     assert [item["Weekday"] for item in document["StartCalendarInterval"]] == [
-        0,
-        1,
-        2,
-        3,
-        4,
+        day for day in range(5) for _ in range(4)
     ]
     assert all(item["Hour"] == 21 for item in document["StartCalendarInterval"])
-    assert all(item["Minute"] == 0 for item in document["StartCalendarInterval"])
+    assert {item["Minute"] for item in document["StartCalendarInterval"]} == {0, 15, 30, 45}
     assert 5 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert 6 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert "KeepAlive" not in document
@@ -77,9 +73,7 @@ def test_evening_report_renderer_replaces_the_complete_argument_array(tmp_path: 
     ]
     assert len(document["ProgramArguments"]) == 3
     assert document["WorkingDirectory"] == str(project_root.resolve())
-    assert document["StartCalendarInterval"] == [
-        {"Weekday": weekday, "Hour": 21, "Minute": 0} for weekday in range(0, 5)
-    ]
+    assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
     assert "__PYTHON_BIN__" not in document["ProgramArguments"]
     assert output.stat().st_mode & 0o777 == 0o600
 

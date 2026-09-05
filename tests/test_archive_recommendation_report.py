@@ -338,6 +338,50 @@ def test_archive_bundle_round_trips_through_sqlite_repository(tmp_path) -> None:
     assert member["plan_cutoff"] == CUTOFF.isoformat()
 
 
+def test_new_initial_risk_cap_and_buffered_structure_round_trip_without_rewriting_legacy(tmp_path):
+    repository = SQLiteRepository(tmp_path / "research.db")
+    legacy = _action_digest()
+    created_at = datetime(2026, 8, 27, 13, 0, tzinfo=UTC)
+    legacy_receipt = archive_recommendation_report(legacy, repository, created_at=created_at)
+    source = legacy.periods[0].candidates[0]
+    candidate = replace(
+        source,
+        price_plan_initial_risk_reference_price=10.60,
+        price_plan_initial_risk_fraction=(10.60 - 9.80) / 10.60,
+        price_plan_maximum_entry_price=10.6521,
+        price_plan_initial_risk_qualified=True,
+        price_plan_initial_risk_reason="initial_entry_risk_within_8pct_of_planned_buy_price",
+        price_plan_initial_protection_support=10.0,
+        price_plan_initial_protection_atr=0.40,
+        price_plan_initial_protection_evidence_date=CUTOFF - timedelta(days=3),
+        price_plan_initial_protection_atr_cutoff=CUTOFF,
+        price_plan_initial_protection_method_version="magee-inspired-pivot-trailing-v0.1.0",
+    )
+    digest = replace(legacy, periods=(replace(legacy.periods[0], candidates=(candidate,)),))
+    receipt = archive_recommendation_report(digest, repository, created_at=created_at)
+    assert receipt.content_hash != legacy_receipt.content_hash
+    batch = repository.list_recommendation_batches(receipt.report_id)[0]
+    plan = repository.list_recommendation_members(batch["id"])[0]["entry_plan_json"]
+    assert plan["maximum_entry_price"] == 10.6521
+    assert plan["initial_risk_fraction"] == (10.60 - 9.80) / 10.60
+    assert plan["initial_risk_reference_price"] == 10.60
+    assert plan["initial_risk_qualified"] is True
+    assert plan["initial_protection_support"] == 10.0
+    assert plan["initial_protection_atr"] == 0.40
+    assert plan["initial_protection_evidence_date"] == "2026-08-24"
+    assert plan["initial_protection_atr_cutoff"] == CUTOFF.isoformat()
+    assert plan["initial_protection_method_version"] == "magee-inspired-pivot-trailing-v0.1.0"
+    # Updating a cap changes the immutable report identity too.
+    changed = replace(candidate, price_plan_maximum_entry_price=10.65)
+    changed_digest = replace(digest, periods=(replace(digest.periods[0], candidates=(changed,)),))
+    assert build_recommendation_archive_bundle(changed_digest).content_hash != receipt.content_hash
+    legacy_batch = repository.list_recommendation_batches(legacy_receipt.report_id)[0]
+    legacy_plan = repository.list_recommendation_members(legacy_batch["id"])[0]["entry_plan_json"]
+    assert "maximum_entry_price" not in legacy_plan
+    assert "initial_risk_qualified" not in legacy_plan
+    assert legacy_plan["invalidation_price"] == 9.80
+
+
 def test_observation_archive_round_trips_as_separate_pending_cohort(tmp_path) -> None:
     repository = SQLiteRepository(tmp_path / "research.db")
 

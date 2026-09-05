@@ -27,7 +27,7 @@ from typing import Final
 import numpy as np
 import pandas as pd
 
-MULTI_TIMEFRAME_METHOD_VERSION: Final = "multi-timeframe-core-v0.2.0"
+MULTI_TIMEFRAME_METHOD_VERSION: Final = "multi-timeframe-core-v0.3.0"
 MULTI_TIMEFRAME_IMPLEMENTATION_STATUS: Final = "analytics_core_only"
 
 _PRICE_COLUMNS: Final = ("open", "high", "low", "close")
@@ -60,6 +60,7 @@ class StructureState(StrEnum):
     NEAR_BREAKOUT = "near_breakout"
     HEALTHY_PULLBACK = "healthy_post_breakout_pullback"
     BREAKOUT = "volume_confirmed_breakout"
+    RECLAIM_WAIT = "broken_breakout_wait_for_new_structure"
 
 
 class ExecutionState(StrEnum):
@@ -69,6 +70,7 @@ class ExecutionState(StrEnum):
     WAIT_CONFIRMATION = "wait_for_daily_confirmation"
     READY_PULLBACK = "daily_healthy_pullback_ready"
     READY_BREAKOUT = "daily_volume_breakout_ready"
+    WAIT_RECLAIM = "broken_breakout_wait_for_reclaim_confirmation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +287,10 @@ class StructureAssessment:
     base_width: float | None
     score: float
     reasons: tuple[str, ...]
+    base_qualified_at_breakout: bool | None = None
+    post_breakout_floor_held: bool | None = None
+    latest_retest_touched: bool = False
+    latest_retest_reclaimed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +304,10 @@ class ExecutionAssessment:
     distance_to_average: float | None
     score: float
     reasons: tuple[str, ...]
+    base_qualified_at_breakout: bool | None = None
+    post_breakout_floor_held: bool | None = None
+    latest_retest_touched: bool = False
+    latest_retest_reclaimed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -745,6 +755,8 @@ def _breakout_evidence(
     frame: pd.DataFrame,
     *,
     lookback: int,
+    base_bars: int,
+    maximum_base_width: float,
 ) -> tuple[pd.Series, pd.Series, pd.Series]:
     prior_high = frame["high"].astype(float).shift(1).rolling(lookback).max()
     activity = _activity_series(frame)
@@ -754,10 +766,41 @@ def _breakout_evidence(
         activity_lookback = max(3, min(20, lookback))
         reference = activity.shift(1).rolling(activity_lookback).median()
         ratio = activity / reference.replace(0.0, np.nan)
+    # Apply the contract to the base preceding *each* possible breakout, not
+    # merely to today's observation.  A wide, vertical run-up cannot become a
+    # qualified breakout by bypassing the later compressed-base branch.
+    base_high = frame["high"].astype(float).shift(1).rolling(base_bars).max()
+    base_low = frame["low"].astype(float).shift(1).rolling(base_bars).min()
+    compressed = (base_high / base_low - 1.0) <= maximum_base_width
     event = (
-        (frame["close"].astype(float) >= prior_high * 1.002) & (ratio >= 1.05) & prior_high.notna()
+        (frame["close"].astype(float) >= prior_high * 1.002)
+        & (ratio >= 1.05)
+        & prior_high.notna()
+        & compressed
     )
     return prior_high, ratio, event
+
+
+def _retest_evidence(
+    frame: pd.DataFrame, event_position: int | None, event_line: float | None
+) -> tuple[bool | None, bool, bool]:
+    """Require an unbroken post-breakout path and a genuine latest-bar retest.
+
+    The existing two-percent tolerance is retained.  Closing above a line
+    without touching its neighbourhood is not a pullback; recovering after an
+    intervening breach is a separate, unconfirmed reclaim state.
+    """
+
+    if event_position is None or event_line is None or event_position == len(frame) - 1:
+        return None, False, False
+    path = frame.iloc[event_position + 1 :]
+    intact = bool((path["low"].astype(float) >= event_line * 0.98).all())
+    latest = frame.iloc[-1]
+    touched = bool(
+        float(latest["low"]) <= event_line * 1.02 and float(latest["high"]) >= event_line * 0.98
+    )
+    reclaimed = float(latest["close"]) >= event_line
+    return intact, touched, reclaimed
 
 
 def _assess_structure(
@@ -785,6 +828,8 @@ def _assess_structure(
     prior_high, activity_ratio, breakout_event = _breakout_evidence(
         frame,
         lookback=lookback,
+        base_bars=contract.structure_base_bars,
+        maximum_base_width=contract.structure_max_base_width,
     )
     latest_close = float(frame.iloc[-1]["close"])
     latest_line = float(prior_high.iloc[-1])
@@ -810,6 +855,7 @@ def _assess_structure(
     base_width = base_high / base_low - 1.0
     compressed = base_width <= contract.structure_max_base_width
     trend_average = float(frame["close"].tail(max(3, lookback // 2)).mean())
+    path_intact, touched, reclaimed = _retest_evidence(frame, event_position, event_line)
 
     if latest_close < base_low * 0.98:
         state = StructureState.FAILED
@@ -823,14 +869,21 @@ def _assess_structure(
         reasons = (
             "close_above_shifted_prior_high",
             "activity_at_least_1_05_of_shifted_median",
+            "pre_breakout_base_width_within_contract",
         )
-    elif event_line is not None and latest_close >= event_line * 0.98:
+    elif path_intact is False:
+        state = StructureState.RECLAIM_WAIT
+        qualified = False
+        score = 0.30
+        reasons = ("post_breakout_path_breached_2pct_floor_wait_for_new_structure",)
+    elif path_intact and touched and reclaimed:
         state = StructureState.HEALTHY_PULLBACK
         qualified = True
         score = 0.88
         reasons = (
             "recent_volume_breakout_found",
-            "latest_close_holds_within_2pct_of_breakout_line",
+            "entire_post_breakout_path_holds_2pct_floor",
+            "latest_bar_touches_line_neighbourhood_and_closes_at_or_above_line",
         )
     elif latest_close >= latest_line * 0.97 and compressed:
         state = StructureState.NEAR_BREAKOUT
@@ -863,6 +916,10 @@ def _assess_structure(
         base_width=base_width,
         score=round(float(np.clip(score, 0.0, 1.0)), 6),
         reasons=reasons,
+        base_qualified_at_breakout=True if event_position is not None else None,
+        post_breakout_floor_held=path_intact,
+        latest_retest_touched=touched,
+        latest_retest_reclaimed=reclaimed,
     )
 
 
@@ -885,7 +942,12 @@ def _assess_execution(
             reasons=(f"minimum_{minimum}_complete_daily_sessions_required",),
         )
 
-    prior_high, activity_ratio, event = _breakout_evidence(daily, lookback=lookback)
+    prior_high, activity_ratio, event = _breakout_evidence(
+        daily,
+        lookback=lookback,
+        base_bars=min(lookback, contract.execution_ma_sessions),
+        maximum_base_width=contract.structure_max_base_width,
+    )
     latest_close = float(daily.iloc[-1]["close"])
     latest_line = float(prior_high.iloc[-1])
     moving_average = float(daily["close"].tail(contract.execution_ma_sessions).mean())
@@ -896,11 +958,13 @@ def _assess_execution(
     recent = event.tail(contract.execution_recent_sessions)
     positions = np.flatnonzero(recent.to_numpy())
     event_line = None
+    event_position = None
     sessions_since = None
     if len(positions):
         event_position = len(daily) - len(recent) + int(positions[-1])
         event_line = float(prior_high.iloc[event_position])
         sessions_since = len(daily) - 1 - event_position
+    path_intact, touched, reclaimed = _retest_evidence(daily, event_position, event_line)
 
     if latest_close < moving_average * 0.97:
         state = ExecutionState.FAILED
@@ -919,14 +983,21 @@ def _assess_execution(
         reasons = (
             "daily_close_above_shifted_prior_high",
             "daily_activity_confirmation_present",
+            "pre_breakout_base_width_within_contract",
         )
-    elif event_line is not None and latest_close >= event_line * 0.98:
+    elif path_intact is False:
+        state = ExecutionState.WAIT_RECLAIM
+        ready = False
+        score = 0.30
+        reasons = ("post_breakout_path_breached_2pct_floor_reclaim_is_not_healthy_pullback",)
+    elif path_intact and touched and reclaimed:
         state = ExecutionState.READY_PULLBACK
         ready = True
         score = 0.88
         reasons = (
             "recent_daily_breakout_present",
-            "daily_close_holds_breakout_line_within_2pct",
+            "entire_post_breakout_path_holds_2pct_floor",
+            "latest_bar_touches_line_neighbourhood_and_closes_at_or_above_line",
         )
     else:
         state = ExecutionState.WAIT_CONFIRMATION
@@ -944,6 +1015,10 @@ def _assess_execution(
         distance_to_average=distance,
         score=score,
         reasons=reasons,
+        base_qualified_at_breakout=True if event_position is not None else None,
+        post_breakout_floor_held=path_intact,
+        latest_retest_touched=touched,
+        latest_retest_reclaimed=reclaimed,
     )
 
 

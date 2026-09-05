@@ -120,6 +120,10 @@ def test_current_update_settles_mature_recommendations_and_logs_counts(
     assert len(calls) == 1
     assert calls[0]["as_of"] == date(2026, 8, 27)
     assert calls[0]["overlay_store"].root == (tmp_path / "overlay").resolve()
+    assert (
+        calls[0]["corporate_action_loader"]
+        is scheduled_sync.load_available_local_corporate_action_evidence
+    )
     assert outcome.event["performance_status"] == "completed"
     assert outcome.event["performance_pending_batches"] == 6
     assert outcome.event["performance_evaluated_batches"] == 2
@@ -396,7 +400,11 @@ def test_first_verified_session_archives_monthly_review_locally_once(
     assert len(build_calls) == 1
     repository, kwargs = build_calls[0]
     assert repository.db_path == (tmp_path / "research.db").resolve()
-    assert kwargs == {"review_month": date(2026, 8, 1), "as_of": cutoff}
+    assert kwargs == {
+        "review_month": date(2026, 8, 1),
+        "as_of": cutoff,
+        "benchmark_evidence_by_batch": {},
+    }
     archive_dir = tmp_path / "scheduler" / "monthly-model-reviews"
     archive_path = archive_dir / "2026-08.json"
     state_path = tmp_path / "scheduler" / "monthly-model-review-state.json"

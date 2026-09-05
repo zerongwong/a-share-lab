@@ -2,17 +2,71 @@ from __future__ import annotations
 
 from datetime import date
 
+import pandas as pd
 import pytest
 
 from ashare_lab.services.build_monthly_model_review import (
     BenchmarkEvidence,
     ReviewPopulation,
     build_monthly_model_review,
+    build_verified_benchmark_evidence,
     load_monthly_review_completion_state,
     mark_monthly_review_completed,
     monthly_review_due,
     render_monthly_model_review_message,
 )
+
+
+def test_verified_benchmark_uses_action_next_open_and_rejects_reference_observation() -> None:
+    formal = _bundle("formal", mode="action_simulation")
+    observation = _bundle("observation", mode="observation_simulation")
+    observation["members"][0]["observation_anchor"] = "archived_reference_price"
+    repository = _Repository([formal, observation])
+    dates = tuple(pd.bdate_range("2026-08-03", "2026-08-31").date)
+
+    class Store:
+        def read_verified_manifest(self, **_kwargs):
+            return pd.DataFrame(
+                {
+                    "trade_date": dates,
+                    "previous_trade_date": (date(2026, 7, 31), *dates[:-1]),
+                    "adjustment": "none",
+                }
+            )
+
+        def read_verified_daily(self, session, **kwargs):
+            assert kwargs["asset_kind"] == "indices"
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": "000300.SH",
+                        "trade_date": session,
+                        "open": 80.0 if session == date(2026, 8, 4) else 100.0,
+                        "close": 110.0,
+                    }
+                ]
+            )
+
+    evidence = build_verified_benchmark_evidence(
+        repository, overlay_store=Store(), as_of=date(2026, 9, 1)
+    )
+    assert set(evidence) == {"formal"}
+    assert evidence["formal"].entry_date == date(2026, 8, 4)
+    assert evidence["formal"].entry_price_field == "open"
+    assert evidence["formal"].benchmark_return == pytest.approx(110.0 / 80.0 - 1)
+
+
+def test_monthly_review_never_pools_calendar_and_trading_clock() -> None:
+    legacy = _bundle("legacy", mode="action_simulation", stock_return=0.1)
+    natural = _bundle("calendar", mode="action_simulation", stock_return=-0.1)
+    natural["batch"]["metadata_json"]["holding_clock"] = "calendar"
+    review = build_monthly_model_review(
+        _Repository([legacy, natural]), review_month=date(2026, 8, 1), as_of=date(2026, 9, 1)
+    )
+    active = [row for row in review.horizon_reviews if row.mature_batch_count]
+    assert len(active) == 2
+    assert {row.holding_clock for row in active} == {"calendar", "trading_sessions"}
+    assert all(row.mature_batch_count == 1 for row in active)
 
 
 class _Repository:

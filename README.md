@@ -10,6 +10,11 @@ A Share Lab 是一个本地优先、证据优先的 A 股中期研究项目。�
 尾盘打板、日内高抛低吸和实时交易监控不属于当前主产品；相关实验代码即使仍在源码中，
 也不会在主导航中启用。
 
+**当前定位：低频研究与人工决策辅助，不是已经验证盈利的自动交易系统。**
+完整样本外回放、公司行为一致价格、交易日历与持仓保护线闭环仍有待完成的验收项。
+测试通过只说明相应软件行为正确，不能证明选股有超额收益。见
+[2026-09-05 全流程审视与修订边界](docs/PROJECT_REVIEW_2026_09.md)。
+
 如果使用者在本机明确登记当前持仓与计划周期，程序会在每个已验证收盘后继续复核同一组
 持仓；在使用者再次明确替换或清空之前，模型不能擅自改动成员或周期。这个“果树修枝”
 流程是收盘后的研究行动单，不读取券商账户，也不自动卖出、补股或调仓。
@@ -34,6 +39,8 @@ A Share Lab 是一个本地优先、证据优先的 A 股中期研究项目。�
 - 原始预测不可事后改写，真实结果写入独立记录；
 - 当前持仓只由使用者显式更新；候选排名变化不能自动换掉健康持仓；
 - 保护线只能随确认结构上移，减仓或退出后的资金先留现金，不向亏损仓摊低；
+- 新买点先找有依据的结构保护线，再校验计划买价至该线的距离不超过 8%；风险过大就
+  等待或放弃，不把保护线人为抬到正常波动中。条件计划同时给最高买价，跳空超过不追；
 - 融资默认关闭，不自动加杠杆，也不向亏损仓摊低成本。
 
 ## 当前主模型
@@ -138,8 +145,8 @@ flowchart TB
     F --> H
 
     classDef data fill:#EAF3FF,stroke:#2563EB,color:#172554,stroke-width:1.5px;
-    classDef engine fill:#F0FDFA,stroke:#0F766E,color:#134E4A,stroke-width:1.5px;
-    classDef output fill:#FFF7ED,stroke:#EA580C,color:#7C2D12,stroke-width:1.5px;
+    classDef engine fill:#F3EEFF,stroke:#8B6CC2,color:#44325F,stroke-width:1.5px;
+    classDef output fill:#FFF0F5,stroke:#CB7C9E,color:#703F58,stroke-width:1.5px;
     class A,B data;
     class C,D,E,F engine;
     class G,H,I output;
@@ -220,10 +227,10 @@ flowchart TB
     end
 
     subgraph REPORT["下一交易日计划"]
-        T["21:00<br/>独立计划任务"] --> W{{"识别下一交易日"}}
+        T["21:00 首次<br/>21:15 / 30 / 45 有限重试"] --> W{{"明天确认为交易日"}}
         D -.->|提供已验证截面| W
         W -->|周日至周四| E["生成六期限<br/>只读摘要"]
-        E --> F["Server酱 + Bark<br/>仅发送脱敏衍生结果"]
+        E --> F["仅 Server酱<br/>精简结论 + 获准的私有持仓图"]
         W -->|周五 · 周六| G["不发送计划报告"]
     end
 

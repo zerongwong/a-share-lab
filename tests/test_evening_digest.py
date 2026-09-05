@@ -292,7 +292,8 @@ def test_markdown_is_compact_derived_and_explicitly_non_actionable() -> None:
     assert "股≤30%/现≥70%" in markdown
     assert "当前持仓修枝" not in markdown
     assert "持仓复核" not in markdown
-    assert "合成甲(SYN001) 30%@观察站回 ≥ 11.00" in markdown
+    assert "合成甲(SYN001) 观察@站回 ≥ 11.00" in markdown
+    assert "仅观察·暂不建仓" in markdown
     assert "六期限重合与差异审计" not in markdown
     assert "候选重合" not in markdown
     assert "Jaccard" not in markdown
@@ -317,7 +318,7 @@ def test_bark_compact_covers_all_six_horizons_candidates_weights_and_prices() ->
     for label in ("1周", "2周", "1个月", "3个月", "6个月", "1年"):
         assert f"{label}｜" in compact
     assert compact.count("合成甲(SYN001)") == 6
-    assert "30%@观察站回 ≥ 11.00" in compact
+    assert "观察@站回 ≥ 11.00" in compact
     assert "仓%=股票仓内10%档" in compact
     assert "不自动下单" in compact
     assert len(compact.encode("utf-8")) <= 2_400
@@ -361,7 +362,7 @@ def test_holding_tree_summary_is_prioritized_concise_and_keeps_urgent_row_first(
     for body in (markdown, compact):
         assert "当前持仓修枝" in body
         assert "东航物流(601156)｜1个月｜退出｜保护线11.00｜收盘已跌破保护线" in body
-        assert "江苏银行(600919)｜1个月｜HOLD｜保护线11.00｜结构仍完整" in body
+        assert "江苏银行(600919)｜1个月｜持有｜保护线11.00｜结构仍完整" in body
         assert body.index("东航物流") < body.index("江苏银行")
         assert body.index("当前持仓修枝") < body.index("六期限计划")
         assert "六期限重合与差异审计" not in body
@@ -418,6 +419,146 @@ def test_holding_reason_distinguishes_evidence_block_and_weakness_strength() -> 
     assert "除权/分红证据待核验，不作动作" in body
     assert "单维度转弱预警" in body
     assert "多周期转弱确认" in body
+
+
+def test_missing_company_action_evidence_never_calls_hold_reference_a_confirmed_stop() -> None:
+    digest = EveningResearchDigest(
+        common_cutoff=CUTOFF,
+        decision_date=CUTOFF,
+        cycle_label="中期下行",
+        entry_strictness=EntryStrictness.DEFENSIVE.value,
+        max_stock_exposure=0.3,
+        minimum_cash_weight=0.7,
+        cycle_rule_agreement=0.8,
+        periods=(),
+        plan_for_date=PLAN_DATE,
+    )
+    row = replace(
+        _holding_review().rows[0],
+        action=HoldingAction.HOLD,
+        status=HoldingReviewRowStatus.READY,
+        effective_stop=11.0,
+        reasons=(
+            "no_completed_close_exit_or_reduce_signal",
+            "company_action_clearance_missing_non_destructive_hold_only",
+            "candidate_stop_not_persisted_without_company_action_clearance",
+        ),
+    )
+    review = replace(_holding_review(), rows=(row,))
+    for render in (render_evening_digest_markdown, render_evening_digest_bark_compact):
+        body = render(digest, review, include_holding_summary=True)
+        assert "暂持有·待核验" in body
+        assert "参考线11.00（待核验）" in body
+        assert "除权/分红证据待核验" in body
+        assert "保护线11.00" not in body
+        assert "结构仍完整" not in body
+
+
+def test_buy_price_ceiling_and_volume_survive_compact_budget_without_promoting_observations():
+    def builder(_histories, _metadata, *, holding_weeks, **_kwargs):
+        result = _result(holding_weeks)
+        candidates = []
+        for index in range(5):
+            source = result.research_candidates[index % 4]
+            plan = replace(
+                source.price_observation_plan,
+                kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
+                trigger_price=100.0001,
+                maximum_entry_price=103.0099,
+                initial_risk_reference_price=100.0001,
+                initial_risk_fraction=0.06,
+                initial_risk_qualified=True,
+                initial_risk_reason="verified_sample",
+                initial_protection_support=95.0,
+                initial_protection_atr=2.0,
+                initial_protection_evidence_date=pd.Timestamp(CUTOFF),
+                initial_protection_atr_cutoff=pd.Timestamp(CUTOFF),
+                initial_protection_method_version="sample-protection-v1",
+            )
+            candidates.append(
+                _replace_namespace(
+                    source,
+                    rank=index + 1,
+                    symbol=f"60000{index}",
+                    name="测试长名字股份有限公司",
+                    price_observation_plan=plan,
+                )
+            )
+        return replace(result, research_candidates=tuple(candidates))
+
+    digest = build_evening_research_digest(
+        dataset_root="csmar",
+        overlay_root="overlay",
+        reference_dataset_root="reference",
+        decision_date=CUTOFF,
+        _hybrid_loader=lambda *_args, **_kwargs: _hybrid(object()),
+        _portfolio_builder=builder,
+    )
+    digest = replace(digest, plan_for_date=PLAN_DATE)
+    candidate = digest.periods[0].candidates[0]
+    assert candidate.price_plan_maximum_entry_price == 103.0099
+    assert candidate.price_plan_initial_protection_support == 95.0
+    assert candidate.price_plan_initial_protection_evidence_date == CUTOFF
+    assert candidate.price_plan_initial_risk_qualified is True
+    assert candidate.allocation_nature == "observation_only"
+    for render in (render_evening_digest_markdown, render_evening_digest_bark_compact):
+        body = render(digest, _holding_review(), include_holding_summary=True)
+        assert body.count("确认≥100.01，买≤103.00+量") == 30
+        assert body.count("观察@确认≥") == 30
+        assert "观察@观察" not in body
+        assert "100.01–103.00" not in body
+        assert "103.01" not in body
+        assert "30%@" not in body
+        assert body.count("仅观察·暂不建仓") == 6
+        assert len(body.encode("utf-8")) <= 2400
+
+
+def test_risk_capped_reclaim_and_pullback_never_round_above_ceiling():
+    from ashare_lab.services.build_evening_digest import _format_plan
+
+    plan = ConditionalEntryPlan(
+        kind=ConditionalEntryPlanKind.RECLAIM,
+        data_cutoff=pd.Timestamp(CUTOFF),
+        horizon="一个月",
+        sessions=20,
+        trigger_price=10.001,
+        maximum_entry_price=10.3099,
+    )
+    assert (
+        _format_plan(
+            plan,
+            expected_cutoff=CUTOFF,
+            expected_sessions=20,
+            observation=False,
+        )
+        == "确认≥10.01，买≤10.30"
+    )
+    pullback = replace(
+        plan,
+        kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK,
+        price_low=9.501,
+        price_high=10.309,
+        trigger_price=None,
+    )
+    assert (
+        _format_plan(
+            pullback,
+            expected_cutoff=CUTOFF,
+            expected_sessions=20,
+            observation=True,
+        )
+        == "回踩9.51–10.30"
+    )
+    impossible = replace(plan, trigger_price=10.301)
+    assert (
+        _format_plan(
+            impossible,
+            expected_cutoff=CUTOFF,
+            expected_sessions=20,
+            observation=True,
+        )
+        == "不入场：门槛10.31>上限10.30"
+    )
 
 
 def test_no_successful_hybrid_load_fails_without_fabricating_digest() -> None:

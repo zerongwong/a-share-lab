@@ -26,6 +26,7 @@ from ashare_lab.services.archive_recommendation_report import (
 )
 from ashare_lab.services.build_evening_digest import build_evening_research_digest
 from ashare_lab.services.run_recommendation_performance import (
+    load_available_local_corporate_action_evidence,
     run_recommendation_performance,
 )
 
@@ -132,6 +133,7 @@ def _run_settle(args: argparse.Namespace):
         overlay_store=store,
         notifier=send_scheduled_notification,
         as_of=getattr(args, "as_of", None),
+        corporate_action_loader=load_available_local_corporate_action_evidence,
     )
 
 

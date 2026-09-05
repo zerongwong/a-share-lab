@@ -12,7 +12,7 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Literal, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
@@ -337,7 +337,7 @@ def _canonical_candidate(candidate: EveningDigestCandidate) -> dict[str, Any]:
 def _entry_plan(candidate: EveningDigestCandidate) -> dict[str, Any] | None:
     if candidate.price_plan_kind is None:
         return None
-    return {
+    plan = {
         "kind": candidate.price_plan_kind,
         "evaluation_rule": _plan_evaluation_rule(candidate.price_plan_kind),
         "price_low": candidate.price_plan_low,
@@ -355,6 +355,25 @@ def _entry_plan(candidate: EveningDigestCandidate) -> dict[str, Any] | None:
         "method_version": candidate.price_plan_method_version,
         "evaluation_price_is_fill_price": False,
     }
+    # Do not add invented cap/stop evidence to legacy records: only newly
+    # assessed plans carry these optional fields.  The canonical content hash
+    # and immutable entry_plan_json include every supplied risk constraint.
+    for key in (
+        "initial_risk_reference_price",
+        "initial_risk_fraction",
+        "maximum_entry_price",
+        "initial_risk_qualified",
+        "initial_risk_reason",
+        "initial_protection_support",
+        "initial_protection_atr",
+        "initial_protection_evidence_date",
+        "initial_protection_atr_cutoff",
+        "initial_protection_method_version",
+    ):
+        value = getattr(candidate, f"price_plan_{key}", None)
+        if value is not None:
+            plan[key] = value.isoformat() if isinstance(value, (date, datetime)) else value
+    return plan
 
 
 def _plan_evaluation_rule(kind: str) -> str:

@@ -24,15 +24,9 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from ashare_lab.adapters.macos_keychain import (
-    load_bark_device_key,
-    load_serverchan_sendkey,
-)
+from ashare_lab.adapters.macos_keychain import load_serverchan_sendkey
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
-from ashare_lab.adapters.notification_channels import (
-    BarkNotificationChannel,
-    ServerChanNotificationChannel,
-)
+from ashare_lab.adapters.notification_channels import ServerChanNotificationChannel
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.bootstrap import application_data_dir, project_root
 from ashare_lab.domain.errors import AShareLabError
@@ -40,6 +34,7 @@ from ashare_lab.ports.notifications import NotificationMessage, NotificationUrge
 from ashare_lab.services.build_monthly_model_review import (
     MonthlyModelReview,
     build_monthly_model_review,
+    build_verified_benchmark_evidence,
     load_monthly_review_completion_state,
     mark_monthly_review_completed,
     monthly_review_due,
@@ -55,6 +50,7 @@ from ashare_lab.services.run_holding_stop_shadows import (
 )
 from ashare_lab.services.run_recommendation_performance import (
     RecommendationPerformanceRunSummary,
+    load_available_local_corporate_action_evidence,
     run_recommendation_performance,
 )
 from ashare_lab.services.run_zero_budget_daily_update import run_zero_budget_daily_update
@@ -149,15 +145,12 @@ def render_launchagent_plist(
 
 
 def send_scheduled_notification(message: NotificationMessage) -> NotificationSummary:
-    """Fan out through configured channels without exposing their credentials."""
+    """Submit only to the user-approved ServerChan channel, without exposing keys."""
 
     channels: list[Any] = []
     configured: list[str] = []
     construction_failures: list[str] = []
-    channel_specs = (
-        ("serverchan", load_serverchan_sendkey, ServerChanNotificationChannel),
-        ("bark", load_bark_device_key, BarkNotificationChannel),
-    )
+    channel_specs = (("serverchan", load_serverchan_sendkey, ServerChanNotificationChannel),)
     try:
         for name, loader, constructor in channel_specs:
             try:
@@ -323,6 +316,11 @@ def run_scheduled_sync(
                         scheduler_root=resolved_scheduler_root,
                         common_cutoff=report.common_cutoff,
                         performance_ready=event.get("performance_status") in (None, "completed"),
+                        overlay_root=Path(
+                            overlay_root or application_data_dir() / "cache" / "market_overlay"
+                        )
+                        .expanduser()
+                        .resolve(),
                     )
                 _write_state(
                     state_path,
@@ -429,6 +427,7 @@ def _run_performance_reviews(
             notifier=notifier,
             as_of=common_cutoff,
             clock=lambda: now,
+            corporate_action_loader=load_available_local_corporate_action_evidence,
         )
     except Exception as exc:  # noqa: BLE001 - non-fatal post-sync boundary
         event["performance_status"] = "error_retry_later"
@@ -580,6 +579,7 @@ def _run_local_monthly_review(
     scheduler_root: Path,
     common_cutoff: date,
     performance_ready: bool,
+    overlay_root: Path,
 ) -> None:
     """Generate one private previous-month audit after its first verified session.
 
@@ -613,6 +613,11 @@ def _run_local_monthly_review(
             repository,
             review_month=due_month,
             as_of=common_cutoff,
+            benchmark_evidence_by_batch=build_verified_benchmark_evidence(
+                repository,
+                overlay_store=MarketOverlayStore(overlay_root),
+                as_of=common_cutoff,
+            ),
         )
         expected_month = due_month.strftime("%Y-%m")
         if review.review_month != expected_month or review.generated_as_of != common_cutoff:

@@ -21,6 +21,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
+import pandas as pd
+
+from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
+from ashare_lab.domain.errors import AShareLabError
+from ashare_lab.ports.market_data import normalize_symbol
 from ashare_lab.ports.notifications import NotificationMessage
 
 MONTHLY_REVIEW_METHOD_VERSION = "monthly-model-review-v0.1.0"
@@ -70,6 +75,8 @@ class BenchmarkEvidence:
     adjustment: str
     source: str
     method_version: str
+    entry_date: date | None = None
+    entry_price_field: str = "close"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +116,7 @@ class HorizonMonthlyReview:
     company_action_clear_member_count: int
     untriggered_member_count: int
     evidence_assessment: str
+    holding_clock: str = "trading_sessions"
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +150,114 @@ class MonthlyReviewCompletionState:
 
     completed_months: tuple[str, ...] = ()
     state_version: int = MONTHLY_REVIEW_STATE_VERSION
+
+
+def build_verified_benchmark_evidence(
+    repository: MonthlyReviewRepository,
+    *,
+    overlay_store: Any,
+    as_of: date,
+    source_id: str = DEFAULT_MARKET_OVERLAY_SOURCE_ID,
+    index_symbol: str = "000300.SH",
+    report_limit: int = 1000,
+) -> dict[str, BenchmarkEvidence]:
+    """Read verified CSI300 prices on the same entry/exit dates as each cohort.
+
+    Action simulations use the next-session open. Observations using a target
+    reference price have no provable market entry timestamp and remain without
+    a benchmark instead of silently comparing mismatched intervals.
+    """
+
+    if not 1 <= report_limit <= 1000:
+        raise ValueError("report_limit must be between 1 and 1000")
+    manifest = overlay_store.read_verified_manifest(source_id=source_id)
+    if manifest.empty:
+        return {}
+    if not {"trade_date", "previous_trade_date", "adjustment"}.issubset(manifest.columns):
+        return {}
+    manifest = manifest.loc[pd.to_datetime(manifest["trade_date"]).dt.date <= as_of].sort_values(
+        "trade_date"
+    )
+    if not manifest["adjustment"].eq("none").all() or manifest["trade_date"].duplicated().any():
+        return {}
+    sessions = tuple(
+        sorted(
+            {
+                pd.Timestamp(value).date()
+                for value in manifest["trade_date"]
+                if pd.Timestamp(value).date() <= as_of
+            }
+        )
+    )
+    predecessors = tuple(pd.Timestamp(value).date() for value in manifest["previous_trade_date"])
+    if any(predecessors[index] != sessions[index - 1] for index in range(1, len(sessions))):
+        return {}
+    cache: dict[tuple[date, str], float | None] = {}
+
+    def price(session: date, field: str) -> float | None:
+        key = (session, field)
+        if key not in cache:
+            try:
+                frame = overlay_store.read_verified_daily(
+                    session, source_id=source_id, asset_kind="indices"
+                )
+                selected = frame.loc[
+                    frame["symbol"].map(normalize_symbol) == normalize_symbol(index_symbol)
+                ]
+                value = (
+                    None if len(selected) != 1 else _optional_finite_float(selected.iloc[0][field])
+                )
+                cache[key] = value if value is not None and value > 0 else None
+            except (AShareLabError, KeyError, TypeError, ValueError, OSError):
+                cache[key] = None
+        return cache[key]
+
+    evidence: dict[str, BenchmarkEvidence] = {}
+    for report in repository.list_recommendation_reports(limit=report_limit):
+        report_id = str(report.get("id") or "")
+        for batch in repository.list_recommendation_batches(report_id):
+            batch_id = str(batch.get("id") or batch.get("batch_id") or "")
+            result = repository.get_recommendation_batch_result(batch_id)
+            if (
+                result is None
+                or not result.get("maturity_date")
+                or not _record_known_by_as_of(result, as_of=as_of)
+            ):
+                continue
+            maturity = _as_date(result["maturity_date"])
+            plan = _as_date(batch.get("plan_for_date") or report["plan_for_date"])
+            if maturity > as_of or plan not in sessions or maturity not in sessions:
+                continue
+            if str(batch.get("evaluation_mode")) == "action_simulation":
+                start = next((session for session in sessions if session > plan), None)
+                field = "open"
+            else:
+                members = repository.list_recommendation_members(batch_id)
+                if not members or any(
+                    member.get("observation_anchor") != "plan_session_close" for member in members
+                ):
+                    continue
+                start, field = plan, "close"
+            if start is None or start > maturity:
+                continue
+            opening, closing = price(start, field), price(maturity, "close")
+            if opening is None or closing is None:
+                continue
+            evidence[batch_id] = BenchmarkEvidence(
+                batch_id=batch_id,
+                benchmark_id=index_symbol,
+                plan_for_date=plan,
+                maturity_date=maturity,
+                data_cutoff=maturity,
+                evaluated_at=as_of,
+                benchmark_return=closing / opening - 1,
+                adjustment="none",
+                source=f"{source_id}:verified-index-same-interval",
+                method_version="same-interval-csi300-price-v1",
+                entry_date=start,
+                entry_price_field=field,
+            )
+    return evidence
 
 
 @dataclass(slots=True)
@@ -184,7 +300,7 @@ def build_monthly_model_review(
     benchmark_map = benchmark_evidence_by_batch or {}
     reports = repository.list_recommendation_reports(limit=report_limit)
     accumulators = {
-        (population, horizon_key): _Accumulator(batches=[])
+        (population, horizon_key, "trading_sessions"): _Accumulator(batches=[])
         for population in ReviewPopulation
         for horizon_key, _, _ in _HORIZONS
     }
@@ -251,7 +367,14 @@ def build_monthly_model_review(
                 benchmark=benchmark,
                 population=population,
             )
-            accumulator = accumulators[(population, horizon_key)]
+            metadata = batch.get("metadata_json") or {}
+            clock = metadata.get("holding_clock", "trading_sessions")
+            if clock not in {"calendar", "trading_sessions"}:
+                excluded.append(f"{batch_id}:unsupported_holding_clock")
+                continue
+            accumulator = accumulators.setdefault(
+                (population, horizon_key, clock), _Accumulator(batches=[])
+            )
             accumulator.batches.append(reviewed)
             _add_member_coverage(accumulator, members, member_results)
 
@@ -261,10 +384,13 @@ def build_monthly_model_review(
             horizon_key=horizon_key,
             holding_sessions=holding_sessions,
             label=label,
-            accumulator=accumulators[(population, horizon_key)],
+            accumulator=accumulators[(population, horizon_key, clock)],
+            holding_clock=clock,
         )
         for population in ReviewPopulation
         for horizon_key, holding_sessions, label in _HORIZONS
+        for clock in ("trading_sessions", "calendar")
+        if (population, horizon_key, clock) in accumulators
     )
     archive_scan_truncated = len(reports) == report_limit
     if archive_scan_truncated:
@@ -644,6 +770,7 @@ def _summarize_horizon(
     holding_sessions: int,
     label: str,
     accumulator: _Accumulator,
+    holding_clock: str = "trading_sessions",
 ) -> HorizonMonthlyReview:
     batches = tuple(accumulator.batches)
     primary_returns = tuple(
@@ -670,7 +797,7 @@ def _summarize_horizon(
         population=population,
         horizon_key=horizon_key,
         holding_sessions=holding_sessions,
-        label=label,
+        label=label + ("（自然到期）" if holding_clock == "calendar" else ""),
         mature_batch_count=len(batches),
         valid_return_count=len(primary_returns),
         mean_weighted_portfolio_return=_mean(primary_returns),
@@ -703,6 +830,7 @@ def _summarize_horizon(
         company_action_clear_member_count=accumulator.company_action_clear_member_count,
         untriggered_member_count=accumulator.untriggered_member_count,
         evidence_assessment=assessment,
+        holding_clock=holding_clock,
     )
 
 
@@ -717,6 +845,8 @@ def _experiment_proposals(
         return ()
     proposals: list[ExperimentProposal] = []
     prefix = f"{review_month:%Y-%m}-{summary.population.value}-{summary.horizon_key}"
+    if summary.holding_clock == "calendar":
+        prefix += "-calendar"
     benchmark_coverage = summary.benchmark_available_count / summary.mature_batch_count
     if (
         benchmark_coverage >= MIN_BENCHMARK_COVERAGE_FOR_DIRECTIONAL_CONCLUSION

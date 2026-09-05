@@ -7,6 +7,7 @@ elapsed, observed returns are written to the separate ``outcomes`` table.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable, Iterator, Mapping
@@ -524,6 +525,98 @@ class SQLiteRepository:
                     updated_at,
                 ),
             )
+
+    def record_recommendation_settlement(
+        self,
+        *,
+        batch_result: JsonRecord,
+        member_results: Iterable[JsonRecord],
+    ) -> None:
+        """Commit every member, its aggregate and an immutable revision together."""
+
+        self.initialize()
+        batch = dict(_record(batch_result))
+        members = tuple(dict(_record(item)) for item in member_results)
+        batch_id = str(_required(batch, "batch_id"))
+        supplied_ids = [str(_required(item, "member_id")) for item in members]
+        if len(supplied_ids) != len(set(supplied_ids)):
+            raise ValueError("settlement member ids must be unique")
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                expected_ids = {
+                    str(row["id"])
+                    for row in connection.execute(
+                        "SELECT id FROM recommendation_members WHERE batch_id = ?", (batch_id,)
+                    )
+                }
+                if not expected_ids or set(supplied_ids) != expected_ids:
+                    raise ValueError("atomic settlement must cover exactly its archived members")
+                prior = connection.execute(
+                    "SELECT * FROM recommendation_batch_results WHERE batch_id = ?", (batch_id,)
+                ).fetchone()
+                recorded = connection.execute(
+                    "SELECT 1 FROM recommendation_settlement_history WHERE batch_id = ? LIMIT 1",
+                    (batch_id,),
+                ).fetchone()
+                if prior is not None and recorded is None:
+                    # Capture pre-migration observations before their first refresh.
+                    prior_members = connection.execute(
+                        """SELECT mr.* FROM recommendation_member_results mr
+                           JOIN recommendation_members m ON m.id = mr.member_id
+                           WHERE m.batch_id = ? ORDER BY m.rank""",
+                        (batch_id,),
+                    ).fetchall()
+                    prior_snapshot = _json_text(
+                        {"batch": dict(prior), "members": [dict(row) for row in prior_members]}
+                    )
+                    connection.execute(
+                        """INSERT OR IGNORE INTO recommendation_settlement_history
+                           (id, batch_id, evaluated_at, method_version, snapshot_json)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (
+                            f"settlement-legacy:{hashlib.sha256(prior_snapshot.encode()).hexdigest()}",
+                            batch_id,
+                            prior["evaluated_at"],
+                            prior["method_version"],
+                            prior_snapshot,
+                        ),
+                    )
+                # Reuse the exact adapters while binding every write to this transaction.
+                writer = _SettlementTransactionRepository(connection)
+                for member in members:
+                    writer.record_recommendation_member_result(member)
+                writer.record_recommendation_batch_result(batch)
+                snapshot = {
+                    "batch": batch,
+                    "members": sorted(members, key=lambda r: r["member_id"]),
+                }
+                canonical = {
+                    "batch": {
+                        k: v for k, v in batch.items() if k not in {"evaluated_at", "updated_at"}
+                    },
+                    "members": [
+                        {k: v for k, v in row.items() if k not in {"evaluated_at", "updated_at"}}
+                        for row in snapshot["members"]
+                    ],
+                }
+                digest = hashlib.sha256(_json_text(canonical).encode()).hexdigest()
+                connection.execute(
+                    """INSERT OR IGNORE INTO recommendation_settlement_history
+                       (id, batch_id, evaluated_at, method_version, snapshot_json)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        f"settlement:{digest}",
+                        batch_id,
+                        _iso_text(batch.get("evaluated_at") or datetime.now(UTC)),
+                        _required(batch, "method_version"),
+                        _json_text(snapshot),
+                    ),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
 
     def get_recommendation_member_result(self, member_id: str) -> dict[str, Any] | None:
         self.initialize()
@@ -1923,13 +2016,32 @@ def _optional_bool_int(value: Any) -> int | None:
     raise ValueError(f"Expected an optional boolean value, got {value!r}")
 
 
+class _SettlementTransactionRepository(SQLiteRepository):
+    """Internal adapter sharing an already-open outer settlement transaction."""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._settlement_connection = connection
+
+    def initialize(self) -> None:
+        pass
+
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        yield self._settlement_connection
+
+
 def _normalize_member_result_status(value: Any) -> str:
     text = str(value)
     if text in {"pending", "pending_maturity_session"}:
         return "pending"
     if text in {"resolved", "settled"}:
         return "resolved"
-    if text in {"not_entered", "expired_untriggered"}:
+    if text in {
+        "not_entered",
+        "expired_untriggered",
+        "entry_price_limit_exceeded",
+        "entry_invalidated_before_fill",
+    }:
         return "not_entered"
     if text in {"unavailable", "archive_ineligible"}:
         return "unavailable"

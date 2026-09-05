@@ -13,7 +13,11 @@ EVENING_REPORT_MODULE = "ashare_lab.cli.evening_report"
 # Saturday. Use 0..4 for Sunday through Thursday. Friday and Saturday are
 # intentionally absent; the CLI also enforces this calendar-day boundary
 # because RunAtLoad is independent of StartCalendarInterval.
-EVENING_REPORT_SCHEDULE = [{"Weekday": weekday, "Hour": 21, "Minute": 0} for weekday in range(0, 5)]
+EVENING_REPORT_SCHEDULE = [
+    {"Weekday": weekday, "Hour": 21, "Minute": minute}
+    for weekday in range(0, 5)
+    for minute in (0, 15, 30, 45)
+]
 
 
 def render_evening_report_launchagent_plist(
@@ -39,7 +43,9 @@ def render_evening_report_launchagent_plist(
     if "KeepAlive" in document:
         raise ValueError("evening report LaunchAgent must not contain KeepAlive")
     if document.get("StartCalendarInterval") != EVENING_REPORT_SCHEDULE:
-        raise ValueError("evening report LaunchAgent schedule must be Sunday-to-Thursday at 21:00")
+        raise ValueError(
+            "evening report must retry four times between 21:00 and 22:00 Sunday-to-Thursday"
+        )
     document["ProgramArguments"] = [interpreter, "-m", EVENING_REPORT_MODULE]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))

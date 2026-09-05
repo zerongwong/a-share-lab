@@ -50,13 +50,14 @@ def _digest() -> EveningResearchDigest:
     )
 
 
-def _paths(tmp_path: Path) -> dict[str, Path]:
+def _paths(tmp_path: Path) -> dict[str, object]:
     return {
         "csmar_root": tmp_path / "csmar",
         "overlay_root": tmp_path / "overlay",
         "reference_root": tmp_path / "reference",
         "state_root": tmp_path / "state",
         "log_root": tmp_path / "logs",
+        "_clock": lambda: datetime.now(UTC).replace(hour=13, minute=0, second=0),
     }
 
 
@@ -344,6 +345,9 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
         "plan_for_date",
         "provider_accepted_at",
         "provider_receipt_ids",
+        "chart_status",
+        "chart_reason",
+        "chart_attempts",
     }
     assert state["last_provider_accepted_common_cutoff"] == "2026-08-27"
     assert state["plan_for_date"] == "2026-08-28"
@@ -372,6 +376,144 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert {row["channel"] for row in delivery} == {"serverchan", "bark"}
     assert {row["provider_status"] for row in delivery} == {"provider_accepted"}
     assert all(row["detail_json"]["orders_enabled"] is False for row in delivery)
+
+
+def test_failed_chart_retries_only_image_with_fresh_publication_and_then_deduplicates(tmp_path):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    publisher = _PrivatePublisher()
+    messages = []
+    builds = []
+
+    def chart(*_args, **_kwargs):
+        builds.append(True)
+        if len(builds) == 1:
+            raise RuntimeError("private provider URL must not be logged")
+        return _holding_chart_result(portfolio)
+
+    def notifier(message):
+        messages.append(message)
+        return evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan",),
+            accepted_channels=("serverchan",),
+            image_accepted_channels=("serverchan",) if message.image_url else (),
+        )
+
+    options = dict(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=chart,
+        _holding_chart_publisher=publisher,
+        _notifier=notifier,
+    )
+    first = evening_report.run_evening_digest(**options)
+    assert first.event["chart_status"] == "pending"
+    assert first.event["chart_reason"] == "chart_generation_or_upload_failed"
+    assert "暂缺" in messages[0].body
+    second = evening_report.run_evening_digest(**options)
+    assert second.event["chart_status"] == "accepted"
+    assert second.event["text_already_accepted"] is True
+    assert "补图" in messages[1].title
+    assert "六期限计划" not in messages[1].body
+    assert messages[1].image_url is not None
+    assert len(publisher.published) == 1
+    third = evening_report.run_evening_digest(**options)
+    assert third.event["status"] == "noop_no_new_trading_day"
+    assert len(messages) == 2
+    state = (tmp_path / "state" / "evening-digest-state.json").read_text()
+    assert "signature" not in state
+
+
+def test_missing_chart_has_four_bounded_attempts_without_duplicate_text(tmp_path):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    messages = []
+    options = dict(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _notifier=lambda message: messages.append(message) or _accepted_summary(),
+    )
+    outcomes = [evening_report.run_evening_digest(**options) for _ in range(5)]
+    assert outcomes[3].event["chart_status"] == "exhausted"
+    assert outcomes[3].event["chart_attempts"] == 4
+    assert outcomes[4].event["status"] == "noop_no_new_trading_day"
+    assert len(messages) == 1
+
+
+def test_image_rejected_after_text_acceptance_is_revoked_and_republished_with_new_signature(
+    tmp_path,
+):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+
+    class Publisher(_PrivatePublisher):
+        def publish_png(self, payload):
+            receipt = super().publish_png(payload)
+            receipt.image_url += f"&attempt={len(self.published)}"
+            return receipt
+
+    publisher = Publisher()
+    messages = []
+
+    def notifier(message):
+        messages.append(message)
+        return evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan",),
+            accepted_channels=("serverchan",),
+            image_accepted_channels=("serverchan",) if len(messages) == 2 else (),
+        )
+
+    options = dict(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=lambda *_args, **_kwargs: _holding_chart_result(portfolio),
+        _holding_chart_publisher=publisher,
+        _notifier=notifier,
+    )
+    first = evening_report.run_evening_digest(**options)
+    assert first.event["chart_reason"] == "image_provider_not_accepted"
+    assert len(publisher.revoked) == 1
+    second = evening_report.run_evening_digest(**options)
+    assert second.event["chart_status"] == "accepted"
+    assert messages[0].image_url != messages[1].image_url
+    assert len(publisher.published) == 2
+    assert "六期限计划" not in messages[1].body
+
+
+def test_evening_window_and_plan_date_block_daytime_past_and_non_eve_reports(tmp_path):
+    for hour in (12, 22, 23):
+        options = _paths(tmp_path / str(hour))
+        options["_clock"] = lambda hour=hour: datetime(2026, 8, 27, hour - 8, tzinfo=UTC)
+        result = evening_report.run_evening_digest(
+            **options,
+            decision_date=CUTOFF,
+            _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not send")),
+        )
+        assert result.event["status"] == "noop_outside_evening_window"
+    result = evening_report.run_evening_digest(
+        **_paths(tmp_path / "past"),
+        decision_date=date(2026, 8, 31),
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+    assert result.event["status"] == "noop_not_next_session_eve"
 
 
 def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing(
@@ -1119,6 +1261,7 @@ def test_unverified_next_trading_day_fails_closed_before_notification(tmp_path: 
 def test_default_notifier_attempts_both_providers_and_keeps_independent_results(
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("ASHARE_EVENING_NOTIFICATION_CHANNELS", "serverchan,bark")
     from ashare_lab.cli import evening_digest
 
     closed: list[str] = []
@@ -1228,6 +1371,7 @@ def test_notifier_honors_serverchan_only_process_allow_list(monkeypatch) -> None
 def test_default_notifier_keeps_full_serverchan_body_and_uses_compact_bark_body(
     monkeypatch,
 ) -> None:
+    monkeypatch.setenv("ASHARE_EVENING_NOTIFICATION_CHANNELS", "serverchan,bark")
     from ashare_lab.cli import evening_digest
 
     seen: dict[str, str] = {}
@@ -1271,6 +1415,7 @@ def test_default_notifier_keeps_full_serverchan_body_and_uses_compact_bark_body(
 
 
 def test_oversize_body_without_compact_fails_closed_for_bark_only(monkeypatch) -> None:
+    monkeypatch.setenv("ASHARE_EVENING_NOTIFICATION_CHANNELS", "serverchan,bark")
     from ashare_lab.cli import evening_digest
 
     sent: list[str] = []

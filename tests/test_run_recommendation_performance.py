@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
@@ -192,6 +193,11 @@ class _Repository:
 
     def record_recommendation_batch_result(self, result):
         self.batch_results[str(result["batch_id"])] = dict(result)
+
+    def record_recommendation_settlement(self, *, batch_result, member_results):
+        for member in member_results:
+            self.record_recommendation_member_result(member)
+        self.record_recommendation_batch_result(batch_result)
 
     def list_maturity_results_pending_notification(self, *, limit=100):
         result = self.batch_results.get("batch-1w")
@@ -442,3 +448,57 @@ def test_renderer_does_not_renormalize_or_hide_cash() -> None:
     assert "股票仓收益" in message.body
     assert "总资金收益" in message.body
     assert "未入场现金" in message.body
+
+
+def test_maximum_price_rejection_is_reported_as_cash_not_missing_evidence() -> None:
+    repository = _Repository()
+    repository.members[0]["entry_plan_json"]["maximum_entry_price"] = 11.5
+    _run(repository=repository)
+    message = render_maturity_notification(
+        repository.get_recommendation_batch_performance("batch-1w")
+    )
+    assert "开盘超过最高买价，保持现金" in message.body
+    assert "未模拟成交，该权重保持现金" in message.body
+    assert "行动模拟证据不足" not in message.body
+    assert (
+        repository.batch_results["batch-1w"]["details_json"]["simulated_action_stock_sleeve_return"]
+        == 0.0
+    )
+
+
+def test_pre_fill_structure_failure_is_reported_even_if_day_later_recovers() -> None:
+    repository = _Repository()
+    repository.members[0]["entry_plan_json"]["maximum_entry_price"] = 13.0
+    store = _Store()
+    frame = store.frames[SESSIONS[1]]
+    frame.loc[frame["symbol"] == "600001", "open"] = 7.5
+    frame.loc[frame["symbol"] == "600001", "low"] = 7.3
+    _run(repository=repository, store=store)
+    message = render_maturity_notification(
+        repository.get_recommendation_batch_performance("batch-1w")
+    )
+    assert "开盘已触及或跌破保护线，保持现金" in message.body
+    assert "未模拟成交，该权重保持现金" in message.body
+    assert "行动模拟证据不足" not in message.body
+
+
+def test_sqlite_batch_error_is_isolated_and_later_batches_continue() -> None:
+    class Repository(_Repository):
+        def list_recommendation_batches_pending_settlement(self, **_kwargs):
+            return [{**self.batch, "id": "broken"}, self.batch]
+
+        def list_recommendation_members(self, batch_id):
+            return [{**self.members[0], "batch_id": batch_id}]
+
+        def record_recommendation_settlement(self, *, batch_result, member_results):
+            if batch_result["batch_id"] == "broken":
+                raise sqlite3.IntegrityError("test only")
+            super().record_recommendation_settlement(
+                batch_result=batch_result, member_results=member_results
+            )
+
+    repository = Repository()
+    result = _run(repository=repository)
+    assert result.failed_batch_ids == ("broken",)
+    assert result.persisted_batches == 1
+    assert set(repository.batch_results) == {"batch-1w"}

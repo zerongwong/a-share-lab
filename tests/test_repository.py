@@ -59,7 +59,179 @@ def test_initialize_is_idempotent_and_records_version(repository: SQLiteReposito
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert [row["version"] for row in versions] == [1, 2, 3, 4]
+    assert {1, 2, 3, 4, 6}.issubset({row["version"] for row in versions})
+
+
+def test_atomic_settlement_rolls_back_member_on_invalid_batch(repository: SQLiteRepository) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    member = {"member_id": "member-20260828-1w-1", "status": "pending", "method_version": "test-v1"}
+    batch = {
+        "batch_id": "batch-20260828-1w",
+        "status": "pending",
+        "method_version": "test-v1",
+        "entered_stock_sleeve_weight": 1.1,
+    }
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.record_recommendation_settlement(batch_result=batch, member_results=[member])
+    assert repository.get_recommendation_member_result(member["member_id"]) is None
+    assert repository.get_recommendation_batch_result(batch["batch_id"]) is None
+    with repository.connection() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM recommendation_settlement_history").fetchone()[
+                0
+            ]
+            == 0
+        )
+    batch["entered_stock_sleeve_weight"] = 1.0
+    repository.record_recommendation_settlement(batch_result=batch, member_results=[member])
+    repository.record_recommendation_settlement(batch_result=batch, member_results=[member])
+    with repository.connection() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM recommendation_settlement_history").fetchone()[
+                0
+            ]
+            == 1
+        )
+
+
+def test_roundoff_allocation_settles_through_real_sqlite(repository: SQLiteRepository) -> None:
+    from datetime import date
+
+    import pandas as pd
+
+    from ashare_lab.services.run_recommendation_performance import (
+        CorporateActionEvidence,
+        run_recommendation_performance,
+    )
+
+    weights = [0.4000000000000001, *([0.20000000000000004] * 3)]
+    symbols = ["600001.SH", "600002.SH", "600003.SH", "600004.SH"]
+    members = [
+        {
+            **_recommendation_member(),
+            "id": f"member-{index}",
+            "rank": index + 1,
+            "symbol": symbol,
+            "operational_stock_sleeve_weight": weight,
+            "operational_account_weight": weight * 0.3,
+            "entry_rule_json": {
+                "kind": "reclaim_close_confirmation",
+                "trigger_price": 10.0,
+                "invalidation_price": 8.0,
+            },
+        }
+        for index, (symbol, weight) in enumerate(zip(symbols, weights, strict=True))
+    ]
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[{**_recommendation_batch(), "member_count": 4}],
+        members=members,
+    )
+    repository.record_recommendation_delivery_event(
+        _accepted_delivery_event(event_id="original", delivery_kind="original_provider_accepted")
+    )
+    sessions = tuple(pd.bdate_range("2026-08-28", "2026-09-04").date)
+
+    class Store:
+        def read_verified_manifest(self, **_kwargs):
+            return pd.DataFrame(
+                {
+                    "trade_date": sessions,
+                    "previous_trade_date": (date(2026, 8, 27), *sessions[:-1]),
+                    "adjustment": "none",
+                }
+            )
+
+        def read_verified_daily(self, trade_date, **_kwargs):
+            return pd.DataFrame(
+                [
+                    {
+                        "symbol": symbol,
+                        "trade_date": trade_date,
+                        "open": 12.0,
+                        "close": 12.0,
+                        "high": 13.0,
+                        "low": 11.0,
+                        "volume_shares": 1000.0,
+                        "amount_cny": 12000.0,
+                    }
+                    for symbol in symbols
+                ]
+            )
+
+    summary = run_recommendation_performance(
+        repository=repository,
+        overlay_store=Store(),
+        notifier=None,
+        corporate_action_loader=lambda **kwargs: CorporateActionEvidence(
+            frozenset(kwargs["symbols"]), {}
+        ),
+    )
+    assert summary.persisted_batches == 1
+    assert summary.failed_batch_ids == ()
+    assert (
+        repository.get_recommendation_batch_result("batch-20260828-1w")[
+            "entered_stock_sleeve_weight"
+        ]
+        == 1.0
+    )
+
+
+def test_first_atomic_refresh_preserves_pre_migration_outcome(repository: SQLiteRepository) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    batch = {"batch_id": "batch-20260828-1w", "status": "needs_review", "method_version": "old-v1"}
+    member = {
+        "member_id": "member-20260828-1w-1",
+        "status": "needs_review",
+        "method_version": "old-v1",
+    }
+    repository.record_recommendation_member_result(member)
+    repository.record_recommendation_batch_result(batch)
+    repository.record_recommendation_settlement(
+        batch_result={**batch, "method_version": "new-v2", "status": "resolved"},
+        member_results=[{**member, "method_version": "new-v2", "status": "resolved"}],
+    )
+    with repository.connection() as connection:
+        versions = {
+            row[0]
+            for row in connection.execute(
+                "SELECT method_version FROM recommendation_settlement_history"
+            )
+        }
+    assert versions == {"old-v1", "new-v2"}
+
+
+@pytest.mark.parametrize("reason", ["entry_price_limit_exceeded", "entry_invalidated_before_fill"])
+def test_execution_price_limit_rejection_persists_as_not_entered(
+    repository: SQLiteRepository,
+    reason: str,
+) -> None:
+    repository.archive_recommendation_report(
+        _recommendation_report(),
+        batches=[_recommendation_batch()],
+        members=[_recommendation_member()],
+    )
+    repository.record_recommendation_member_result(
+        {
+            "member_id": "member-20260828-1w-1",
+            "status": reason,
+            "reason_code": reason,
+            "method_version": "test-v1",
+            "details_json": {"condition_triggered": True, "maximum_entry_price": 15.0},
+        }
+    )
+    result = repository.get_recommendation_member_result("member-20260828-1w-1")
+    assert result["status"] == "not_entered"
+    assert result["reason_code"] == reason
+    assert result["details_json"]["condition_triggered"] is True
 
 
 def test_archive_bundle_round_trip(repository: SQLiteRepository) -> None:

@@ -12,7 +12,11 @@ from ashare_lab.analytics.multi_timeframe import (
     MULTI_TIMEFRAME_METHOD_VERSION,
     SUPPORTED_HOLDING_WEEKS,
     BarTimeframe,
+    ExecutionState,
+    StructureState,
     TrendDirection,
+    _assess_execution,
+    _assess_structure,
     assess_all_horizons,
     assess_multi_timeframe,
     build_completed_timeframes,
@@ -444,3 +448,76 @@ def test_candidate_membership_is_separate_from_daily_execution() -> None:
 def test_horizon_contract_rejects_unsupported_period() -> None:
     with pytest.raises(ValueError, match="1, 2, 4, 13, 26 or 52"):
         horizon_contract(8)
+
+
+def _retest_history(*, breach: bool = False, touching: bool = True, reclaimed: bool = True):
+    frame = pd.DataFrame(
+        {
+            "open": [9.90] * 150,
+            "high": [10.0] * 150,
+            "low": [9.80] * 150,
+            "close": [9.90] * 150,
+            "amount_cny": [100.0] * 150,
+        }
+    )
+    frame.loc[147] = [10.0, 10.10, 9.98, 10.05, 180.0]
+    frame.loc[148] = [10.01, 10.08, 9.70 if breach else 9.98, 10.03, 90.0]
+    if touching:
+        frame.loc[149] = [10.01, 10.06, 9.95, 10.03 if reclaimed else 9.99, 90.0]
+    else:
+        frame.loc[149] = [10.40, 10.50, 10.35, 10.45, 90.0]
+    return frame
+
+
+@pytest.mark.parametrize("holding_weeks", SUPPORTED_HOLDING_WEEKS)
+def test_healthy_retest_requires_full_path_support_touch_and_reclaim(holding_weeks: int) -> None:
+    contract = horizon_contract(holding_weeks)
+    frame = _retest_history()
+    structure = _assess_structure(frame, contract)
+    execution = _assess_execution(frame, contract)
+    assert structure.state is StructureState.HEALTHY_PULLBACK
+    assert execution.state is ExecutionState.READY_PULLBACK
+    assert structure.post_breakout_floor_held is True
+    assert execution.latest_retest_touched and execution.latest_retest_reclaimed
+
+
+@pytest.mark.parametrize("holding_weeks", SUPPORTED_HOLDING_WEEKS)
+def test_intervening_breach_is_never_relabelled_healthy_after_recovery(holding_weeks: int) -> None:
+    contract = horizon_contract(holding_weeks)
+    frame = _retest_history(breach=True)
+    structure = _assess_structure(frame, contract)
+    execution = _assess_execution(frame, contract)
+    assert structure.state is StructureState.RECLAIM_WAIT
+    assert not structure.qualified
+    assert execution.state is ExecutionState.WAIT_RECLAIM
+    assert not execution.ready
+
+
+@pytest.mark.parametrize("holding_weeks", SUPPORTED_HOLDING_WEEKS)
+@pytest.mark.parametrize("conditions", ({"touching": False}, {"reclaimed": False}))
+def test_holding_above_line_without_retest_or_without_reclaim_is_not_ready(
+    holding_weeks: int, conditions: dict[str, bool]
+) -> None:
+    frame = _retest_history(**conditions)
+    contract = horizon_contract(holding_weeks)
+    assert _assess_structure(frame, contract).state is not StructureState.HEALTHY_PULLBACK
+    assert not _assess_execution(frame, contract).ready
+
+
+@pytest.mark.parametrize("holding_weeks", SUPPORTED_HOLDING_WEEKS)
+def test_volume_breakout_cannot_bypass_the_pre_event_base_width_contract(
+    holding_weeks: int,
+) -> None:
+    frame = _retest_history().iloc[:148].copy()
+    frame.loc[frame.index[:-1], "low"] = 4.0
+    contract = horizon_contract(holding_weeks)
+    assert _assess_structure(frame, contract).state is not StructureState.BREAKOUT
+    assert not _assess_execution(frame, contract).ready
+
+
+@pytest.mark.parametrize("holding_weeks", SUPPORTED_HOLDING_WEEKS)
+def test_compact_pre_event_base_still_allows_a_confirmed_breakout(holding_weeks: int) -> None:
+    frame = _retest_history().iloc[:148].copy()
+    contract = horizon_contract(holding_weeks)
+    assert _assess_structure(frame, contract).state is StructureState.BREAKOUT
+    assert _assess_execution(frame, contract).state is ExecutionState.READY_BREAKOUT

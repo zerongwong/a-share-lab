@@ -35,13 +35,15 @@ Unallocated capital is cash and borrowing is always zero.
 Risk formulas
 -------------
 
-* annual downside volatility uses zero as the minimum acceptable daily return;
+* annual downside volatility uses zero as the minimum acceptable daily return,
+  with fixed shares and idle cash within each non-overlapping holding block;
 * the legacy 60-session rolling drawdown severity is retained as a reporting
   metric;
 * the binding rolling drawdown severity uses an overlapping window equal to the
   configured holding period, so one-, two-, four-, thirteen-, twenty-six-, and
   fifty-two-week research paths do not share one fixed risk horizon; both
-  calculations include each window's starting equity of one;
+  calculations start each window at equity one, hold shares and cash fixed,
+  and allow position weights to drift until that window ends;
 * 5-session ES95 is the positive loss magnitude of the mean of the worst 5% of
   non-overlapping, buy-and-hold-within-block portfolio returns;
 * down-period correlation is the largest pairwise Pearson correlation on dates
@@ -299,6 +301,7 @@ class AdaptivePortfolioMetrics:
     horizon_rolling_drawdown_window_sessions: int = ROLLING_DRAWDOWN_SESSIONS
     horizon_rolling_drawdown_window_count: int = 0
     horizon_rolling_max_drawdown_p90: float = 0.0
+    path_method_version: str = "fixed-shares-plus-cash-per-window-v1.0.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -783,6 +786,37 @@ def _non_overlapping_portfolio_returns(
     return stock_block_returns @ weights
 
 
+def _fixed_share_daily_returns(
+    returns: np.ndarray, weights: np.ndarray, sessions: int
+) -> np.ndarray:
+    """Daily account returns with fixed shares/cash within each holding block."""
+
+    usable = len(returns) // sessions * sessions
+    blocks = returns[-usable:].reshape(-1, sessions, returns.shape[1])
+    equity = (1.0 - float(weights.sum())) + np.cumprod(1.0 + blocks, axis=1) @ weights
+    start = np.ones((len(blocks), 1))
+    previous = np.concatenate((start, equity[:, :-1]), axis=1)
+    return (equity / previous - 1.0).reshape(-1)
+
+
+def _fixed_share_rolling_drawdown_magnitudes(
+    returns: np.ndarray, weights: np.ndarray, sessions: int
+) -> np.ndarray:
+    """Each rolling window starts with the same shares allocation and cash.
+
+    Reweighting daily would silently simulate a different strategy.  Each
+    window instead allows weights to drift until its end, without any trades.
+    """
+
+    if sessions < 2 or sessions > len(returns):
+        raise AdaptivePortfolioDataError("invalid fixed-share drawdown window")
+    windows = np.lib.stride_tricks.sliding_window_view(returns, sessions, axis=0)
+    stock_equity = np.cumprod(1.0 + windows, axis=2)
+    equity = (1.0 - float(weights.sum())) + np.einsum("nst,s->nt", stock_equity, weights)
+    equity = np.concatenate((np.ones((len(equity), 1)), equity), axis=1)
+    return -(equity / np.maximum.accumulate(equity, axis=1) - 1.0).min(axis=1)
+
+
 def _rolling_drawdown_magnitudes(
     portfolio_returns: np.ndarray,
     sessions: int = ROLLING_DRAWDOWN_SESSIONS,
@@ -844,22 +878,24 @@ def _evaluate_prepared(
     evaluation_method: str = CONTINUOUS_TARGET_OPERATION_METHOD,
     weight_method_version: str = WEIGHT_QUANTIZATION_METHOD_VERSION,
 ) -> AdaptivePortfolioEvaluation:
-    portfolio_returns = returns @ weights
+    portfolio_returns = _fixed_share_daily_returns(returns, weights, budget.holding_period_sessions)
     portfolio_downside = np.minimum(portfolio_returns, 0.0)
     annual_downside_volatility = float(
         np.sqrt(np.mean(np.square(portfolio_downside))) * math.sqrt(ANNUAL_SESSIONS)
     )
 
-    drawdown_magnitudes = _rolling_drawdown_magnitudes(
-        portfolio_returns,
+    drawdown_magnitudes = _fixed_share_rolling_drawdown_magnitudes(
+        returns,
+        weights,
         ROLLING_DRAWDOWN_SESSIONS,
     )
     drawdown_p90 = float(np.quantile(drawdown_magnitudes, 0.90))
     if budget.holding_period_sessions == ROLLING_DRAWDOWN_SESSIONS:
         horizon_drawdown_magnitudes = drawdown_magnitudes
     else:
-        horizon_drawdown_magnitudes = _rolling_drawdown_magnitudes(
-            portfolio_returns,
+        horizon_drawdown_magnitudes = _fixed_share_rolling_drawdown_magnitudes(
+            returns,
+            weights,
             budget.holding_period_sessions,
         )
     horizon_drawdown_p90 = float(np.quantile(horizon_drawdown_magnitudes, 0.90))

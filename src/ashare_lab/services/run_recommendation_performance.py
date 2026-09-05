@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
@@ -48,6 +49,10 @@ class RecommendationPerformanceRepository(Protocol):
     def record_recommendation_member_result(self, result: Mapping[str, Any]) -> None: ...
 
     def record_recommendation_batch_result(self, result: Mapping[str, Any]) -> None: ...
+
+    def record_recommendation_settlement(
+        self, *, batch_result: Mapping[str, Any], member_results: Sequence[Mapping[str, Any]]
+    ) -> None: ...
 
     def list_maturity_results_pending_notification(
         self, *, limit: int = 100
@@ -87,6 +92,23 @@ class CorporateActionEvidenceLoader(Protocol):
         start: date,
         end: date,
     ) -> CorporateActionEvidence: ...
+
+
+def load_available_local_corporate_action_evidence(
+    *, symbols: tuple[str, ...], start: date, end: date
+) -> CorporateActionEvidence:
+    """Optional shared evidence hook; absent infrastructure never implies clear."""
+
+    try:
+        from ashare_lab.services.corporate_action_evidence import (
+            load_local_corporate_action_evidence,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "ashare_lab.services.corporate_action_evidence":
+            raise
+        return CorporateActionEvidence(frozenset(), {})
+    evidence = load_local_corporate_action_evidence(symbols=symbols, start=start, end=end)
+    return CorporateActionEvidence(evidence.coverage_symbols, evidence.action_dates_by_symbol)
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,17 +185,20 @@ def run_recommendation_performance(
                 evidence=evidence,
             )
             evaluated += 1
+            member_records = []
             for member_result in result.members:
                 record = member_performance_record(member_result)
                 record["evaluated_at"] = now.isoformat()
-                repository.record_recommendation_member_result(record)
+                member_records.append(record)
             batch_record = batch_performance_record(result)
             batch_record["evaluated_at"] = now.isoformat()
-            repository.record_recommendation_batch_result(batch_record)
+            repository.record_recommendation_settlement(
+                batch_result=batch_record, member_results=member_records
+            )
             persisted += 1
             if result.maturity_date is not None and result.status.value != "pending":
                 mature += 1
-        except (AShareLabError, KeyError, TypeError, ValueError, OSError) as exc:
+        except (AShareLabError, KeyError, TypeError, ValueError, OSError, sqlite3.Error) as exc:
             # Fail closed and keep the cohort pending for a later, auditable retry.
             failures.append(batch_id or f"unknown:{type(exc).__name__}")
 
@@ -268,7 +293,8 @@ def render_maturity_notification(performance: Mapping[str, Any]) -> Notification
     lines = [
         f"**{nature}**",
         f"计划日：{plan_date}　到期日：{maturity_date}",
-        "口径：发布参考价→到期收盘；未复权价格收益，不含分红；原权重、不重标。",
+        "口径：发布参考价→到期收盘；原权重、不重标。固定持有价格表现未计分红、交易费用和期间止损换股，不代表实际账户收益。",
+        _holding_clock_label(batch),
         "",
         "### 逐股结果",
     ]
@@ -295,6 +321,8 @@ def render_maturity_notification(performance: Mapping[str, Any]) -> Notification
         member_details = member_details if isinstance(member_details, Mapping) else {}
         raw_change = _as_optional_float(member_details.get("raw_unadjusted_price_change"))
         status = str(member_result.get("status") or "unknown")
+        price_limit_blocked = member_result.get("reason_code") == "entry_price_limit_exceeded"
+        structure_invalidated = member_result.get("reason_code") == "entry_invalidated_before_fill"
         if entry is not None and close is not None and realized is not None:
             detail = f"{entry:.2f}→{close:.2f}，{_pct(realized)}"
         elif entry is not None and close is not None and raw_change is not None:
@@ -309,13 +337,25 @@ def render_maturity_notification(performance: Mapping[str, Any]) -> Notification
             )
         else:
             detail = _status_label(status, str(member_result.get("reason_code") or ""))
+        if price_limit_blocked:
+            detail = "开盘超过最高买价，保持现金；参考价观察 " + detail
+        elif structure_invalidated:
+            detail = "开盘已触及或跌破保护线，保持现金；参考价观察 " + detail
         lines.append(f"{index}. **{name} {symbol}**｜仓内{weight_text}｜{detail}")
         compact.append(f"{name}：{detail}")
         if mode == EvaluationMode.ACTION_SIMULATION.value:
             triggered = member_details.get("condition_triggered")
             simulated = _as_optional_float(member_details.get("simulated_action_return"))
             simulated_entry = _as_optional_float(member_details.get("simulated_entry_price"))
-            if triggered is False:
+            if price_limit_blocked:
+                lines.append(
+                    "   - 条件已确认，但次日开盘超出归档最高买价；未模拟成交，该权重保持现金。"
+                )
+            elif structure_invalidated:
+                lines.append(
+                    "   - 条件曾确认，但次日开盘已触及或跌破冻结保护线；未模拟成交，该权重保持现金。"
+                )
+            elif triggered is False:
                 lines.append("   - 行动条件未触发；该权重保持现金。")
             elif simulated is not None and simulated_entry is not None:
                 lines.append(
@@ -489,6 +529,15 @@ def _nature_label(mode: str, archive_nature: str) -> str:
     if mode == EvaluationMode.ACTION_SIMULATION.value:
         return "正式行动组合"
     return "原始观察组合（不计入正式行动业绩）"
+
+
+def _holding_clock_label(batch: Mapping[str, Any]) -> str:
+    metadata = batch.get("metadata_json") or {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    if metadata.get("holding_clock") == "calendar":
+        return "到期时钟：自然周/月/年；非交易日顺延至下一交易日。"
+    return "到期时钟：原归档交易日口径（5/10/20/60/120/252日）。"
 
 
 def _status_label(status: str, reason: str) -> str:

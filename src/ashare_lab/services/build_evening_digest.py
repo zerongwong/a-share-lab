@@ -147,6 +147,16 @@ class EveningDigestCandidate:
     price_plan_invalidation_price: float | None = None
     price_plan_cutoff: date | None = None
     price_plan_method_version: str | None = None
+    price_plan_initial_risk_reference_price: float | None = None
+    price_plan_initial_risk_fraction: float | None = None
+    price_plan_maximum_entry_price: float | None = None
+    price_plan_initial_risk_qualified: bool | None = None
+    price_plan_initial_risk_reason: str | None = None
+    price_plan_initial_protection_support: float | None = None
+    price_plan_initial_protection_atr: float | None = None
+    price_plan_initial_protection_evidence_date: date | None = None
+    price_plan_initial_protection_atr_cutoff: date | None = None
+    price_plan_initial_protection_method_version: str | None = None
 
 
 DifferenceReason = Literal[
@@ -533,7 +543,7 @@ def _render_notification_summary(
     )
     cycle = _truncate_utf8(_clean_text(digest.cycle_label), cycle_bytes)
     posture = _cycle_posture(digest.entry_strictness)
-    title = f"# {plan} A股研究计划" if markdown else f"{plan} A股研究计划"
+    title = f"# 🪻 {plan} A股研究计划" if markdown else f"{plan} A股研究计划"
     lines = [
         title,
         f"数据{digest.common_cutoff.isoformat()}｜{cycle}｜{posture}｜"
@@ -542,7 +552,7 @@ def _render_notification_summary(
     if digest.plan_for_date is None:
         lines.append("计划日未通过交易日历确认｜不据此执行")
     if include_holding_summary:
-        lines.extend(("", "## 当前持仓修枝" if markdown else "当前持仓修枝"))
+        lines.extend(("", "## 🩵 当前持仓修枝" if markdown else "当前持仓修枝"))
         lines.extend(
             _holding_review_lines(
                 holding_review,
@@ -550,7 +560,7 @@ def _render_notification_summary(
                 reason_bytes=price_bytes,
             )
         )
-    lines.extend(("", "## 六期限计划" if markdown else "六期限计划"))
+    lines.extend(("", "## 🌸 六期限计划" if markdown else "六期限计划"))
     for period in digest.periods:
         if period.failure_code is not None:
             lines.append(f"- {period.label}｜数据不足")
@@ -558,21 +568,37 @@ def _render_notification_summary(
         if not period.candidates:
             lines.append(f"- {period.label}｜无合格")
             continue
+        actionable = (
+            period.performance_nature == "official_action" and period.action_stock_exposure > 0
+        )
+        status = f"计划总仓{period.action_stock_exposure:.0%}" if actionable else "仅观察·暂不建仓"
         candidates: list[str] = []
         for candidate in period.candidates:
             symbol = _truncate_utf8(_symbol(candidate.symbol), 12)
             name = _truncate_utf8(_clean_text(candidate.name), name_bytes)
             sleeve = (
                 "—"
-                if candidate.stock_sleeve_weight is None
+                if not actionable
+                or candidate.allocation_nature != "action_research"
+                or candidate.evidence_pending
+                or candidate.stock_sleeve_weight is None
                 else f"{candidate.stock_sleeve_weight:.0%}"
             )
-            price = _truncate_utf8(
-                _compact_price_condition(candidate.price_condition),
-                price_bytes,
+            compact_price = _compact_price_condition(candidate.price_condition)
+            if sleeve == "—":
+                # The allocation label already says observation. Keep that
+                # qualification once instead of spending bytes on it twice.
+                compact_price = compact_price.removeprefix("观察")
+            # Never shorten a risk-bounded entry condition: truncation can
+            # silently remove the buy-price ceiling or the volume condition.
+            price = (
+                compact_price
+                if candidate.price_plan_maximum_entry_price is not None
+                else _truncate_utf8(compact_price, price_bytes)
             )
-            candidates.append(f"{name}({symbol}) {sleeve}@{price}")
-        lines.append(f"- {period.label}｜" + "；".join(candidates))
+            allocation = "观察" if sleeve == "—" else sleeve
+            candidates.append(f"{name}({symbol}) {allocation}@{price}")
+        lines.append(f"- {period.label}｜{status}｜" + "；".join(candidates))
     lines.extend(
         (
             "",
@@ -631,20 +657,37 @@ def _holding_review_row_line(
     reason_bytes: int,
 ) -> str:
     name = _truncate_utf8(_clean_text(row.name), name_bytes)
+    unverified_reference = any(
+        reason == "candidate_stop_not_persisted_without_company_action_clearance"
+        or reason.startswith("company_action_evidence_blocks_")
+        for reason in row.reasons
+    )
     action = {
-        HoldingAction.HOLD: "HOLD",
+        HoldingAction.HOLD: "持有",
         HoldingAction.TIGHTEN: "收紧",
         HoldingAction.REDUCE: "减仓",
         HoldingAction.EXIT: "退出",
         HoldingAction.REVIEW: "复核",
     }[row.action]
+    if row.action is HoldingAction.HOLD and unverified_reference:
+        action = "暂持有·待核验"
     horizon = _HORIZON_LABELS.get(row.holding_weeks, f"{row.holding_weeks}周")
-    protection = "保护线待核验" if row.effective_stop is None else f"保护线{row.effective_stop:.2f}"
+    if row.effective_stop is None:
+        protection = "参考线待核验" if unverified_reference else "保护线待核验"
+    elif unverified_reference:
+        protection = f"参考线{row.effective_stop:.2f}（待核验）"
+    else:
+        protection = f"保护线{row.effective_stop:.2f}"
     reason = _truncate_utf8(_holding_reason(row), reason_bytes)
     return f"- {name}({_symbol(row.symbol)})｜{horizon}｜{action}｜{protection}｜{reason}"
 
 
 def _holding_reason(row: HoldingTreeReviewRow) -> str:
+    if (
+        row.action is HoldingAction.HOLD
+        and "candidate_stop_not_persisted_without_company_action_clearance" in row.reasons
+    ):
+        return "除权/分红证据待核验"
     if row.status is HoldingReviewRowStatus.DATA_NOT_READY:
         if any("company_action_evidence_blocks" in reason for reason in row.reasons):
             return "除权/分红证据待核验，不作动作"
@@ -1059,6 +1102,33 @@ def _structured_plan_fields(plan: ConditionalEntryPlan | None) -> dict[str, Any]
         ),
         "price_plan_cutoff": None if cutoff is None else _as_date(cutoff),
         "price_plan_method_version": _clean_optional_text(getattr(plan, "method_version", None)),
+        **{
+            f"price_plan_{name}": _positive_optional(getattr(plan, name, None))
+            for name in (
+                "initial_risk_reference_price",
+                "maximum_entry_price",
+                "initial_protection_support",
+                "initial_protection_atr",
+            )
+        },
+        "price_plan_initial_risk_fraction": _optional_fraction(
+            getattr(plan, "initial_risk_fraction", None)
+        ),
+        "price_plan_initial_risk_qualified": (
+            getattr(plan, "initial_risk_qualified", None)
+            if isinstance(getattr(plan, "initial_risk_qualified", None), bool)
+            else None
+        ),
+        **{
+            f"price_plan_{name}": _clean_optional_text(getattr(plan, name, None))
+            for name in ("initial_risk_reason", "initial_protection_method_version")
+        },
+        **{
+            f"price_plan_{name}": (
+                None if getattr(plan, name, None) is None else _as_date(getattr(plan, name))
+            )
+            for name in ("initial_protection_evidence_date", "initial_protection_atr_cutoff")
+        },
     }
 
 
@@ -1495,6 +1565,36 @@ def _format_plan(
         or plan.sessions != expected_sessions
     ):
         return None
+    maximum = _positive_optional(getattr(plan, "maximum_entry_price", None))
+    if maximum is not None:
+        upper = math.floor(maximum * 100 + 1e-9) / 100
+        raw_lower = (
+            plan.price_low
+            if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK
+            else plan.trigger_price
+        )
+        lower = _positive_optional(raw_lower)
+        if lower is None:
+            return None
+        lower = math.ceil(lower * 100 - 1e-9) / 100
+        if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
+            high = _positive_optional(plan.price_high)
+            if high is None:
+                return None
+            upper = min(upper, math.floor(high * 100 + 1e-9) / 100)
+        if lower > upper:
+            return f"不入场：门槛{lower:.2f}>上限{upper:.2f}"
+        if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
+            return f"回踩{lower:.2f}–{upper:.2f}"
+        if plan.kind not in (
+            ConditionalEntryPlanKind.RECLAIM,
+            ConditionalEntryPlanKind.VOLUME_BREAKOUT,
+        ):
+            return None
+        volume = "+量" if plan.kind is ConditionalEntryPlanKind.VOLUME_BREAKOUT else ""
+        # The threshold confirms the prior close, not a lower bound for the
+        # following open. Keep that distinct from the actual buy-price cap.
+        return f"确认≥{lower:.2f}，买≤{upper:.2f}{volume}"
     if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
         low = _positive_optional(plan.price_low)
         high = _positive_optional(plan.price_high)
