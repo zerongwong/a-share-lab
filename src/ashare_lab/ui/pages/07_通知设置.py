@@ -226,6 +226,10 @@ def render() -> None:
 
     with st.container(border=True):
         st.subheader("Cloudflare R2 · 持仓K线图私有发布配置")
+        st.info(
+            "当前生产晚报按你的选择只发送精简文字和持仓预警，图片外发已停用；"
+            "因此无需开通或配置R2。下面的配置仅为历史兼容保留，不会被定时晚报调用。"
+        )
         st.warning(
             "保存本页不会联网、上传或发送图片。"
             "存储桶必须保持私有，并在R2端配置1日自动删除；"

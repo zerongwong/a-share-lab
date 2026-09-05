@@ -63,7 +63,6 @@ from ashare_lab.services.build_holding_chart_report import (
 )
 from ashare_lab.services.chart_publisher_settings import (
     CLOUDFLARE_R2_PUBLISHER_ID,
-    build_configured_chart_publisher,
 )
 from ashare_lab.services.daily_update_lock import daily_update_lock
 from ashare_lab.services.holding_ledger import (
@@ -180,6 +179,7 @@ def run_evening_digest(
     _build_holding_review: HoldingReviewBuilder = build_evening_holding_review,
     _build_holding_chart_report: HoldingChartBuilder = build_holding_chart_report,
     _holding_chart_publisher: HoldingChartPublisher | None = None,
+    enable_holding_chart_delivery: bool = True,
     _clock: Callable[[], datetime] | None = None,
 ) -> EveningDigestOutcome:
     """Build/send once per verified common cutoff; never place an order."""
@@ -467,7 +467,8 @@ def run_evening_digest(
                 compact_body = None
             publication: _PublishedHoldingChart | None = None
             chart_requested = bool(
-                holding_identity is not None
+                enable_holding_chart_delivery
+                and holding_identity is not None
                 and holding_symbols
                 and holding_channels.issuperset(_HOLDING_CHART_CHANNELS)
                 and chart_channels == _HOLDING_CHART_CHANNELS
@@ -479,7 +480,8 @@ def run_evening_digest(
                 int(prior_state.get("chart_attempts", 0)) if text_already_accepted else 0
             ) + int(chart_requested)
             chart_delivery_authorized = bool(
-                holding_review is not None
+                enable_holding_chart_delivery
+                and holding_review is not None
                 and holding_symbols
                 and holding_identity is not None
                 and holding_channels.issuperset(_HOLDING_CHART_CHANNELS)
@@ -1186,12 +1188,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     publisher: PrivateImagePublisher | None = None
-    try:
-        configured = build_configured_chart_publisher()
-        if configured is not None and hasattr(configured, "publish_png"):
-            publisher = configured  # type: ignore[assignment]
-    except Exception:  # noqa: BLE001 - invalid/missing R2 setup means text-only fallback
-        publisher = None
+    # Outbound chart delivery is intentionally disabled.  The scheduled report
+    # is text-only by user preference; keeping the publisher construction out of
+    # this path also avoids R2 billing, upload retries, and signed-URL handling.
     try:
         outcome = run_evening_digest(
             csmar_root=args.csmar_root,
@@ -1200,6 +1199,7 @@ def main(argv: list[str] | None = None) -> int:
             state_root=args.state_root,
             log_root=args.log_root,
             _holding_chart_publisher=publisher,
+            enable_holding_chart_delivery=False,
         )
     finally:
         if publisher is not None:
