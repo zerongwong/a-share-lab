@@ -97,6 +97,10 @@ def build_recommendation_archive_bundle(
         "multi_timeframe_component_status": digest.multi_timeframe_component_status,
         "periods": canonical_periods,
     }
+    if digest.continuous_plan is not None:
+        if digest.periods:
+            raise ValueError("continuous decisions must not create fixed-maturity batches")
+        canonical_report["continuous_plan"] = digest.continuous_plan
     content_hash = _canonical_sha256(canonical_report)
     report_uuid = uuid5(NAMESPACE_URL, f"a-share-lab:recommendation-report:{content_hash}")
     report_id = str(report_uuid)

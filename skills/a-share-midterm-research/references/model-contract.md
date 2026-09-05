@@ -1,4 +1,8 @@
-# Medium-term model contract
+# A-share model contract
+
+Production uses [continuous-signal-v1](#current-production-mode-continuous-signal-v1),
+whose section below takes precedence over all legacy horizon/default/output
+rules. The fixed-horizon sections are preserved for historical research only.
 
 ## Version and implementation truth
 
@@ -369,3 +373,40 @@ review condition. A report declaring `multi-timeframe-contract-v0.2.0` must addi
 daily/weekly/monthly bar cutoffs, per-horizon structure/risk/LCB status, pairwise horizon overlap, and
 per-security difference attribution. The exact serialized field names may evolve, but these audit
 semantics may not be omitted.
+# Current production mode: continuous-signal-v1
+
+This section supersedes the **horizon/default/output** provisions of the legacy
+contract below; its evidence, privacy, point-in-time and no-order safeguards
+still apply. Do not silently reactivate six-horizon production recommendations.
+
+- One ongoing 3–5-stock research target, no forced holding deadline. Fewer
+  remaining positions or cash are valid; do not relax risk gates to fill slots.
+- Daily/completed-weekly signal windows are independently frozen. The old
+  `holding_weeks=4` transport field is not a sell date. Protect existing stops
+  from downward movement, including same-day recomputation/model migration.
+- Every new entry requires confirmed EARLY_UPTREND plus base breakout/healthy
+  retest and execution/evidence/risk gates. The 120-session <=15% early-stage
+  threshold is an unvalidated hypothesis, not absolute-bottom identification.
+  Do not reapply new-entry eligibility to intact existing holdings.
+- Keep the structural-stop/maximum-entry-price gate: prospective initial loss
+  distance <=8%, not a realized-loss guarantee. Unknown corporate-action
+  coverage (from entry through cutoff) blocks confirmed exit/stop persistence.
+- Lock actual retained weights and compare every admitted replacement plus
+  cash. Initial top36/beam128 search is approximate; single replacement is
+  enumerated on 10% total-account new-allocation steps. Do not round old weights.
+  One name per industry, <=30% total-account single-name cap and original risk
+  constraints remain binding; 1–2 remaining names do not waive risk-contribution limits.
+- Require an explicit whole-account snapshot and verified price/corporate-action
+  interval for drifted weights. No recommendation constitutes a confirmed sale,
+  purchase, deposit or withdrawal. Pending exits are local contingencies only.
+- Rank with the frozen historical 20-session return-LCB proxy; do not claim
+  future/global optimum Sharpe or validated dynamic-strategy returns. New
+  continuous decision/NAV records are separate from immutable legacy maturities.
+  Actual versus shadow, cash, open positions, costs and company actions must be
+  distinguished; absent evidence is unavailable, not zero return.
+- Only authorized ServerChan summaries/images may leave the local machine.
+  Verify exact holding version before disclosure; R2 secrets and raw financial
+  data are never report content. Provider acceptance is not end-device delivery.
+
+The remainder is the preserved fixed-horizon research contract, used only for
+explicit legacy comparisons and interpreting frozen historical archives.

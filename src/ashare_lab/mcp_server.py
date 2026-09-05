@@ -1081,8 +1081,9 @@ def build_server(settings: MCPSettings | None = None) -> Any:
 
     @server.tool(
         name="generate_portfolio",
-        title="生成中期主升研究组合",
+        title="生成旧版期限研究对照组合",
         description=(
+            "旧版固定期限研究对照，不是当前持续持仓的补位或微信行动计划。"
             "从本机已规范化的A股数据临时计算3至5股主升趋势研究组合和自动权重。"
             "只返回精简衍生结果，不归档、不下单；持有期可选1、2、4、13、26或52周。"
         ),

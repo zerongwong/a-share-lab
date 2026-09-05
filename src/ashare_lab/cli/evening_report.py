@@ -1,4 +1,4 @@
-"""Stable module name for the 21:00 six-horizon evening report."""
+"""Stable module name for the 21:00 continuous-portfolio evening report."""
 
 from __future__ import annotations
 

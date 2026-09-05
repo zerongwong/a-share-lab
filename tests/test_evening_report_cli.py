@@ -468,6 +468,7 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
         (tmp_path / "state" / "evening-digest-state.json").read_text(encoding="utf-8")
     )
     assert set(state) == {
+        "method_version",
         "accepted_channels",
         "delivery_confirmed",
         "last_provider_accepted_common_cutoff",
@@ -642,7 +643,8 @@ def test_evening_window_and_plan_date_block_daytime_past_and_non_eve_reports(tmp
         _build_digest=lambda **_kwargs: _digest(),
         _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not send")),
     )
-    assert result.event["status"] == "noop_not_next_session_eve"
+    assert result.event["status"] == "error"
+    assert result.event["reason"] == "verified_market_data_stale_for_tomorrow"
 
 
 def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing(
@@ -1683,7 +1685,7 @@ def test_friday_and_saturday_are_hard_noop_before_state_or_data_reads(
     assert all(entry["exit_code"] == evening_report.EXIT_OK for entry in entries)
 
 
-def test_sunday_with_no_new_cutoff_uses_normal_deduplication(tmp_path: Path) -> None:
+def test_sunday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
     state_path = paths["state_root"] / "evening-digest-state.json"
     state_path.parent.mkdir(parents=True)
@@ -1701,16 +1703,16 @@ def test_sunday_with_no_new_cutoff_uses_normal_deduplication(tmp_path: Path) -> 
         **paths,
         decision_date=SUNDAY,
         _latest_cutoff=lambda _root: CUTOFF,
-        _build_digest=lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("same cutoff must not rebuild on Sunday")
-        ),
+        _build_digest=lambda **_kwargs: _digest(),
+        _next_trading_day=lambda _cutoff: FRIDAY,
         _notifier=lambda _message: (_ for _ in ()).throw(
             AssertionError("same cutoff must not resend on Sunday")
         ),
     )
 
-    assert outcome.exit_code == evening_report.EXIT_OK
-    assert outcome.event["status"] == "noop_no_new_trading_day"
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["status"] == "error"
+    assert outcome.event["reason"] == "verified_market_data_stale_for_tomorrow"
 
 
 def test_busy_lock_is_logged_without_building_or_sending(tmp_path: Path) -> None:

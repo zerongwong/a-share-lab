@@ -408,6 +408,7 @@ def assess_multi_timeframe(
     as_of: object,
     holding_weeks: int,
     benchmark_frame: pd.DataFrame | None = None,
+    signal_contract: HorizonContract | None = None,
 ) -> MultiTimeframeAssessment:
     """Assess slow direction, middle structure, and daily execution.
 
@@ -417,7 +418,7 @@ def assess_multi_timeframe(
     looking daily candle from overriding a broken primary trend.
     """
 
-    contract = horizon_contract(holding_weeks)
+    contract = signal_contract or horizon_contract(holding_weeks)
     bars = build_completed_timeframes(frame, as_of=as_of)
     return _assess_completed_timeframes(
         bars,

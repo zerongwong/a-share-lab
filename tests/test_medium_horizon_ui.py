@@ -9,7 +9,8 @@ UI_ROOT = PROJECT_ROOT / "src" / "ashare_lab" / "ui"
 def test_main_router_registers_research_and_notification_settings_only() -> None:
     source = (UI_ROOT / "A股研究室.py").read_text(encoding="utf-8")
 
-    assert '_existing_page("08")' in source
+    assert '_existing_page("10")' in source
+    assert '_existing_page("08")' not in source
     assert '_existing_page("07")' in source
     assert '_existing_page("03")' not in source
     assert '_existing_page("06")' not in source

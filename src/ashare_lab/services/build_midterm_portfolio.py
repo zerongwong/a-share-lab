@@ -41,6 +41,10 @@ from ashare_lab.analytics.adaptive_portfolio import (
     AdaptiveRiskBudget,
     optimize_adaptive_portfolio,
 )
+from ashare_lab.analytics.continuous_signals import (
+    CONTINUOUS_SIGNAL_CONTRACT,
+    assess_continuous_entry,
+)
 from ashare_lab.analytics.cycle_policy import (
     EntryStrictness,
     PriceCycleAssessment,
@@ -284,6 +288,9 @@ class MidtermPortfolioResult:
     # archive, official-calendar boundaries and validation path are complete.
     central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
     multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    # Local-only complete admission universe, not truncated to the beam pool.
+    # Contains return series: never serialize into notifications or archives.
+    qualified_entry_universe: tuple[MidtermCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,6 +390,7 @@ def build_midterm_portfolio(
     minimum_universe_size: int = 1_000,
     minimum_balance_sheet_strength: float = 0.10,
     minimum_historical_return_lcb: float = 0.0,
+    continuous_entry_policy: bool = False,
 ) -> MidtermPortfolioResult:
     """Return one risk-budget-passing 3--5 stock research portfolio.
 
@@ -393,6 +401,8 @@ def build_midterm_portfolio(
     never translated into a neutral score.
     """
 
+    if continuous_entry_policy and holding_weeks != 4:
+        raise ValueError("continuous policy uses frozen daily/weekly observation windows")
     if holding_weeks not in HOLDING_PERIOD_SESSIONS:
         raise ValueError("holding_weeks must be one of 1, 2, 4, 13, 26 or 52")
     if candidate_pool_size < 5:
@@ -487,7 +497,9 @@ def build_midterm_portfolio(
             reasons=("price_cycle_evidence_unavailable",),
         )
 
-    contract = horizon_contract(holding_weeks)
+    contract = (
+        CONTINUOUS_SIGNAL_CONTRACT if continuous_entry_policy else horizon_contract(holding_weeks)
+    )
     holding_sessions = HOLDING_PERIOD_SESSIONS[holding_weeks]
     budget = _resolve_risk_budget(
         price_cycle,
@@ -508,10 +520,9 @@ def build_midterm_portfolio(
             continue
         assert item is not None
         try:
+            signal_kwargs = {"signal_contract": contract} if continuous_entry_policy else {}
             timeframe = assess_multi_timeframe(
-                frame,
-                as_of=cutoff,
-                holding_weeks=holding_weeks,
+                frame, as_of=cutoff, holding_weeks=holding_weeks, **signal_kwargs
             )
         except MultiTimeframeDataError as exc:
             exclusions.append(CandidateExclusion(symbol, (f"multi_timeframe_data:{exc}",)))
@@ -534,6 +545,11 @@ def build_midterm_portfolio(
                 )
             )
             continue
+        if continuous_entry_policy:
+            admission = assess_continuous_entry(stage, timeframe)
+            if not admission.qualified:
+                exclusions.append(CandidateExclusion(symbol, admission.reasons))
+                continue
         if not timeframe.candidate_qualified:
             exclusions.append(
                 CandidateExclusion(
@@ -599,6 +615,16 @@ def build_midterm_portfolio(
     candidate_actions = {
         candidate.symbol: _candidate_action(candidate, price_cycle) for candidate in candidates
     }
+    qualified_entry_universe = (
+        tuple(
+            candidate
+            for candidate in candidates
+            if candidate.risk_history_available
+            and candidate_actions[candidate.symbol][0] is CandidateAction.CONDITIONAL_ENTRY
+        )
+        if continuous_entry_policy
+        else ()
+    )
     horizon_candidate_count = len(candidates)
     risk_eligible_candidates = [
         candidate for candidate in candidates if candidate.risk_history_available
@@ -622,6 +648,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
             risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
@@ -643,6 +670,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
             risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
@@ -672,6 +700,7 @@ def build_midterm_portfolio(
         budget=budget,
         beam_width=beam_width,
         minimum_historical_return_lcb=minimum_historical_return_lcb,
+        continuous_policy=continuous_entry_policy,
     )
     research_best: AdaptivePortfolioEvaluation | None = None
     observation_best: AdaptivePortfolioEvaluation | None = None
@@ -734,6 +763,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
             risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
@@ -769,6 +799,7 @@ def build_midterm_portfolio(
         budget=budget,
         beam_width=beam_width,
         minimum_historical_return_lcb=minimum_historical_return_lcb,
+        continuous_policy=continuous_entry_policy,
     )
 
     if not any(viable_by_count.values()):
@@ -777,6 +808,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
             risk_history_eligible_candidate_count=risk_history_eligible_candidate_count,
@@ -892,6 +924,7 @@ def build_midterm_portfolio(
         holding_weeks=holding_weeks,
         positions=positions,
         research_candidates=research_candidates,
+        qualified_entry_universe=qualified_entry_universe,
         stock_exposure=best.stock_exposure,
         cash_weight=best.cash_weight,
         borrowed_weight=0.0,
@@ -1933,6 +1966,8 @@ def _beam_candidate_sets(
     candidates: list[MidtermCandidate],
     stock_count: int,
     beam_width: int,
+    *,
+    one_per_industry: bool = False,
 ) -> tuple[tuple[int, ...], ...]:
     correlations: dict[tuple[int, int], float] = {}
     for left in range(len(candidates)):
@@ -1953,6 +1988,10 @@ def _beam_candidate_sets(
             remaining = stock_count - len(state) - 1
             stop = len(candidates) - remaining
             for index in range(start, stop):
+                if one_per_industry and any(
+                    candidates[index].industry == candidates[prior].industry for prior in state
+                ):
+                    continue
                 expanded.append((*state, index))
         expanded.sort(
             key=lambda state: (
@@ -2010,6 +2049,7 @@ def _search_candidate_portfolios(
     budget: AdaptiveRiskBudget,
     beam_width: int,
     minimum_historical_return_lcb: float,
+    continuous_policy: bool = False,
 ) -> tuple[
     dict[
         int,
@@ -2037,7 +2077,9 @@ def _search_candidate_portfolios(
     for stock_count in (3, 4, 5):
         if len(search_pool) < stock_count:
             continue
-        for indices in _beam_candidate_sets(search_pool, stock_count, beam_width):
+        for indices in _beam_candidate_sets(
+            search_pool, stock_count, beam_width, one_per_industry=continuous_policy
+        ):
             selected = tuple(search_pool[index] for index in indices)
             try:
                 adaptive = _evaluate_candidate_set(selected, budget)
@@ -2045,6 +2087,10 @@ def _search_candidate_portfolios(
                 continue
             evaluated += 1
             rejection_reasons = list(adaptive.risk_budget.violations)
+            if continuous_policy and any(
+                position.weight > 0.30 + 1e-9 for position in adaptive.positions
+            ):
+                rejection_reasons.append("single_account_position_above_30pct")
             if adaptive.metrics.holding_period_return_lcb < minimum_historical_return_lcb:
                 rejection_reasons.append("holding_period_return_lcb_below_minimum")
             if rejection_reasons:

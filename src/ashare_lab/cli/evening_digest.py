@@ -1,4 +1,4 @@
-"""Submit one deduplicated six-horizon digest to configured notification providers.
+"""Submit one deduplicated continuous digest, retaining legacy test/archive APIs.
 
 Credentials are read only from macOS Keychain.  The command has no account,
 brokerage or order capability.  Provider acceptance is not described as
@@ -52,7 +52,6 @@ from ashare_lab.services.archive_recommendation_report import (
 )
 from ashare_lab.services.build_evening_digest import (
     EveningResearchDigest,
-    build_evening_research_digest,
     format_cn_plan_date,
     render_evening_digest_bark_compact,
     render_evening_digest_markdown,
@@ -172,7 +171,7 @@ def run_evening_digest(
     state_root: str | Path | None = None,
     log_root: str | Path | None = None,
     decision_date: date | None = None,
-    _build_digest: DigestBuilder = build_evening_research_digest,
+    _build_digest: DigestBuilder | None = None,
     _notifier: Notifier | None = None,
     _latest_cutoff: LatestCutoffReader | None = None,
     _next_trading_day: NextTradingDayResolver | None = None,
@@ -234,6 +233,16 @@ def run_evening_digest(
     archiver = _archive_digest or _archive_original_digest
 
     def finish(outcome: EveningDigestOutcome) -> EveningDigestOutcome:
+        if outcome.exit_code != EXIT_OK and now.hour == 21 and now.minute >= 45:
+            _send_final_failure_notice(
+                repository=repository,
+                notifier=notifier,
+                state_root=resolved_state_root,
+                dataset_root=resolved_csmar,
+                overlay_root=resolved_overlay,
+                now=now,
+                holding_reviewer=_build_holding_review,
+            )
         _safe_write_log_outcome(log_path, outcome)
         return outcome
 
@@ -264,6 +273,10 @@ def run_evening_digest(
 
             prior_state = _read_state(state_path)
             last_sent = _state_cutoff(prior_state)
+            current_method_matches = (
+                _build_digest is not None
+                or prior_state.get("method_version") == "continuous-signal-v1"
+            )
             latest = latest_reader(resolved_overlay)
             retry_chart = (
                 prior_state.get("chart_status") == "pending"
@@ -276,6 +289,9 @@ def run_evening_digest(
                 and last_sent is not None
                 and latest <= last_sent
                 and not retry_chart
+                and current_method_matches
+                and _state_plan_for_date(prior_state)
+                == (target_date + timedelta(days=1)).isoformat()
             ):
                 return finish(
                     EveningDigestOutcome(
@@ -288,14 +304,32 @@ def run_evening_digest(
                     )
                 )
 
-            digest = _build_digest(
+            if _build_digest is None:
+                from ashare_lab.services.build_continuous_digest import (
+                    build_continuous_research_digest,
+                )
+
+                def digest_builder(**kwargs):
+                    return build_continuous_research_digest(
+                        **kwargs, repository=repository, known_at=now
+                    )
+            else:
+                digest_builder = _build_digest
+            digest = digest_builder(
                 dataset_root=resolved_csmar,
                 overlay_root=resolved_overlay,
                 reference_dataset_root=resolved_reference,
                 decision_date=target_date,
             )
-            text_already_accepted = last_sent == digest.common_cutoff
-            if last_sent is not None and digest.common_cutoff <= last_sent and not retry_chart:
+            text_already_accepted = last_sent == digest.common_cutoff and current_method_matches
+            if (
+                last_sent is not None
+                and digest.common_cutoff <= last_sent
+                and not retry_chart
+                and current_method_matches
+                and _state_plan_for_date(prior_state)
+                == (target_date + timedelta(days=1)).isoformat()
+            ):
                 return finish(
                     EveningDigestOutcome(
                         EXIT_OK,
@@ -323,6 +357,10 @@ def run_evening_digest(
                 )
             digest = replace(digest, plan_for_date=plan_for_date)
             if plan_for_date != target_date + timedelta(days=1):
+                if plan_for_date <= target_date:
+                    return finish(
+                        _error("verified_market_data_stale_for_tomorrow", common_cutoff=cutoff)
+                    )
                 return finish(
                     EveningDigestOutcome(
                         EXIT_OK,
@@ -336,8 +374,8 @@ def run_evening_digest(
             # Freeze the exact derived report before submitting it. Provider
             # outcomes and later maturity observations are append-only and can
             # never rewrite this recommendation snapshot.
-            archive = archiver(digest, repository)
             holding_identity: tuple[str, int] | None = None
+            current_ledger_identity: tuple[str, int] | None = None
             holding_symbols: tuple[str, ...] = ()
             holding_context = None
             holding_known_at = now
@@ -345,6 +383,9 @@ def run_evening_digest(
             chart_publisher_id: str | None = None
             try:
                 portfolio = get_active_holding_portfolio(repository)
+                current_ledger_identity = (
+                    None if portfolio is None else (portfolio.id, portfolio.version)
+                )
                 holding_channels = holding_summary_delivery_channels(portfolio)
                 chart_channels = holding_chart_delivery_channels(portfolio)
                 chart_publisher_id = holding_chart_publisher_id(portfolio)
@@ -384,6 +425,17 @@ def run_evening_digest(
                         holding_review = None
                 except Exception:  # noqa: BLE001 - private failure cannot suppress the plan
                     holding_review = None
+
+            if (
+                digest.continuous_plan is not None
+                and digest.continuous_plan.get("holding_based")
+                and digest.continuous_plan.get("holding_identity")
+                != (None if current_ledger_identity is None else list(current_ledger_identity))
+            ):
+                return finish(
+                    _error("holding_version_changed_before_submission", common_cutoff=cutoff)
+                )
+            archive = archiver(digest, repository)
 
             public_body = render_evening_digest_markdown(
                 digest,
@@ -527,7 +579,10 @@ def run_evening_digest(
 
             plan_label = format_cn_plan_date(plan_for_date)
             holding_guard = None
-            if holding_review is not None and holding_identity is not None:
+            if holding_identity is not None and (
+                holding_review is not None
+                or bool(digest.continuous_plan and digest.continuous_plan.get("holding_based"))
+            ):
 
                 def holding_guard_impl(channel_name: str) -> bool:
                     return channel_name in holding_channels and _holding_authorization_matches(
@@ -624,6 +679,7 @@ def run_evening_digest(
                 state_path,
                 {
                     "last_provider_accepted_common_cutoff": cutoff,
+                    "method_version": digest.method_version,
                     "plan_for_date": plan_for_date.isoformat(),
                     "provider_accepted_at": now.isoformat(),
                     "accepted_channels": list(notification.accepted_channels),
@@ -653,16 +709,98 @@ def run_evening_digest(
         return finish(_error("unexpected_evening_digest_error"))
 
 
+def _send_final_failure_notice(
+    *, repository, notifier, state_root, dataset_root, overlay_root, now, holding_reviewer
+):
+    """One fail-closed notice on the final retry; never claim a missing report.
+
+    A small holding-only review is independent of the full-market builder.
+    It uses the same per-provider authorization guard and exposes no credentials,
+    amounts or raw data. Provider errors cannot recurse into this function.
+    """
+    path = state_root / "evening-failure-notice-state.json"
+    try:
+        state = _read_state(path)
+        if state.get("accepted_date") == now.date().isoformat():
+            return
+        public = "今晚完整研究计划未能生成或提交。请勿把旧报告当作明日买入依据；没有自动下单。"
+        body, guard = public, None
+        try:
+            portfolio = get_active_holding_portfolio(repository)
+            channels = holding_summary_delivery_channels(portfolio)
+        except Exception:
+            portfolio, channels = None, frozenset()
+        if portfolio is not None and "serverchan" in channels:
+            identity = (portfolio.id, portfolio.version)
+            try:
+                cutoff = latest_verified_overlay_cutoff(overlay_root)
+            except Exception:
+                cutoff = None
+            if cutoff is not None:
+                try:
+                    review = holding_reviewer(
+                        repository,
+                        dataset_root=dataset_root,
+                        overlay_root=overlay_root,
+                        decision_date=cutoff,
+                        reviewed_at=now,
+                        persist=False,
+                        holding_context=holding_knowledge_context(portfolio, known_at=now),
+                    )
+                    if (review.portfolio_id, review.holding_version) == identity:
+                        from ashare_lab.services.build_evening_digest import _holding_review_lines
+
+                        lines = _holding_review_lines(review, name_bytes=36, reason_bytes=90)
+                        body += f"\n\n持仓单独核验（数据{cutoff}，非明日新买计划）：\n" + "\n".join(
+                            lines
+                        )
+
+                        def guard(channel):
+                            return channel == "serverchan" and _holding_authorization_matches(
+                                repository, expected_identity=identity, expected_channels=channels
+                            )
+                except Exception:
+                    body += "\n持仓核验也未完成：当前不确认持有或卖出。"
+        message = NotificationMessage(
+            title="A股计划未完成｜请勿沿用旧买入建议",
+            body=body,
+            group="A股研究室·晚间日报",
+            holding_authorization_guard=guard,
+            unauthorized_body=public if guard else None,
+        )
+        receipt = notifier(message)
+        if (
+            isinstance(receipt, EveningNotificationSummary)
+            and "serverchan" in receipt.accepted_channels
+        ):
+            _write_state(
+                path, {"accepted_date": now.date().isoformat(), "delivery_confirmed": False}
+            )
+    except Exception:
+        return
+
+
 def _archive_original_digest(
     digest: EveningResearchDigest,
     repository: SQLiteRepository,
 ) -> RecommendationArchiveBundle:
-    return archive_recommendation_report(
-        digest,
+    bundle = archive_recommendation_report(
+        replace(digest, periods=()) if digest.continuous_plan is not None else digest,
         repository,
         archive_nature="original",
         created_at=datetime.now(_SHANGHAI),
     )
+    if digest.continuous_plan is not None:
+        from ashare_lab.services.continuous_strategy_journal import archive_continuous_decision
+
+        with repository.connection() as connection:
+            archive_continuous_decision(
+                connection,
+                bundle.report_id,
+                digest.common_cutoff.isoformat(),
+                {"plan_for_date": digest.plan_for_date.isoformat(), **digest.continuous_plan},
+            )
+    return bundle
 
 
 def _holding_authorization_matches(

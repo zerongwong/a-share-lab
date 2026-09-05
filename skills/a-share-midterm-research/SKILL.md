@@ -1,6 +1,6 @@
 ---
 name: a-share-midterm-research
-description: Build or review an evidence-based 3-to-5-stock A-share research portfolio for holding periods from one week to one year, with one to three months as the default. Use when the user asks for A-share screening, a medium-term portfolio update, entry or invalidation levels, or a review combining CSMAR history, current LongBridge evidence, fundamentals, market regime, official announcements, and news.
+description: Build or review an evidence-based, low-frequency A-share research portfolio using entry and exit signals, locked existing holdings, and portfolio-aware replacements. Use for A-share screening, portfolio or protective-level reviews, and evidence-based strategy audits; retain fixed-horizon research only when explicitly requested.
 ---
 
 # A-share medium-term research
@@ -14,7 +14,7 @@ Read [references/model-contract.md](references/model-contract.md) before produci
 3. Apply all hard eligibility, data-quality, execution, and late-stage acceleration gates. Returning no portfolio is valid.
 4. Use current fundamentals, LongBridge read-only data, official announcements, and web news only after the quantitative screen has reduced the universe. Treat current snapshots as current evidence, not historical point-in-time data. A balance-sheet snapshot may enter only after both the decision date and price cutoff pass its conservative retrieval-time gate.
 5. Review the finalists with explicit bull, bear, data-quality, and portfolio-risk checks. Resolve conflicts from primary evidence rather than by majority vote.
-6. Compare feasible 3-, 4-, and 5-stock portfolios under one downside-risk budget. Four is the attention default, three keeps at least 30% cash, and five is allowed only when it materially improves diversification. Use automatic bounded inverse-downside-risk weights, no financing, and never place orders.
+6. For initial research compare feasible 3–5-stock sets under the risk budget. For an existing portfolio lock confirmed membership and drifted weights; compare all eligible single replacements jointly with retained holdings and cash. Do not turn an exit recommendation into a fill or spend unconfirmed proceeds. Missing account or corporate-action evidence blocks replacement, not permission to invent a new portfolio. No financing or orders.
 7. Archive the cutoff, input hashes, strategy version, exclusions, evidence links, factor coverage, and output before presenting the result.
 
 ## Tool boundaries
@@ -28,7 +28,7 @@ Read [references/model-contract.md](references/model-contract.md) before produci
 ## Output rules
 
 - State the data cutoff and data-quality limitations first.
-- Distinguish one-week entry timing, one-to-three-month core thesis, six-month validation, and one-year continuation conditions.
+- Default to one continuous plan without forced maturity, using fixed daily/completed-weekly signal windows. Show urgent holding risks first, then concise conditional entries, total-account weights, protection lines and cash. Fixed-horizon legacy comparisons must be explicitly labelled and cannot masquerade as the live replacement plan.
 - Show every hard-gate exclusion that materially changed the result, especially limit-up, suspension, unbuyable, late-stage acceleration, accounting quality, and concentration gates.
 - Report historical or walk-forward metrics with their method and confidence interval. Do not label in-sample statistics as forecasts.
 - Present scenario ranges, not guaranteed returns. If probability calibration is unavailable, say “not estimated.”

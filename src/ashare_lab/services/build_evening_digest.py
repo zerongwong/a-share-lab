@@ -296,6 +296,9 @@ class EveningResearchDigest:
     repeated_symbol_attributions: tuple[RepeatedSymbolAttribution, ...] = ()
     central_implementation_status: str = CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
     multi_timeframe_component_status: str = MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+    # New transport payload is derived only. Legacy periods/archives retain
+    # their original semantics and are never relabelled as dynamic returns.
+    continuous_plan: dict[str, Any] | None = None
 
 
 HybridLoader = Callable[..., HybridUniverseLoad]
@@ -471,6 +474,8 @@ def render_evening_digest_markdown(
 
     if not isinstance(digest, EveningResearchDigest):
         raise TypeError("digest must be an EveningResearchDigest")
+    if digest.continuous_plan is not None:
+        return _render_continuous_digest(digest, holding_review, include_holding_summary)
     for name_bytes, price_bytes, cycle_bytes in _NOTIFICATION_LAYOUT_BUDGETS:
         body = _render_notification_summary(
             digest,
@@ -515,6 +520,11 @@ def render_evening_digest_bark_compact(
 
     if not isinstance(digest, EveningResearchDigest):
         raise TypeError("digest must be an EveningResearchDigest")
+    if digest.continuous_plan is not None:
+        body = _render_continuous_digest(digest, holding_review, include_holding_summary)
+        if len(body.encode("utf-8")) > MAX_COMPACT_NOTIFICATION_BODY_BYTES:
+            raise ValueError("continuous report exceeds compact layout")
+        return body
     if any(len(period.candidates) > 5 for period in digest.periods):
         raise ValueError("Bark compact digest supports at most five candidates per period")
 
@@ -645,6 +655,46 @@ def _cycle_posture(entry_strictness: str) -> str:
     }.get(entry_strictness, "观望")
 
 
+def _render_continuous_digest(digest, review, include_holdings):
+    from ashare_lab.services.build_continuous_report import render_continuous_report
+
+    plan = digest.continuous_plan
+    assert plan is not None
+    private = bool(plan.get("holding_based"))
+    if private and not include_holdings:
+        entries, cash, note = [], None, "持仓授权待核验，组合补位信息暂不披露。"
+    else:
+        entries, cash, note = plan["entries"], plan["cash_weight"], plan["status_note"]
+    if private and include_holdings and review is None:
+        entries, cash, note = (
+            [],
+            None,
+            "本次持仓复核未完成，暂停发布补位；不把未知状态当成正常持有。",
+        )
+    if plan.get("pending_exit_symbols"):
+        # Hypothetical released cash is not spendable until the user confirms
+        # the exit and updates the snapshot. Keep the local comparison only.
+        entries, cash = [], None
+        note = "先处理卖出建议并确认实际成交；当前不发布可执行补位，确认后按新现金重新计算。"
+    lines = (
+        _holding_review_lines(review, name_bytes=36, reason_bytes=90) if include_holdings else []
+    )
+    # Remove only the legacy display horizon, never modify the registered
+    # ledger revision or the actual protective-stop values.
+    lines = [line.removeprefix("- ") for line in lines]
+    for label in _HORIZON_LABELS.values():
+        lines = [line.replace(f"｜{label}｜", "｜") for line in lines]
+    return render_continuous_report(
+        as_of=digest.common_cutoff,
+        plan_date=digest.plan_for_date,
+        market_summary=f"{digest.cycle_label}｜股票敞口上限{digest.max_stock_exposure:.0%}",
+        holding_lines=lines,
+        entries=entries,
+        cash_weight=cash,
+        status_note=note,
+    )
+
+
 def _holding_review_lines(
     review: HoldingTreeReviewSummary | None,
     *,
@@ -656,7 +706,7 @@ def _holding_review_lines(
     if review.status is HoldingReviewSummaryStatus.NO_HOLDINGS:
         if review.portfolio_id is not None:
             return ["- 已明确空仓｜如有变化请重新登记"]
-        return ["- 未登记持仓｜告诉我股票和周期后开始每日修枝"]
+        return ["- 未登记持仓｜确认股票与仓位后开始每日修枝"]
     if not review.rows:
         return ["- 持仓数据待复核｜本次不生成减仓或退出结论"]
     priority = {

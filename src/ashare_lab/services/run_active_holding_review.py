@@ -151,7 +151,9 @@ def load_active_holding_histories(
         )
     data_cutoff = overlay_dates[-1] if overlay_dates else baseline_cutoff
     contract = horizon_contract(portfolio.holding_weeks)
-    requested_sessions = contract.minimum_daily_sessions + 80
+    # The production continuous profile needs at least 140 sessions regardless
+    # of the historical ledger's compatibility holding_weeks field.
+    requested_sessions = max(140, contract.minimum_daily_sessions) + 80
     start = baseline_cutoff - timedelta(days=requested_sessions * 2 + 30)
 
     histories: dict[str, pd.DataFrame] = {}
@@ -272,6 +274,7 @@ def run_active_holding_review(
         persist=persist,
         company_action_clear_by_symbol=clearances,
         holding_context=holding_context,
+        continuous_profile=True,
     )
 
 
@@ -339,11 +342,15 @@ def _local_company_action_clearances(
             continue
         try:
             through_date = date.fromisoformat(str(through_raw))
+            from_raw = metadata.get("company_action_clear_from")
+            from_date = None if from_raw is None else date.fromisoformat(str(from_raw))
         except ValueError:
             continue
         if through_date < holding.entry_date or through_date > cutoff:
             # A pre-entry or future-dated assertion is not evidence for this
             # point-in-time holding review.
+            continue
+        if from_date is not None and (from_date > holding.entry_date or from_date > through_date):
             continue
         clearances[holding.symbol] = CompanyActionClearance(
             symbol=holding.symbol,
@@ -351,5 +358,6 @@ def _local_company_action_clearances(
             clear=explicit,
             source=source,
             evidence_id=evidence_id,
+            from_date=from_date,
         )
     return clearances

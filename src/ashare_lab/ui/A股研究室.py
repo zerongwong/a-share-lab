@@ -26,8 +26,8 @@ def _existing_page(prefix: str) -> Path:
 # codebase for a future separate project, but are intentionally not registered.
 pages = [
     st.Page(
-        _existing_page("08"),
-        title="中期主升组合",
+        _existing_page("10"),
+        title="持续信号组合",
         icon="📈",
         url_path="midterm-maintrend-portfolio",
         default=True,
@@ -52,9 +52,9 @@ with st.sidebar:
     st.caption("本地个人研究版 · 不连接券商 · 不自动下单")
     with st.expander("当前主模块", expanded=False):
         st.markdown(
-            "**中期主升组合：研究版。** 先筛主升趋势与明确介入点，再自动比较"
-            "3、4、5只组合并计算风险约束权重。默认研究3个月；"
-            "1周只观察入场节奏，1–3个月是核心持有期，6–12个月用于长期验证。"
+            "**持续信号组合：研究版。** 只跟踪一组股票，不设到期卖出。"
+            "初建与补位须通过早期趋势入场门；保留旧仓后联合比较替补和现金。"
+            "日线与完整周线是固定观察窗口，不是强制持有期限。"
         )
     with st.expander("证据与研究留档", expanded=False):
         st.write(

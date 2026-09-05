@@ -75,6 +75,7 @@ class CompanyActionClearance:
     clear: bool
     source: str
     evidence_id: str
+    from_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +112,7 @@ class HoldingTreeReviewRow:
     company_action_evidence_source: str | None = None
     company_action_clear_through: date | None = None
     method_version: str = HOLDING_TREE_METHOD_VERSION
+    company_action_clear_from: date | None = None
 
     @property
     def urgent(self) -> bool:
@@ -178,6 +180,7 @@ def review_active_holdings(
     persist: bool = True,
     company_action_clear_by_symbol: Mapping[str, CompanyActionClearance] | None = None,
     holding_context: HoldingKnowledgeContext | None = None,
+    continuous_profile: bool = False,
 ) -> HoldingTreeReviewSummary:
     """Review the newest explicit holding snapshot on verified completed bars.
 
@@ -234,6 +237,7 @@ def review_active_holdings(
             review_time=review_time,
             persist=persist,
             company_action_clearance=clearances.get(holding.symbol),
+            continuous_profile=continuous_profile,
         )
         for holding in portfolio.positions
         if holding.status == "active"
@@ -271,6 +275,7 @@ def _review_one(
     review_time: datetime,
     persist: bool,
     company_action_clearance: CompanyActionClearance | None,
+    continuous_profile: bool = False,
 ) -> HoldingTreeReviewRow:
     if not verified_close:
         return _failed_row(
@@ -319,10 +324,16 @@ def _review_one(
         bars = build_completed_timeframes(frame, as_of=cutoff)
         if bars.data_cutoff.date() != cutoff:
             raise MultiTimeframeDataError("holding_close_cutoff_mismatch")
+        from ashare_lab.analytics.continuous_signals import CONTINUOUS_SIGNAL_CONTRACT
+
+        profile_kwargs = (
+            {"signal_contract": CONTINUOUS_SIGNAL_CONTRACT} if continuous_profile else {}
+        )
         assessment = assess_multi_timeframe(
             frame,
             as_of=cutoff,
             holding_weeks=portfolio.holding_weeks,
+            **profile_kwargs,
         )
         if (
             assessment.slow_direction.direction is TrendDirection.INSUFFICIENT
@@ -353,7 +364,10 @@ def _review_one(
         previous_stop = None if stored["previous_stop"] is None else float(stored["previous_stop"])
     else:
         previous_stop = float(stored["effective_stop"])
-    effective_stop = max(candidate.stop, previous_stop or candidate.stop)
+    # Even a same-cutoff replay under a new signal profile must respect the
+    # latest stored line, not just yesterday's previous_stop.
+    stored_floor = candidate.stop if stored is None else float(stored["effective_stop"])
+    effective_stop = max(candidate.stop, previous_stop or candidate.stop, stored_floor)
     effective_stop = _price_floor(effective_stop)
     stop_raised = previous_stop is not None and effective_stop > previous_stop + 0.005
     close_below_stop = latest_close < effective_stop
@@ -366,6 +380,13 @@ def _review_one(
         company_action_clearance is not None
         and company_action_clearance.clear
         and company_action_clearance.through_date >= cutoff
+        and (
+            not continuous_profile
+            or (
+                company_action_clearance.from_date is not None
+                and company_action_clearance.from_date <= holding.entry_date
+            )
+        )
     )
     company_action_detected = bool(
         company_action_clearance is not None and not company_action_clearance.clear
@@ -401,6 +422,13 @@ def _review_one(
         f"atr_buffer_multiple:{ATR_BUFFER_MULTIPLE:.2f}",
         *action_reasons,
         *company_action_reasons,
+        *(
+            (f"company_action_coverage_from:{company_action_clearance.from_date.isoformat()}",)
+            if company_action_clearance is not None
+            and company_action_clearance.from_date is not None
+            else ()
+        ),
+        *(("signal_profile:continuous_daily_weekly_v1;no_expiry",) if continuous_profile else ()),
     )
     row = HoldingTreeReviewRow(
         symbol=holding.symbol,
@@ -437,6 +465,14 @@ def _review_one(
         company_action_clear_through=(
             None if company_action_clearance is None else company_action_clearance.through_date
         ),
+        company_action_clear_from=(
+            None if company_action_clearance is None else company_action_clearance.from_date
+        ),
+        method_version=(
+            f"{HOLDING_TREE_METHOD_VERSION}+continuous-v1"
+            if continuous_profile
+            else HOLDING_TREE_METHOD_VERSION
+        ),
     )
     if persist:
         evidence_hash = _evidence_hash(
@@ -459,7 +495,7 @@ def _review_one(
                 "source_timeframe": candidate.source_timeframe,
                 "evidence_date": candidate.evidence_date,
                 "holding_version": portfolio.version,
-                "method_version": HOLDING_TREE_METHOD_VERSION,
+                "method_version": row.method_version,
                 "details_json": {
                     "atr14": candidate.atr14,
                     "atr_cutoff": candidate.atr_cutoff.isoformat(),
@@ -468,6 +504,9 @@ def _review_one(
                     "support_kind": candidate.support_kind,
                     "calendar_boundary": "existing_multi_timeframe_conservative_fallback",
                     "company_action_evidence_id": company_action_clearance.evidence_id,
+                    "company_action_clear_from": None
+                    if company_action_clearance.from_date is None
+                    else company_action_clearance.from_date.isoformat(),
                 },
                 "updated_at": review_time,
             }
@@ -693,7 +732,7 @@ def _review_record(
     identity = hashlib.sha256(
         (
             f"{holding.position_key}|{portfolio.version}|{cutoff}|"
-            f"{HOLDING_TREE_METHOD_VERSION}|{evidence_hash}"
+            f"{row.method_version}|{evidence_hash}"
         ).encode()
     ).hexdigest()[:32]
     return {
@@ -722,7 +761,7 @@ def _review_record(
         "company_action_evidence_source": row.company_action_evidence_source,
         "company_action_clear_through": row.company_action_clear_through,
         "evidence_hash": evidence_hash,
-        "method_version": HOLDING_TREE_METHOD_VERSION,
+        "method_version": row.method_version,
         "created_at": review_time,
     }
 
@@ -796,6 +835,11 @@ def _evidence_hash(
                 "through_date": company_action_clearance.through_date.isoformat(),
                 "source": company_action_clearance.source,
                 "evidence_id": company_action_clearance.evidence_id,
+                **(
+                    {"from_date": company_action_clearance.from_date.isoformat()}
+                    if company_action_clearance.from_date is not None
+                    else {}
+                ),
             }
         ),
         "method_version": HOLDING_TREE_METHOD_VERSION,

@@ -269,6 +269,11 @@ def run_scheduled_sync(
 
             event = _report_event(report, now)
             if report.current_through_latest_complete_session:
+                _run_continuous_accounting(
+                    event,
+                    scheduler_root=resolved_scheduler_root,
+                    common_cutoff=report.common_cutoff,
+                )
                 if bool(prior_state.get("failure_active")):
                     recovery = _safe_notify(_notifier, _recovery_message(report))
                     event["recovery_notification_successful_channels"] = list(
@@ -397,6 +402,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(json.dumps(outcome.event, ensure_ascii=False, sort_keys=True, default=str))
     return outcome.exit_code
+
+
+def _run_continuous_accounting(event, *, scheduler_root, common_cutoff):
+    """Local-only explicit snapshots; no inference of trades from daily plans."""
+    from ashare_lab.services.run_continuous_performance import run_continuous_performance
+
+    try:
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db", project_root() / "migrations"
+        )
+        result = run_continuous_performance(repository, as_of=common_cutoff)
+        event["continuous_performance_status"] = result["status"]
+        event["continuous_valuations_recorded"] = result["valuations_recorded"]
+    except Exception:
+        event["continuous_performance_status"] = "error_retry_later"
 
 
 def _run_performance_reviews(

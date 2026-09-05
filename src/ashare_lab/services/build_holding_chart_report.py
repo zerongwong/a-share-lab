@@ -226,6 +226,7 @@ def build_holding_chart_report(
             holding_context=context,
         ),
         holding_context=context,
+        continuous_profile=True,
     )
     identity = HoldingChartReviewIdentity(
         portfolio_id=loaded.portfolio_id,
