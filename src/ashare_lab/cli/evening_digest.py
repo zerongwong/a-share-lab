@@ -74,6 +74,12 @@ from ashare_lab.services.holding_ledger import (
     holding_knowledge_context,
     holding_summary_delivery_channels,
 )
+from ashare_lab.services.render_holding_chart_report import (
+    COMPOSITE_WIDTH,
+    MAX_HOLDING_COUNT,
+    MIN_HOLDING_COUNT,
+    holding_chart_composite_height,
+)
 from ashare_lab.services.review_active_holdings import HoldingTreeReviewSummary
 from ashare_lab.services.run_active_holding_review import build_evening_holding_review
 
@@ -332,6 +338,7 @@ def run_evening_digest(
             # never rewrite this recommendation snapshot.
             archive = archiver(digest, repository)
             holding_identity: tuple[str, int] | None = None
+            holding_symbols: tuple[str, ...] = ()
             holding_context = None
             holding_known_at = now
             chart_channels: frozenset[str] = frozenset()
@@ -343,6 +350,7 @@ def run_evening_digest(
                 chart_publisher_id = holding_chart_publisher_id(portfolio)
                 if portfolio is not None and holding_channels:
                     holding_identity = (portfolio.id, portfolio.version)
+                    holding_symbols = tuple(position.symbol for position in portfolio.positions)
                     holding_context = holding_knowledge_context(
                         portfolio,
                         known_at=holding_known_at,
@@ -382,24 +390,33 @@ def run_evening_digest(
                 None,
                 include_holding_summary=False,
             )
-            public_compact_body = render_evening_digest_bark_compact(
-                digest,
-                None,
-                include_holding_summary=False,
-            )
+            try:
+                public_compact_body = render_evening_digest_bark_compact(
+                    digest,
+                    None,
+                    include_holding_summary=False,
+                )
+            except ValueError:
+                # An APNs layout failure must not suppress the independent
+                # ServerChan Markdown. Bark still enforces its own byte cap.
+                public_compact_body = None
             body = render_evening_digest_markdown(
                 digest,
                 holding_review,
                 include_holding_summary="serverchan" in holding_channels,
             )
-            compact_body = render_evening_digest_bark_compact(
-                digest,
-                holding_review,
-                include_holding_summary="bark" in holding_channels,
-            )
+            try:
+                compact_body = render_evening_digest_bark_compact(
+                    digest,
+                    holding_review,
+                    include_holding_summary="bark" in holding_channels,
+                )
+            except ValueError:
+                compact_body = None
             publication: _PublishedHoldingChart | None = None
             chart_requested = bool(
                 holding_identity is not None
+                and holding_symbols
                 and holding_channels.issuperset(_HOLDING_CHART_CHANNELS)
                 and chart_channels == _HOLDING_CHART_CHANNELS
                 and chart_publisher_id == CLOUDFLARE_R2_PUBLISHER_ID
@@ -411,6 +428,7 @@ def run_evening_digest(
             ) + int(chart_requested)
             chart_delivery_authorized = bool(
                 holding_review is not None
+                and holding_symbols
                 and holding_identity is not None
                 and holding_channels.issuperset(_HOLDING_CHART_CHANNELS)
                 and chart_channels == _HOLDING_CHART_CHANNELS
@@ -435,6 +453,7 @@ def run_evening_digest(
                         holding_review=holding_review,
                         expected_identity=holding_identity,
                         expected_cutoff=digest.common_cutoff,
+                        expected_symbols=holding_symbols,
                     )
                     if not _holding_chart_authorization_matches(
                         repository,
@@ -696,8 +715,9 @@ def _validated_holding_chart_payload(
     holding_review: HoldingTreeReviewSummary,
     expected_identity: tuple[str, int],
     expected_cutoff: date,
+    expected_symbols: tuple[str, ...],
 ) -> bytes:
-    """Allow only the four-position, eight-panel, disclosure-safe composite."""
+    """Allow only the exact registered holdings and their bounded 2N panels."""
 
     if result.status is not HoldingChartBuildStatus.READY or result.rendered is None:
         raise ValueError("holding chart is not ready")
@@ -715,13 +735,13 @@ def _validated_holding_chart_payload(
         or review_identity.data_cutoff != expected_cutoff
     ):
         raise ValueError("holding chart review identity mismatch")
-    expected_symbols = tuple(row.symbol for row in holding_review.rows)
     if (
-        len(expected_symbols) != 4
-        or metadata.panel_count != 8
+        not MIN_HOLDING_COUNT <= len(expected_symbols) <= MAX_HOLDING_COUNT
+        or tuple(row.symbol for row in holding_review.rows) != expected_symbols
+        or metadata.panel_count != 2 * len(expected_symbols)
         or tuple(metadata.symbols) != expected_symbols
-        or metadata.width != 1_200
-        or metadata.height != 3_600
+        or metadata.width != COMPOSITE_WIDTH
+        or metadata.height != holding_chart_composite_height(len(expected_symbols))
         or metadata.raw_rows_embedded is not False
         or metadata.sensitive_fields_embedded is not False
     ):

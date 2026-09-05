@@ -35,10 +35,13 @@ from ashare_lab.services.review_active_holdings import (
 )
 
 COMPOSITE_WIDTH: Final = 1200
+# Preserve the existing maximum external-image dimensions, including for five
+# holdings. Four holdings retain their original 1200-by-3600 layout.
 COMPOSITE_HEIGHT: Final = 3600
 INDIVIDUAL_WIDTH: Final = 1800
 INDIVIDUAL_HEIGHT: Final = 500
-EXPECTED_HOLDING_COUNT: Final = 4
+MIN_HOLDING_COUNT: Final = 1
+MAX_HOLDING_COUNT: Final = 5
 DAILY_BAR_LIMIT: Final = 150
 WEEKLY_BAR_LIMIT: Final = 52
 
@@ -268,10 +271,10 @@ class _LabelSpec:
 def render_holding_chart_report(
     request: HoldingChartReportRequest,
 ) -> RenderedHoldingChartReport:
-    """Return a local composite PNG, four local detail PNGs, and safe metadata.
+    """Return a local composite, one detail PNG per holding, and safe metadata.
 
     The function fails closed unless the request identifies exactly the same
-    ready four-position review snapshot and every history reaches that snapshot's
+    ready one-to-five-position snapshot and every history reaches that snapshot's
     verified cutoff.  Future rows are sliced away before every calculation.
     """
 
@@ -353,12 +356,13 @@ def render_holding_chart_report(
     metadata = HoldingChartReportMetadata(
         mime_type="image/png",
         width=COMPOSITE_WIDTH,
-        height=COMPOSITE_HEIGHT,
+        height=holding_chart_composite_height(len(prepared)),
         panel_count=len(panels),
         review_identity=request.expected_identity,
         symbols=tuple(item.symbol for item in prepared),
         panels=panels,
         individual_image_count=len(individual),
+        layout=f"single_column_{len(panels)}_panels",
     )
     return RenderedHoldingChartReport(
         composite_png=_encode_png(composite),
@@ -386,8 +390,8 @@ def _validated_review_rows(
         HoldingReviewSummaryStatus.PARTIAL,
     }:
         raise ValueError("holding review must be ready or company-action-only partial")
-    if len(review.rows) != EXPECTED_HOLDING_COUNT:
-        raise ValueError(f"exactly {EXPECTED_HOLDING_COUNT} reviewed holdings required")
+    if not MIN_HOLDING_COUNT <= len(review.rows) <= MAX_HOLDING_COUNT:
+        raise ValueError("one to five reviewed holdings required")
     symbols: set[str] = set()
     position_keys: set[str] = set()
     for row in review.rows:
@@ -522,19 +526,33 @@ def _load_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
     return ImageFont.load_default()
 
 
+def holding_chart_composite_height(holding_count: int) -> int:
+    """Size a nonempty holding report without increasing its existing cap."""
+
+    if (
+        isinstance(holding_count, bool)
+        or not isinstance(holding_count, int)
+        or not MIN_HOLDING_COUNT <= holding_count <= MAX_HOLDING_COUNT
+    ):
+        raise ValueError("one to five reviewed holdings required")
+    return min(900 * holding_count, COMPOSITE_HEIGHT)
+
+
 def _render_composite(
     holdings: tuple[_PreparedHolding, ...],
     identity: HoldingChartReviewIdentity,
     fonts: _FontBook,
 ) -> Image.Image:
-    image = Image.new("RGB", (COMPOSITE_WIDTH, COMPOSITE_HEIGHT), HOLDING_CHART_COLORS["canvas"])
+    height = holding_chart_composite_height(len(holdings))
+    panel_count = 2 * len(holdings)
+    image = Image.new("RGB", (COMPOSITE_WIDTH, height), HOLDING_CHART_COLORS["canvas"])
     draw = ImageDraw.Draw(image)
     _draw_report_header(draw, identity, fonts, width=COMPOSITE_WIDTH)
     outer_x = 24
     panel_gap = 12
     top = 112
     bottom = 24
-    panel_height = (COMPOSITE_HEIGHT - top - bottom - 7 * panel_gap) // 8
+    panel_height = (height - top - bottom - (panel_count - 1) * panel_gap) // panel_count
     panel_index = 0
     for holding_index, holding in enumerate(holdings, start=1):
         for timeframe, frame in (
@@ -1247,7 +1265,9 @@ __all__ = [
     "COMPOSITE_WIDTH",
     "DAILY_BAR_LIMIT",
     "EntryOverlayNature",
-    "EXPECTED_HOLDING_COUNT",
+    "MIN_HOLDING_COUNT",
+    "MAX_HOLDING_COUNT",
+    "holding_chart_composite_height",
     "HOLDING_CHART_COLORS",
     "HoldingChartConfirmedPivot",
     "HoldingChartEntryOverlay",

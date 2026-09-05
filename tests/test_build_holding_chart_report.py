@@ -362,6 +362,34 @@ def test_only_company_action_evidence_partial_is_chart_eligible(tmp_path: Path) 
     assert not _review_is_chart_eligible(ordinary_failure)
 
 
+@pytest.mark.parametrize(
+    "count, eligible",
+    [(0, False), (1, True), (2, True), (3, True), (4, True), (5, True), (6, False)],
+)
+def test_chart_build_count_gate_accepts_only_one_to_five(tmp_path, count, eligible):
+    ready = _review(_repository(tmp_path))
+    rows = tuple(
+        replace(ready.rows[index % 4], symbol=f"60000{index}", position_key=f"test:{index}")
+        for index in range(count)
+    )
+    assert _review_is_chart_eligible(replace(ready, rows=rows)) is eligible
+
+
+def test_chart_builder_rejects_subset_claiming_the_same_registered_identity(tmp_path):
+    repository = _repository(tmp_path)
+    review = _review(repository)
+    with pytest.raises(DataQualityError, match="membership"):
+        build_holding_chart_report(
+            repository,
+            dataset_root="unused",
+            overlay_root="unused",
+            as_of=CUTOFF,
+            _history_loader=lambda *_args, **_kwargs: _loaded(repository),
+            _reviewer=lambda *_args, **_kwargs: replace(review, rows=review.rows[:3]),
+            _renderer=lambda _request: pytest.fail("forged subset must not reach renderer"),
+        )
+
+
 def test_private_archive_is_deterministic_idempotent_and_prunes_only_owned_files(
     tmp_path: Path,
 ) -> None:

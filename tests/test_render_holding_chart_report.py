@@ -26,6 +26,7 @@ from ashare_lab.services.render_holding_chart_report import (
     _load_font,
     _merge_entry_label_specs,
     _resolve_label_positions,
+    holding_chart_composite_height,
     render_holding_chart_report,
 )
 from ashare_lab.services.review_active_holdings import (
@@ -160,6 +161,69 @@ def _request(
             ),
         ),
     )
+
+
+def _sized_request(count: int) -> HoldingChartReportRequest:
+    base = _request()
+    histories = dict(base.histories)
+    rows = list(base.review.rows[:count])
+    for index in range(len(rows), count):
+        symbol = f"60000{index}"
+        histories[symbol] = histories[SYMBOLS[0]].copy()
+        rows.append(
+            replace(
+                base.review.rows[0],
+                symbol=symbol,
+                name=f"合成持仓{index}",
+                position_key=f"position:{symbol}:v7",
+            )
+        )
+    symbols = {row.symbol for row in rows}
+    return replace(
+        base,
+        review=replace(base.review, rows=tuple(rows)),
+        histories={symbol: frame for symbol, frame in histories.items() if symbol in symbols},
+        entry_overlays=tuple(item for item in base.entry_overlays if item.symbol in symbols),
+        confirmed_pivots=tuple(item for item in base.confirmed_pivots if item.symbol in symbols),
+    )
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+def test_registered_holding_count_generates_exactly_two_panels_each(count: int) -> None:
+    request = _sized_request(count)
+    result = render_holding_chart_report(request)
+    height = holding_chart_composite_height(count)
+    assert height == {1: 900, 2: 1800, 3: 2700, 4: 3600, 5: 3600}[count]
+    assert result.metadata.symbols == tuple(row.symbol for row in request.review.rows)
+    assert result.metadata.panel_count == len(result.metadata.panels) == 2 * count
+    assert result.metadata.layout == f"single_column_{2 * count}_panels"
+    assert result.metadata.individual_image_count == len(result.individual_pngs) == count
+    assert result.metadata.review_identity == request.expected_identity
+    assert result.metadata.sensitive_fields_embedded is False
+    assert result.metadata.raw_rows_embedded is False
+    with Image.open(BytesIO(result.composite_png)) as image:
+        assert image.size == (COMPOSITE_WIDTH, height)
+        assert height <= COMPOSITE_HEIGHT
+        assert not image.info
+        pixels = np.asarray(image)
+        panel_height = (height - 112 - 24 - (2 * count - 1) * 12) // (2 * count)
+        for index in range(2 * count):
+            y0 = 112 + index * (panel_height + 12)
+            assert tuple(pixels[y0 + 5, COMPOSITE_WIDTH // 2]) == HOLDING_CHART_COLORS["panel"]
+    for index, row in enumerate(request.review.rows):
+        assert [
+            (panel.symbol, panel.timeframe)
+            for panel in result.metadata.panels[2 * index : 2 * index + 2]
+        ] == [
+            (row.symbol, "daily"),
+            (row.symbol, "weekly_completed"),
+        ]
+
+
+@pytest.mark.parametrize("count", [0, 6])
+def test_empty_or_excess_holdings_are_not_rendered(count: int) -> None:
+    with pytest.raises(ValueError, match="one to five"):
+        render_holding_chart_report(_sized_request(count))
 
 
 def test_render_valid_deterministic_png_with_eight_audited_panels() -> None:
@@ -363,8 +427,8 @@ def test_invalid_identity_count_symbols_and_stale_history_fail_closed() -> None:
                 expected_identity=replace(_identity(), holding_version=8),
             )
         )
-    with pytest.raises(ValueError, match="exactly 4"):
-        render_holding_chart_report(_request(histories, replace(review, rows=review.rows[:3])))
+    with pytest.raises(ValueError, match="one to five"):
+        render_holding_chart_report(_request(histories, replace(review, rows=())))
 
     duplicate_histories = dict(histories)
     duplicate_histories["600919.SH"] = histories["600919"]

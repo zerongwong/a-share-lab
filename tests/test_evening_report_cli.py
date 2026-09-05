@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.cli import evening_report
@@ -21,8 +24,10 @@ from ashare_lab.services.holding_ledger import (
     HOLDING_CHART_PUBLISHER_ID_KEY,
     ActiveHoldingPortfolio,
     HoldingPositionInput,
+    clear_active_holdings,
     replace_active_holdings,
 )
+from ashare_lab.services.render_holding_chart_report import holding_chart_composite_height
 from ashare_lab.services.review_active_holdings import (
     HoldingAction,
     HoldingReviewRowStatus,
@@ -178,10 +183,10 @@ def _holding_chart_result(
     )
     metadata = SimpleNamespace(
         review_identity=identity,
-        panel_count=8,
+        panel_count=2 * len(portfolio.positions),
         symbols=tuple(position.symbol for position in portfolio.positions),
         width=1_200,
-        height=3_600,
+        height=holding_chart_composite_height(len(portfolio.positions)),
         raw_rows_embedded=False,
         sensitive_fields_embedded=False,
     )
@@ -202,8 +207,9 @@ def _register_four_holding_channels(
     *,
     summary_channels: tuple[str, ...] = ("serverchan", "bark"),
     chart_channels: tuple[str, ...] = ("serverchan",),
+    count: int = 4,
 ) -> ActiveHoldingPortfolio:
-    symbols = ("601101", "603012", "603268", "603679")
+    symbols = ("601101", "603012", "603268", "603679", "600000", "600001")[:count]
     return replace_active_holdings(
         repository,
         tuple(
@@ -211,7 +217,7 @@ def _register_four_holding_channels(
                 symbol=symbol,
                 name=f"持仓{index}",
                 entry_date=CUTOFF,
-                stock_sleeve_weight=0.25,
+                stock_sleeve_weight=1.0 / count,
             )
             for index, symbol in enumerate(symbols, start=1)
         ),
@@ -288,6 +294,129 @@ class _PrivatePublisher:
 
     def close(self) -> None:
         return None
+
+
+@pytest.mark.parametrize("count", [1, 2, 3, 4, 5])
+def test_authorized_registered_holdings_allow_exactly_two_panels_each(tmp_path, count):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository, count=count)
+    publisher = _PrivatePublisher()
+    result = _holding_chart_result(portfolio)
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=lambda *_args, **_kwargs: result,
+        _holding_chart_publisher=publisher,
+        _notifier=lambda _message: evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan",),
+            accepted_channels=("serverchan",),
+            image_accepted_channels=("serverchan",),
+        ),
+    )
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert len(publisher.published) == 1
+    assert result.rendered.metadata.panel_count == count * 2
+    assert result.rendered.metadata.height <= 3600
+    assert outcome.event["image_accepted_channels"] == ["serverchan"]
+
+
+def test_explicit_empty_holdings_never_build_or_publish_a_chart(tmp_path):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = clear_active_holdings(
+        repository,
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 27, 21, tzinfo=UTC),
+        metadata={
+            "holding_summary_delivery_channels": ["serverchan"],
+            HOLDING_CHART_DELIVERY_CHANNELS_KEY: ["serverchan"],
+            HOLDING_CHART_PUBLISHER_ID_KEY: "cloudflare_r2",
+        },
+    )
+    publisher = _PrivatePublisher()
+
+    def unexpected_chart(*_args, **_kwargs):
+        pytest.fail("an empty portfolio must not build a chart")
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: replace(
+            _holding_review_for_portfolio(portfolio),
+            status=HoldingReviewSummaryStatus.NO_HOLDINGS,
+        ),
+        _build_holding_chart_report=unexpected_chart,
+        _holding_chart_publisher=publisher,
+        _notifier=lambda _message: evening_report.EveningNotificationSummary(
+            configured_channels=("serverchan",),
+            accepted_channels=("serverchan",),
+        ),
+    )
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert outcome.event["chart_status"] == "not_requested"
+    assert publisher.published == []
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "identity",
+        "review_version",
+        "subset",
+        "symbols",
+        "panel_count",
+        "height",
+        "sensitive",
+        "empty",
+        "too_many",
+    ],
+)
+def test_dynamic_chart_validation_rejects_forged_identity_or_disclosure(tmp_path, tamper):
+    from ashare_lab.cli.evening_digest import _validated_holding_chart_payload
+
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    result = _holding_chart_result(portfolio)
+    review = _holding_review_for_portfolio(portfolio)
+    symbols = tuple(position.symbol for position in portfolio.positions)
+    metadata = result.rendered.metadata
+    if tamper == "identity":
+        result = replace(result, portfolio_id="forged-portfolio")
+    elif tamper == "review_version":
+        metadata.review_identity.holding_version += 1
+    elif tamper == "subset":
+        review = replace(review, rows=review.rows[:3])
+        metadata.symbols = symbols[:3]
+        metadata.panel_count = 6
+        metadata.height = holding_chart_composite_height(3)
+    elif tamper == "symbols":
+        metadata.symbols = (*symbols[:3], "600000")
+    elif tamper == "panel_count":
+        metadata.panel_count = 10
+    elif tamper == "height":
+        metadata.height = 4500
+    elif tamper == "sensitive":
+        metadata.sensitive_fields_embedded = True
+    elif tamper == "empty":
+        symbols = ()
+    else:
+        symbols = (*symbols, "600000", "600001")
+    with pytest.raises(ValueError, match="identity|disclosure"):
+        _validated_holding_chart_payload(
+            result,
+            holding_review=review,
+            expected_identity=(portfolio.id, portfolio.version),
+            expected_cutoff=CUTOFF,
+            expected_symbols=symbols,
+        )
 
 
 def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path: Path) -> None:
@@ -573,6 +702,47 @@ def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing
             assert "总金额" not in body
             assert "账户权重" not in body
             assert len(body.encode("utf-8")) <= 2_400
+
+
+@pytest.mark.parametrize("holding_channels", [(), ("serverchan",), ("bark",)])
+def test_bark_layout_failure_cannot_block_serverchan_or_cross_holding_permissions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, holding_channels: tuple[str, ...]
+) -> None:
+    from ashare_lab.cli import evening_digest as implementation
+
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_holding_channels(repository, holding_channels)
+    seen = []
+
+    def broken_compact(*_args, **_kwargs):
+        raise ValueError("synthetic compact layout overflow")
+
+    def notifier(message):
+        prepared = _message_for_channel(message, channel_name="serverchan")
+        assert prepared is not None
+        seen.append(prepared)
+        return _accepted_summary("serverchan")
+
+    monkeypatch.setattr(implementation, "render_evening_digest_bark_compact", broken_compact)
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review(
+            portfolio.id, portfolio.version
+        ),
+        _notifier=notifier,
+    )
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert outcome.event["accepted_channels"] == ["serverchan"]
+    assert len(seen) == 1
+    assert seen[0].compact_body is None
+    assert ("持仓摘要股票" in seen[0].body) is ("serverchan" in holding_channels)
+    assert "987654.32" not in seen[0].body
+    assert "六期限计划" in seen[0].body
 
 
 def test_concurrent_holding_replacement_cannot_disclose_new_portfolio_details(

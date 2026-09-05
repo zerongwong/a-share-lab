@@ -55,6 +55,10 @@ from ashare_lab.services.review_active_holdings import (
 
 EVENING_DIGEST_HORIZONS = (1, 2, 4, 13, 26, 52)
 EVENING_DIGEST_METHOD_VERSION = "evening-six-horizon-digest-v0.4.0"
+# ServerChan carries Markdown in an HTTP body, not an APNs payload. Keep the
+# normal 2400-byte reading target, with a bounded fallback for complete risk
+# alerts and price ceilings. This is our layout cap, not a provider limit.
+MAX_SERVERCHAN_DIGEST_BODY_BYTES = 4_096
 
 _HORIZON_LABELS = {
     1: "1周",
@@ -479,7 +483,19 @@ def render_evening_digest_markdown(
         )
         if len(body.encode("utf-8")) <= MAX_COMPACT_NOTIFICATION_BODY_BYTES:
             return body
-    raise ValueError("ServerChan digest exceeds the safe UTF-8 byte budget")
+    for name_bytes, price_bytes, cycle_bytes in _NOTIFICATION_LAYOUT_BUDGETS:
+        body = _render_notification_summary(
+            digest,
+            holding_review=holding_review,
+            include_holding_summary=include_holding_summary,
+            markdown=True,
+            name_bytes=name_bytes,
+            price_bytes=price_bytes,
+            cycle_bytes=cycle_bytes,
+        )
+        if len(body.encode("utf-8")) <= MAX_SERVERCHAN_DIGEST_BODY_BYTES:
+            return body
+    raise ValueError("ServerChan digest exceeds the bounded Markdown layout budget")
 
 
 def render_evening_digest_bark_compact(
@@ -552,7 +568,10 @@ def _render_notification_summary(
     if digest.plan_for_date is None:
         lines.append("计划日未通过交易日历确认｜不据此执行")
     if include_holding_summary:
-        lines.extend(("", "## 🩵 当前持仓修枝" if markdown else "当前持仓修枝"))
+        urgent = holding_review is not None and any(row.urgent for row in holding_review.rows)
+        priority_label = "次日优先处理" if digest.plan_for_date is not None else "风险优先核验"
+        heading = f"当前持仓修枝 · {priority_label}" if urgent else "当前持仓修枝"
+        lines.extend(("", f"## {'⚠️' if urgent else '🩵'} {heading}" if markdown else heading))
         lines.extend(
             _holding_review_lines(
                 holding_review,
@@ -561,7 +580,15 @@ def _render_notification_summary(
             )
         )
     lines.extend(("", "## 🌸 六期限计划" if markdown else "六期限计划"))
-    for period in digest.periods:
+    # Prefer the explicitly registered horizon for reading only. Do not change
+    # the six-horizon model, archive order, holding clock, or holding membership.
+    preferred_weeks = (
+        holding_review.holding_weeks
+        if include_holding_summary and holding_review is not None and holding_review.rows
+        else None
+    )
+    periods = sorted(digest.periods, key=lambda period: period.holding_weeks != preferred_weeks)
+    for period in periods:
         if period.failure_code is not None:
             lines.append(f"- {period.label}｜数据不足")
             continue
@@ -597,12 +624,12 @@ def _render_notification_summary(
                 else _truncate_utf8(compact_price, price_bytes)
             )
             allocation = "观察" if sleeve == "—" else sleeve
-            candidates.append(f"{name}({symbol}) {allocation}@{price}")
+            candidates.append(f"{name}({symbol}){allocation}@{price}")
         lines.append(f"- {period.label}｜{status}｜" + "；".join(candidates))
     lines.extend(
         (
             "",
-            "仅研究｜仓%=股票仓内10%档｜价格为条件/观察线｜不自动下单。",
+            "研究参考｜仓%=股票仓内10%档｜条件/观察价｜不自动下单。",
         )
     )
     return "\n".join(lines).strip()
@@ -665,12 +692,19 @@ def _holding_review_row_line(
     action = {
         HoldingAction.HOLD: "持有",
         HoldingAction.TIGHTEN: "收紧",
-        HoldingAction.REDUCE: "减仓",
-        HoldingAction.EXIT: "退出",
+        HoldingAction.REDUCE: "🟠 减仓建议",
+        HoldingAction.EXIT: "🔴 卖出建议",
         HoldingAction.REVIEW: "复核",
     }[row.action]
     if row.action is HoldingAction.HOLD and unverified_reference:
         action = "暂持有·待核验"
+    if row.action is HoldingAction.REVIEW and row.urgent:
+        action = "优先核验·非卖出确认"
+    if row.action is HoldingAction.REDUCE and any(
+        reason.startswith("single_dimension_weakness_warning_not_multi_timeframe_confirmation")
+        for reason in row.reasons
+    ):
+        action = "🟠 优先复核减仓"
     horizon = _HORIZON_LABELS.get(row.holding_weeks, f"{row.holding_weeks}周")
     if row.effective_stop is None:
         protection = "参考线待核验" if unverified_reference else "保护线待核验"
@@ -678,7 +712,11 @@ def _holding_review_row_line(
         protection = f"参考线{row.effective_stop:.2f}（待核验）"
     else:
         protection = f"保护线{row.effective_stop:.2f}"
-    reason = _truncate_utf8(_holding_reason(row), reason_bytes)
+    # Keep the cause of a blocked risk alert intact, even in compact layouts.
+    # A possible break must neither disappear nor be promoted to a sell signal.
+    reason = _holding_reason(row)
+    if not (row.action is HoldingAction.REVIEW and row.urgent):
+        reason = _truncate_utf8(reason, reason_bytes)
     return f"- {name}({_symbol(row.symbol)})｜{horizon}｜{action}｜{protection}｜{reason}"
 
 
@@ -689,6 +727,12 @@ def _holding_reason(row: HoldingTreeReviewRow) -> str:
     ):
         return "除权/分红证据待核验"
     if row.status is HoldingReviewRowStatus.DATA_NOT_READY:
+        if any(reason.startswith("company_action_evidence_blocks_exit:") for reason in row.reasons):
+            return "疑似破位·除权/分红待核验"
+        if any(
+            reason.startswith("company_action_evidence_blocks_reduce:") for reason in row.reasons
+        ):
+            return "疑似转弱·除权/分红待核验"
         if any("company_action_evidence_blocks" in reason for reason in row.reasons):
             return "除权/分红证据待核验，不作动作"
         return "数据不足，不作持仓动作"

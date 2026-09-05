@@ -35,6 +35,8 @@ from ashare_lab.services.holding_ledger import (
     resolve_current_holding_context,
 )
 from ashare_lab.services.render_holding_chart_report import (
+    MAX_HOLDING_COUNT,
+    MIN_HOLDING_COUNT,
     EntryOverlayNature,
     HoldingChartEntryOverlay,
     HoldingChartReportRequest,
@@ -232,6 +234,10 @@ def build_holding_chart_report(
         data_cutoff=loaded.data_cutoff,
     )
     _require_review_identity(review, identity)
+    if tuple(row.symbol for row in review.rows) != tuple(
+        position.symbol for position in portfolio.positions
+    ):
+        raise DataQualityError("Holding review membership does not match registered holdings")
 
     origin = _read_origin_archive(repository, portfolio)
     entry_overlays = _entry_overlays(origin, portfolio)
@@ -252,7 +258,7 @@ def build_holding_chart_report(
                 *loaded.unavailable_symbols,
                 *review.reasons,
                 *origin.reasons,
-                "holding_chart_requires_four_ready_holdings",
+                "holding_chart_requires_one_to_five_ready_holdings",
             ),
         )
     request = HoldingChartReportRequest(
@@ -599,7 +605,7 @@ def _require_review_identity(
 def _review_is_chart_eligible(review: HoldingTreeReviewSummary) -> bool:
     """Mirror the renderer's narrow allowance for evidence-blocked references."""
 
-    if len(review.rows) != 4:
+    if not MIN_HOLDING_COUNT <= len(review.rows) <= MAX_HOLDING_COUNT:
         return False
     if review.status is HoldingReviewSummaryStatus.READY:
         return True

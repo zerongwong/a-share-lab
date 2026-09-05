@@ -8,6 +8,7 @@ import pandas as pd
 
 from ashare_lab.analytics.cycle_policy import EntryStrictness
 from ashare_lab.domain.errors import DataUnavailableError
+from ashare_lab.ports.notifications import NotificationMessage
 from ashare_lab.services.build_evening_digest import (
     EVENING_DIGEST_HORIZONS,
     EveningResearchDigest,
@@ -292,7 +293,7 @@ def test_markdown_is_compact_derived_and_explicitly_non_actionable() -> None:
     assert "股≤30%/现≥70%" in markdown
     assert "当前持仓修枝" not in markdown
     assert "持仓复核" not in markdown
-    assert "合成甲(SYN001) 观察@站回 ≥ 11.00" in markdown
+    assert "合成甲(SYN001)观察@站回 ≥ 11.00" in markdown
     assert "仅观察·暂不建仓" in markdown
     assert "六期限重合与差异审计" not in markdown
     assert "候选重合" not in markdown
@@ -361,12 +362,15 @@ def test_holding_tree_summary_is_prioritized_concise_and_keeps_urgent_row_first(
 
     for body in (markdown, compact):
         assert "当前持仓修枝" in body
-        assert "东航物流(601156)｜1个月｜退出｜保护线11.00｜收盘已跌破保护线" in body
+        assert "次日优先处理" in body
+        assert "东航物流(601156)｜1个月｜🔴 卖出建议｜保护线11.00｜收盘已跌破保护线" in body
         assert "江苏银行(600919)｜1个月｜持有｜保护线11.00｜结构仍完整" in body
         assert body.index("东航物流") < body.index("江苏银行")
         assert body.index("当前持仓修枝") < body.index("六期限计划")
         assert "六期限重合与差异审计" not in body
         assert len(body.encode("utf-8")) <= 2_400
+        assert body.index("- 1个月｜") < body.index("- 1周｜")
+    assert tuple(period.holding_weeks for period in digest.periods) == EVENING_DIGEST_HORIZONS
 
 
 def test_holding_reason_distinguishes_evidence_block_and_weakness_strength() -> None:
@@ -416,9 +420,55 @@ def test_holding_reason_distinguishes_evidence_block_and_weakness_strength() -> 
         include_holding_summary=True,
     )
 
-    assert "除权/分红证据待核验，不作动作" in body
+    assert "优先核验·非卖出确认" in body
+    assert "疑似转弱·除权/分红待核验" in body
+    assert "多周期转弱(600003)｜1个月｜🟠 减仓建议" in body
+    assert "单维度转弱(600002)｜1个月｜🟠 优先复核减仓" in body
     assert "单维度转弱预警" in body
     assert "多周期转弱确认" in body
+
+
+def test_unverified_break_remains_prominent_without_becoming_a_sell_instruction() -> None:
+    digest = EveningResearchDigest(
+        common_cutoff=CUTOFF,
+        decision_date=CUTOFF,
+        cycle_label="中期下行",
+        entry_strictness=EntryStrictness.DEFENSIVE.value,
+        max_stock_exposure=0.3,
+        minimum_cash_weight=0.7,
+        cycle_rule_agreement=0.8,
+        periods=(),
+        plan_for_date=PLAN_DATE,
+    )
+    row = replace(
+        _holding_review().rows[0],
+        action=HoldingAction.REVIEW,
+        status=HoldingReviewRowStatus.DATA_NOT_READY,
+        close_below_stop=True,
+        reasons=(
+            "complete_close_confirmed_below_effective_stop",
+            "company_action_evidence_blocks_exit:company_action_clearance_missing_or_stale",
+        ),
+    )
+    review = replace(_holding_review(), rows=(row,))
+    for render in (render_evening_digest_markdown, render_evening_digest_bark_compact):
+        body = render(digest, review, include_holding_summary=True)
+        assert "次日优先处理" in body
+        assert "疑似破位·除权/分红待核验" in body
+        assert "优先核验·非卖出确认" in body
+        assert "参考线11.00（待核验）" in body
+        assert "卖出建议" not in body
+        assert "保护线11.00" not in body
+        assert "结构仍完整" not in body
+        hidden = render(digest, review)
+        assert "疑似破位" not in hidden
+        assert "次日优先处理" not in hidden
+    without_plan_date = render_evening_digest_markdown(
+        replace(digest, plan_for_date=None), review, include_holding_summary=True
+    )
+    assert "风险优先核验" in without_plan_date
+    assert "次日优先处理" not in without_plan_date
+    assert "计划日未通过交易日历确认｜不据此执行" in without_plan_date
 
 
 def test_missing_company_action_evidence_never_calls_hold_reference_a_confirmed_stop() -> None:
@@ -511,6 +561,37 @@ def test_buy_price_ceiling_and_volume_survive_compact_budget_without_promoting_o
         assert "30%@" not in body
         assert body.count("仅观察·暂不建仓") == 6
         assert len(body.encode("utf-8")) <= 2400
+
+    # Complete current-holding risk evidence plus thirty price ceilings may
+    # exceed the APNs target. ServerChan must still receive the full Markdown;
+    # its unapproved Bark fallback must remain public and bounded.
+    for holding_count in (4, 5):
+        rows = tuple(
+            replace(
+                _holding_review().rows[0],
+                symbol=f"60001{index}",
+                name=f"合成风险{index}",
+                action=HoldingAction.REVIEW,
+                status=HoldingReviewRowStatus.DATA_NOT_READY,
+                close_below_stop=True,
+                reasons=(
+                    "company_action_evidence_blocks_exit:company_action_clearance_missing_or_stale",
+                ),
+            )
+            for index in range(holding_count)
+        )
+        review = replace(_holding_review(), rows=rows)
+        full = render_evening_digest_markdown(digest, review, include_holding_summary=True)
+        public_compact = render_evening_digest_bark_compact(digest)
+        message = NotificationMessage(title="合成风险测试", body=full, compact_body=public_compact)
+        assert 2400 < len(message.body.encode("utf-8")) <= 4096
+        assert message.body.count("疑似破位·除权/分红待核验") == holding_count
+        assert message.body.count("优先核验·非卖出确认") == holding_count
+        assert message.body.count("确认≥100.01，买≤103.00+量") == 30
+        assert message.body.count("仅观察·暂不建仓") == 6
+        assert "卖出建议" not in message.body
+        assert "合成风险" not in message.compact_body
+        assert len(message.compact_body.encode("utf-8")) <= 2400
 
 
 def test_risk_capped_reclaim_and_pullback_never_round_above_ceiling():
