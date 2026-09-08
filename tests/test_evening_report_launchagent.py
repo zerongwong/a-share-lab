@@ -27,6 +27,8 @@ def test_evening_report_template_is_independent_secret_free_and_sun_thu_21_only(
         "com.zerong.asharelab.daily-sync",
     }
     assert document["ProgramArguments"] == [
+        "/usr/bin/caffeinate",
+        "-i",
         "__PYTHON_BIN__",
         "-m",
         EVENING_REPORT_MODULE,
@@ -67,11 +69,13 @@ def test_evening_report_renderer_replaces_the_complete_argument_array(tmp_path: 
 
     document = plistlib.loads(output.read_bytes())
     assert document["ProgramArguments"] == [
+        "/usr/bin/caffeinate",
+        "-i",
         str(python_bin.absolute()),
         "-m",
         EVENING_REPORT_MODULE,
     ]
-    assert len(document["ProgramArguments"]) == 3
+    assert len(document["ProgramArguments"]) == 5
     assert document["WorkingDirectory"] == str(project_root.resolve())
     assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
     assert "__PYTHON_BIN__" not in document["ProgramArguments"]

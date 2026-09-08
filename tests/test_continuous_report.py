@@ -94,6 +94,15 @@ def test_undated_report_is_holding_verification_not_a_new_buy_plan():
         _render(plan_date=None)
 
 
+def test_dated_public_plan_without_holding_lines_does_not_invent_missing_holdings():
+    body = _render(holding_lines=[], entries=[], cash_weight=1.0, status_note="暂不建仓")
+    assert "2026-09-07 次日交易计划" in body
+    assert "持仓优先" not in body
+    assert "持仓信息未提供" not in body
+    assert "计划现金：总资金100%" in body
+    assert "暂不建仓" in body
+
+
 def test_market_narrative_may_be_omitted_but_risk_lines_and_numbers_never_truncated():
     risk = "🔴 优先退出：合成持仓(600001)，已核验保护9.8712，不要误认成持有"
     body = _render(holding_lines=[risk], market_summary="非关键市场描述" * 800, max_bytes=1000)

@@ -5,6 +5,15 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Harden the continuous text-only evening report: supervise automatic builds with a 12-minute
+  timeout and isolated process-group cleanup, report late/failed builds explicitly, and keep failure
+  notices separate from accepted-plan deduplication. Inhibit idle sleep only while the scheduled
+  report runs; this does not promise delivery while the Mac is already asleep or powered off.
+  Add an explicit same-evening `--send-now` recovery path with real-time freshness, next-session,
+  holding-version, and deduplication checks. No images are enabled by stale chart state.
+- Retry alternative dynamically resolved ServerChan addresses only after pre-request connection
+  failures, preserving the official hostname, TLS certificate verification, and no-redirect behavior.
+  Read/write failures and provider HTTP responses never trigger automatic POST retransmission.
 - Improve the zero-budget close pipeline without weakening its source contract: Tushare transport
   failures or empty same-session responses receive two bounded same-source retries, while schema,
   unit, identity, and price-quality failures still stop immediately. Add a third idempotent 20:00

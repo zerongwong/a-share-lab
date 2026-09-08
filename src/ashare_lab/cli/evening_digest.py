@@ -170,6 +170,7 @@ def run_evening_digest(
     state_root: str | Path | None = None,
     log_root: str | Path | None = None,
     decision_date: date | None = None,
+    send_now: bool = False,
     _build_digest: DigestBuilder | None = None,
     _notifier: Notifier | None = None,
     _latest_cutoff: LatestCutoffReader | None = None,
@@ -179,10 +180,14 @@ def run_evening_digest(
     _build_holding_review: HoldingReviewBuilder = build_evening_holding_review,
     _build_holding_chart_report: HoldingChartBuilder = build_holding_chart_report,
     _holding_chart_publisher: HoldingChartPublisher | None = None,
-    enable_holding_chart_delivery: bool = True,
+    enable_holding_chart_delivery: bool = False,
     _clock: Callable[[], datetime] | None = None,
 ) -> EveningDigestOutcome:
-    """Build/send once per verified common cutoff; never place an order."""
+    """Submit a deduplicated next-session plan in its authorized evening window.
+
+    ``send_now`` is an explicit manual catch-up after 20:00 on the current
+    calendar day. It preserves the verified next-session and stale-data gates.
+    """
 
     try:
         fallback_log_path = (
@@ -258,8 +263,16 @@ def run_evening_digest(
                 _event("noop_weekend_send_window_closed"),
             )
         )
-    if now.hour != 21:
+    if send_now and (target_date != now.date() or now.hour < 20):
+        return finish(_error("manual_send_requires_current_evening_after_20"))
+    if not send_now and now.hour != 21:
         return finish(EveningDigestOutcome(EXIT_OK, _event("noop_outside_evening_window")))
+
+    def submission_window_open() -> bool:
+        checked_at = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
+        return checked_at.date() == now.date() and (
+            checked_at.hour >= 20 if send_now else checked_at.hour == 21
+        )
 
     try:
         with daily_update_lock(lock_path) as acquired:
@@ -279,7 +292,8 @@ def run_evening_digest(
             )
             latest = latest_reader(resolved_overlay)
             retry_chart = (
-                prior_state.get("chart_status") == "pending"
+                enable_holding_chart_delivery
+                and prior_state.get("chart_status") == "pending"
                 and int(prior_state.get("chart_attempts", 0)) < _MAX_CHART_ATTEMPTS
                 and _state_plan_for_date(prior_state)
                 == (target_date + timedelta(days=1)).isoformat()
@@ -321,7 +335,19 @@ def run_evening_digest(
                 reference_dataset_root=resolved_reference,
                 decision_date=target_date,
             )
-            text_already_accepted = last_sent == digest.common_cutoff and current_method_matches
+            if not submission_window_open():
+                return finish(
+                    _error(
+                        "evening_window_ended_before_submission",
+                        common_cutoff=digest.common_cutoff.isoformat(),
+                    )
+                )
+            text_already_accepted = (
+                last_sent == digest.common_cutoff
+                and current_method_matches
+                and _state_plan_for_date(prior_state)
+                == (target_date + timedelta(days=1)).isoformat()
+            )
             if (
                 last_sent is not None
                 and digest.common_cutoff <= last_sent
@@ -620,14 +646,14 @@ def run_evening_digest(
                 unauthorized_compact_body=(None if holding_guard is None else public_compact_body),
                 image_revoke_callback=(None if publication is None else publication.revoke_once),
             )
-            send_now = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
-            if send_now.hour != 21 or send_now.date() != now.date():
+            if not submission_window_open():
                 if publication is not None:
                     publication.revoke_once()
                 return finish(
-                    EveningDigestOutcome(
-                        EXIT_OK,
-                        _event("noop_evening_window_ended_before_submission"),
+                    _error(
+                        "evening_window_ended_before_submission",
+                        common_cutoff=cutoff,
+                        plan_for_date=plan_for_date.isoformat(),
                     )
                 )
             notification = notifier(message)
@@ -1168,7 +1194,7 @@ def build_parser() -> argparse.ArgumentParser:
     data_root = application_data_dir()
     parser = argparse.ArgumentParser(
         description=(
-            "生成六周期A股研究日报并提交给本机钥匙串中已配置的通知通道；不连接券商、不自动下单。"
+            "生成一组连续A股研究计划和持仓预警，提交给本机已配置的通知通道；不自动下单。"
         )
     )
     parser.add_argument("--csmar-root", type=Path, default=data_root / "cache" / "csmar")
@@ -1182,29 +1208,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path.home() / "Library" / "Logs" / "A股研究助手",
     )
+    parser.add_argument(
+        "--send-now",
+        action="store_true",
+        help="当晚20:00后人工补发下一交易日计划；保留数据新鲜度、交易日和去重检查",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    publisher: PrivateImagePublisher | None = None
     # Outbound chart delivery is intentionally disabled.  The scheduled report
     # is text-only by user preference; keeping the publisher construction out of
     # this path also avoids R2 billing, upload retries, and signed-URL handling.
-    try:
-        outcome = run_evening_digest(
-            csmar_root=args.csmar_root,
-            overlay_root=args.overlay_root,
-            reference_root=args.reference_root,
-            state_root=args.state_root,
-            log_root=args.log_root,
-            _holding_chart_publisher=publisher,
-            enable_holding_chart_delivery=False,
-        )
-    finally:
-        if publisher is not None:
-            with suppress(Exception):
-                publisher.close()
+    outcome = run_evening_digest(
+        csmar_root=args.csmar_root,
+        overlay_root=args.overlay_root,
+        reference_root=args.reference_root,
+        state_root=args.state_root,
+        log_root=args.log_root,
+        send_now=args.send_now,
+        enable_holding_chart_delivery=False,
+    )
     print(json.dumps(outcome.event, ensure_ascii=False, sort_keys=True))
     return outcome.exit_code
 

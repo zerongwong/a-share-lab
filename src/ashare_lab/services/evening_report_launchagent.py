@@ -46,7 +46,13 @@ def render_evening_report_launchagent_plist(
         raise ValueError(
             "evening report must retry four times between 21:00 and 22:00 Sunday-to-Thursday"
         )
-    document["ProgramArguments"] = [interpreter, "-m", EVENING_REPORT_MODULE]
+    document["ProgramArguments"] = [
+        "/usr/bin/caffeinate",
+        "-i",
+        interpreter,
+        "-m",
+        EVENING_REPORT_MODULE,
+    ]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))
     os.chmod(destination, 0o600)

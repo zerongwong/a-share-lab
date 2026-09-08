@@ -98,10 +98,12 @@ def render_continuous_report(
         raise ValueError("new entries and planned cash cannot exceed the total account")
 
     title = "持仓核验" if plan_date is None else f"{plan_date.isoformat()} 次日交易计划"
-    prefix = [f"# 🪻 {title}", f"数据截至 {as_of.isoformat()}", "", "## 🩷 持仓优先"]
-    prefix.extend(line if line.startswith("- ") else f"- {line}" for line in holdings)
-    if not holdings:
-        prefix.append("- 持仓信息未提供｜待核验")
+    prefix = [f"# 🪻 {title}", f"数据截至 {as_of.isoformat()}"]
+    if holdings or plan_date is None:
+        prefix.extend(("", "## 🩷 持仓优先"))
+        prefix.extend(line if line.startswith("- ") else f"- {line}" for line in holdings)
+        if not holdings:
+            prefix.append("- 持仓信息未提供｜待核验")
     if status:
         prefix.extend(("", f"📌 {status}"))
     suffix = ["", "## 🩵 条件新买"]

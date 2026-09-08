@@ -8,7 +8,10 @@ errors because either may contain a credential-bearing request URL.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import re
+import socket
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlparse
 
@@ -24,6 +27,70 @@ from ashare_lab.ports.notifications import (
 
 _SERVERCHAN_KEY = re.compile(r"^SCT[A-Za-z0-9_-]{8,192}$")
 _BARK_DEVICE_KEY = re.compile(r"^[A-Za-z0-9_-]{8,256}$")
+_SERVERCHAN_HOSTNAME = "sctapi.ftqq.com"
+_MAX_SERVERCHAN_ADDRESS_ATTEMPTS = 8
+
+
+class _ServerChanAddressFallbackTransport(httpx.BaseTransport):
+    """Try DNS alternatives only while no HTTP request has been transmitted.
+
+    httpcore uses ``sni_hostname`` for TLS SNI and certificate hostname checks;
+    the HTTP Host remains the original authority. Read/write failures and HTTP
+    responses are never retried because the provider may already have accepted
+    the notification. No endpoint addresses or credential-bearing URLs are logged.
+    """
+
+    def __init__(
+        self,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        resolver: Callable | None = None,
+    ) -> None:
+        self._transport = transport or httpx.HTTPTransport(verify=True, retries=0, trust_env=False)
+        self._resolver = resolver or socket.getaddrinfo
+
+    def close(self) -> None:
+        self._transport.close()
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        try:
+            return self._transport.handle_request(request)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as initial_error:
+            if request.url.scheme != "https" or request.url.host != _SERVERCHAN_HOSTNAME:
+                raise
+            last_error = initial_error
+        try:
+            records = self._resolver(
+                _SERVERCHAN_HOSTNAME,
+                request.url.port or 443,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except OSError:
+            raise last_error from None
+        addresses: set[str] = set()
+        for record in records:
+            try:
+                address = str(ipaddress.ip_address(record[4][0]))
+            except (ValueError, IndexError, TypeError):
+                continue
+            if address in addresses:
+                continue
+            if len(addresses) >= _MAX_SERVERCHAN_ADDRESS_ATTEMPTS:
+                break
+            addresses.add(address)
+            alternate = httpx.Request(
+                request.method,
+                request.url.copy_with(host=address),
+                headers=request.headers,
+                stream=request.stream,
+                extensions={**request.extensions, "sni_hostname": _SERVERCHAN_HOSTNAME},
+            )
+            try:
+                return self._transport.handle_request(alternate)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as connection_error:
+                last_error = connection_error
+        raise last_error from None
 
 
 class ServerChanNotificationChannel:
@@ -43,7 +110,16 @@ class ServerChanNotificationChannel:
             raise ValueError("Server酱地址必须使用HTTPS")
         self._sendkey = normalized
         self._base_url = base_url.rstrip("/")
-        self._client = client or httpx.Client(timeout=httpx.Timeout(15.0))
+        self._client = (
+            client
+            if client is not None
+            else httpx.Client(
+                timeout=httpx.Timeout(15.0),
+                transport=_ServerChanAddressFallbackTransport(),
+                follow_redirects=False,
+                trust_env=False,
+            )
+        )
         self._owns_client = client is None
 
     def close(self) -> None:

@@ -312,6 +312,7 @@ def test_authorized_registered_holdings_allow_exactly_two_panels_each(tmp_path, 
         _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
         _build_holding_chart_report=lambda *_args, **_kwargs: result,
         _holding_chart_publisher=publisher,
+        enable_holding_chart_delivery=True,
         _notifier=lambda _message: evening_report.EveningNotificationSummary(
             configured_channels=("serverchan",),
             accepted_channels=("serverchan",),
@@ -355,6 +356,7 @@ def test_explicit_empty_holdings_never_build_or_publish_a_chart(tmp_path):
         ),
         _build_holding_chart_report=unexpected_chart,
         _holding_chart_publisher=publisher,
+        enable_holding_chart_delivery=True,
         _notifier=lambda _message: evening_report.EveningNotificationSummary(
             configured_channels=("serverchan",),
             accepted_channels=("serverchan",),
@@ -539,6 +541,7 @@ def test_failed_chart_retries_only_image_with_fresh_publication_and_then_dedupli
         _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
         _build_holding_chart_report=chart,
         _holding_chart_publisher=publisher,
+        enable_holding_chart_delivery=True,
         _notifier=notifier,
     )
     first = evening_report.run_evening_digest(**options)
@@ -565,6 +568,7 @@ def test_missing_chart_has_four_bounded_attempts_without_duplicate_text(tmp_path
     messages = []
     options = dict(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -605,6 +609,7 @@ def test_image_rejected_after_text_acceptance_is_revoked_and_republished_with_ne
 
     options = dict(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -645,6 +650,158 @@ def test_evening_window_and_plan_date_block_daytime_past_and_non_eve_reports(tmp
     )
     assert result.event["status"] == "error"
     assert result.event["reason"] == "verified_market_data_stale_for_tomorrow"
+
+
+@pytest.mark.parametrize("hour", [20, 22, 23])
+def test_manual_evening_send_preserves_next_session_date_and_deduplication(tmp_path, hour):
+    messages = []
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 8, 27, hour - 8, tzinfo=UTC)
+    options.update(
+        send_now=True,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _notifier=lambda message: messages.append(message) or _accepted_summary(),
+    )
+    first = evening_report.run_evening_digest(**options)
+    second = evening_report.run_evening_digest(**options)
+
+    assert first.event["status"] == "provider_accepted"
+    assert first.event["plan_for_date"] == FRIDAY.isoformat()
+    assert first.event["chart_status"] == "not_requested"
+    assert second.event["status"] == "noop_no_new_trading_day"
+    assert len(messages) == 1
+    assert messages[0].image_url is None
+
+
+@pytest.mark.parametrize(
+    ("now", "decision_date"),
+    [
+        (datetime(2026, 8, 27, 11, 59, tzinfo=UTC), CUTOFF),
+        (datetime(2026, 8, 26, 17, 25, tzinfo=UTC), CUTOFF),
+        (datetime(2026, 8, 27, 14, tzinfo=UTC), date(2026, 8, 26)),
+    ],
+)
+def test_manual_send_rejects_daytime_midnight_and_historical_decision_dates(
+    tmp_path, now, decision_date
+):
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: now
+    outcome = evening_report.run_evening_digest(
+        **options,
+        send_now=True,
+        decision_date=decision_date,
+        _build_digest=lambda **_kwargs: pytest.fail("invalid manual time must not build"),
+        _notifier=lambda _message: pytest.fail("invalid manual time must not send"),
+    )
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "manual_send_requires_current_evening_after_20"
+
+
+def test_manual_send_never_relabels_stale_data_as_tomorrows_plan(tmp_path):
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 8, 31, 14, tzinfo=UTC)
+    outcome = evening_report.run_evening_digest(
+        **options,
+        send_now=True,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _notifier=lambda _message: pytest.fail("stale plan must not send"),
+    )
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "verified_market_data_stale_for_tomorrow"
+    assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("send_now", "end_time"),
+    [
+        (False, datetime(2026, 8, 27, 14, tzinfo=UTC)),
+        (False, datetime(2026, 8, 27, 17, 25, tzinfo=UTC)),
+        (True, datetime(2026, 8, 27, 17, 25, tzinfo=UTC)),
+    ],
+)
+def test_long_build_crossing_submission_window_is_a_visible_failure(
+    tmp_path, send_now, end_time
+):
+    current = [datetime(2026, 8, 27, 13, tzinfo=UTC)]
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: current[0]
+
+    def build(**_kwargs):
+        current[0] = end_time
+        return _digest()
+
+    outcome = evening_report.run_evening_digest(
+        **options,
+        send_now=send_now,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _build_digest=build,
+        _next_trading_day=lambda _cutoff: pytest.fail("expired build must stop before network"),
+        _notifier=lambda _message: pytest.fail("expired plan must not send"),
+    )
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "evening_window_ended_before_submission"
+    logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text())
+    assert logged["exit_code"] == evening_report.EXIT_ERROR
+    assert logged["status"] == "error"
+    assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+
+
+def test_default_text_only_ignores_old_chart_grants_and_pending_image_retry(tmp_path):
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    publisher = _PrivatePublisher()
+    messages = []
+    options = dict(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _repository=repository,
+        _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
+        _build_holding_chart_report=lambda *_args, **_kwargs: pytest.fail("text-only must not draw"),
+        _holding_chart_publisher=publisher,
+        _notifier=lambda message: messages.append(message) or _accepted_summary(),
+    )
+    first = evening_report.run_evening_digest(**options)
+    assert first.event["chart_status"] == "not_requested"
+    state_path = tmp_path / "state" / "evening-digest-state.json"
+    state = json.loads(state_path.read_text())
+    state.update(chart_status="pending", chart_attempts=1)
+    state_path.write_text(json.dumps(state))
+    second = evening_report.run_evening_digest(**options)
+    assert second.event["status"] == "noop_no_new_trading_day"
+    assert publisher.published == []
+    assert len(messages) == 1
+    assert messages[0].image_url is None
+    assert "补图" not in messages[0].body
+
+
+def test_window_is_checked_again_after_archiving_before_actual_send(tmp_path):
+    current = [datetime(2026, 8, 27, 13, tzinfo=UTC)]
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: current[0]
+
+    def archive(*_args):
+        current[0] = datetime(2026, 8, 27, 14, tzinfo=UTC)
+        return SimpleNamespace(report_id="synthetic-expired-report")
+
+    outcome = evening_report.run_evening_digest(
+        **options,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _build_digest=lambda **_kwargs: _digest(),
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _archive_digest=archive,
+        _notifier=lambda _message: pytest.fail("late submission must not reach provider"),
+    )
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "evening_window_ended_before_submission"
+    assert outcome.event["plan_for_date"] == FRIDAY.isoformat()
+    assert not (tmp_path / "state" / "evening-digest-state.json").exists()
 
 
 def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing(
@@ -927,6 +1084,7 @@ def test_holding_chart_is_not_built_without_provider_scoped_authorization(
 
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -953,6 +1111,7 @@ def test_summary_authorization_alone_never_builds_or_uploads_holding_chart(
 
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1022,6 +1181,7 @@ def test_authorized_r2_chart_is_attached_only_to_serverchan(tmp_path: Path) -> N
 
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1064,6 +1224,7 @@ def test_uploaded_chart_is_revoked_when_serverchan_does_not_accept_the_image(
 
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1118,6 +1279,7 @@ def test_chart_is_revoked_if_holding_revision_changes_during_publication(
     messages = []
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
+        enable_holding_chart_delivery=True,
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1236,6 +1398,7 @@ def test_holding_chart_failures_preserve_text_and_never_leak_private_details(
 
         outcome = evening_report.run_evening_digest(
             **_paths(case_root),
+            enable_holding_chart_delivery=True,
             decision_date=CUTOFF,
             _latest_cutoff=lambda _root: CUTOFF,
             _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1311,6 +1474,7 @@ def test_disabled_chart_pipeline_never_reaches_stale_builder_or_publisher(
 
         outcome = evening_report.run_evening_digest(
             **_paths(case_root),
+            enable_holding_chart_delivery=True,
             decision_date=CUTOFF,
             _latest_cutoff=lambda _root: CUTOFF,
             _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1782,7 +1946,25 @@ def test_cli_has_stable_module_and_no_credential_arguments() -> None:
     assert "sendkey" not in help_text
     assert "token" not in help_text
     assert "--log-root" in help_text
+    assert "--send-now" in help_text
     assert callable(evening_report.main)
+
+
+def test_cli_manual_send_keeps_production_text_only(monkeypatch, capsys):
+    from ashare_lab.cli import evening_digest
+
+    calls = []
+    monkeypatch.setattr(
+        evening_digest,
+        "run_evening_digest",
+        lambda **kwargs: calls.append(kwargs)
+        or evening_report.EveningDigestOutcome(evening_report.EXIT_OK, {"status": "checked"}),
+    )
+    assert evening_report.main(["--send-now"]) == evening_report.EXIT_OK
+    assert calls[0]["send_now"] is True
+    assert calls[0]["enable_holding_chart_delivery"] is False
+    assert "_holding_chart_publisher" not in calls[0]
+    assert json.loads(capsys.readouterr().out)["status"] == "checked"
 
 
 def test_private_log_rotates_and_keeps_at_most_five_backups(tmp_path: Path, monkeypatch) -> None:
