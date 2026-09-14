@@ -348,10 +348,12 @@ def test_two_missing_stock_rows_pass_the_98_percent_gate_and_publish_own_manifes
     initial_rights = (
         (SourceId.TUSHARE, DataAction.MARKET_DATA_READ),
         (SourceId.TUSHARE, DataAction.MARKET_DATA_CACHE),
+        (SourceId.TUSHARE, DataAction.METADATA_READ),
         (SourceId.BAOSTOCK, DataAction.MARKET_DATA_READ),
         (SourceId.BAOSTOCK, DataAction.MARKET_DATA_CACHE),
         (SourceId.BAOSTOCK, DataAction.METADATA_READ),
         (SourceId.AKSHARE, DataAction.MARKET_DATA_READ),
+        (SourceId.AKSHARE, DataAction.MARKET_DATA_CACHE),
         (SourceId.ZERO_BUDGET_EOD, DataAction.MARKET_DATA_READ),
         (SourceId.ZERO_BUDGET_EOD, DataAction.MARKET_DATA_CACHE),
     )

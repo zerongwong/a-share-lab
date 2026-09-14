@@ -39,6 +39,7 @@ class DailyIncrementBatch:
     unit_contract_version: str = ""
     unit_resolution_method_version: str = ""
     amount_multiplier_to_cny: str = ""
+    metadata_sources: tuple[str, ...] = ()
 
     @property
     def coverage_ratio(self) -> float:

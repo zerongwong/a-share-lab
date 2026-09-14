@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from ashare_lab.adapters.baostock_eod import BaoStockEodMarketData
+from ashare_lab.adapters.bounded_baostock import BoundedBaoStockEod
 from ashare_lab.adapters.infoway_eod import InfowayEodMarketData
 from ashare_lab.adapters.macos_keychain import (
     load_bark_device_key,
@@ -1149,10 +1149,29 @@ def resolve_next_infoway_trading_day(
     return _validate_next_trading_day(common_cutoff, sessions[0])
 
 
+def _tushare_calendar_backup(start: date, end: date) -> tuple[date, ...]:
+    from ashare_lab.adapters.macos_keychain import load_tushare_token
+    from ashare_lab.adapters.tushare_daily import TushareDailyClient
+    from ashare_lab.domain.data_sources import DataAction, RightsPolicy, SourceId, SourceRegistry
+
+    RightsPolicy(SourceRegistry.load_default()).require(SourceId.TUSHARE, DataAction.METADATA_READ)
+    token = load_tushare_token()
+    if not token:
+        raise DataUnavailableError("免费备用交易日历未配置，不能猜测下一交易日。")
+    provider = TushareDailyClient(token)
+    try:
+        return provider.fetch_cn_trading_days(start, end)
+    finally:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
+
+
 def resolve_next_zero_budget_trading_day(
     common_cutoff: date,
     *,
-    _provider_factory: Callable[..., Any] = BaoStockEodMarketData,
+    _provider_factory: Callable[..., Any] = BoundedBaoStockEod,
+    _calendar_backup: Callable = _tushare_calendar_backup,
 ) -> date:
     """Resolve the next official A-share session without a paid credential."""
 
@@ -1162,7 +1181,10 @@ def resolve_next_zero_budget_trading_day(
     end = common_cutoff + timedelta(days=_TRADING_CALENDAR_LOOKAHEAD_DAYS)
     provider = _provider_factory()
     try:
-        sessions = tuple(provider.fetch_cn_trading_days(start, end))
+        try:
+            sessions = tuple(provider.fetch_cn_trading_days(start, end))
+        except DataUnavailableError:
+            sessions = tuple(_calendar_backup(start, end))
     finally:
         close = getattr(provider, "close", None)
         if callable(close):
@@ -1170,9 +1192,11 @@ def resolve_next_zero_budget_trading_day(
     if not sessions:
         raise DataUnavailableError("未能在14日窗口内确认下一个A股交易日")
     if any(not isinstance(value, date) or isinstance(value, datetime) for value in sessions):
-        raise DataUnavailableError("BaoStock CN交易日历包含无效日期")
+        raise DataUnavailableError("免费CN交易日历包含无效日期")
     if sessions != tuple(sorted(set(sessions))):
-        raise DataUnavailableError("BaoStock CN交易日历顺序或唯一性异常")
+        raise DataUnavailableError("免费CN交易日历顺序或唯一性异常")
+    if any(value < start or value > end for value in sessions):
+        raise DataUnavailableError("免费CN交易日历返回请求区间外日期")
     return _validate_next_trading_day(common_cutoff, sessions[0])
 
 
@@ -1193,9 +1217,7 @@ def latest_verified_overlay_cutoff(overlay_root: Path) -> date | None:
 def build_parser() -> argparse.ArgumentParser:
     data_root = application_data_dir()
     parser = argparse.ArgumentParser(
-        description=(
-            "生成一组连续A股研究计划和持仓预警，提交给本机已配置的通知通道；不自动下单。"
-        )
+        description=("生成一组连续A股研究计划和持仓预警，提交给本机已配置的通知通道；不自动下单。")
     )
     parser.add_argument("--csmar-root", type=Path, default=data_root / "cache" / "csmar")
     parser.add_argument("--overlay-root", type=Path, default=data_root / "cache" / "market_overlay")

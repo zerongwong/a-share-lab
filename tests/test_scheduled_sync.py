@@ -761,9 +761,10 @@ def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
     assert document["Label"] == "com.zerong.asharelab.daily-sync"
     assert document["Label"] != "com.zerong.asharelab"
     assert document["ProgramArguments"] == [
+        "/usr/bin/caffeinate", "-i",
         "__PYTHON_BIN__",
         "-m",
-        "ashare_lab.cli.scheduled_sync",
+        "ashare_lab.cli.scheduled_sync_worker",
     ]
     assert document["RunAtLoad"] is True
     assert document["StartCalendarInterval"] == [
@@ -803,9 +804,10 @@ def test_launchagent_renderer_replaces_placeholders_without_inserting_arguments(
 
     document = plistlib.loads(output.read_bytes())
     assert document["ProgramArguments"] == [
+        "/usr/bin/caffeinate", "-i",
         str(python_bin.absolute()),
         "-m",
-        "ashare_lab.cli.scheduled_sync",
+        "ashare_lab.cli.scheduled_sync_worker",
     ]
     assert document["WorkingDirectory"] == str(project_root.resolve())
     assert document["StartCalendarInterval"] == [

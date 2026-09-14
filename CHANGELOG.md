@@ -5,6 +5,17 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Add an isolated, append-only Howard Marks-inspired cycle shadow: four provenance- and
+  knowledge-time-gated dimensions, explicit unavailable states, frozen experimental thresholds,
+  weekly ordinary-state persistence and immediate risk tightening. The daily report builder archives
+  the comparison locally but never feeds it to production weights, stops, holdings or notifications.
+  Complete four-dimension automatic evidence collection and out-of-sample promotion remain pending.
+- Bound BaoStock operations in short-lived subprocesses and supervise the whole scheduled sync
+  with a 12-minute deadline. Add explicit Tushare metadata and cross-checked Eastmoney/Tencent
+  core-index fallbacks without substituting on quality failures. Stock batch replacement remains
+  blocked without exchange pre-close/coverage evidence. Preserve v1 archives; tag new receipts v2.
+- Notify a blocked evening build on the first failed attempt, independently from accepted-plan
+  deduplication, so delayed wakeups do not skip the only failure notification opportunity.
 - Harden the continuous text-only evening report: supervise automatic builds with a 12-minute
   timeout and isolated process-group cleanup, report late/failed builds explicitly, and keep failure
   notices separate from accepted-plan deduplication. Inhibit idle sleep only while the scheduled

@@ -29,14 +29,14 @@ notes = "需自行购买或获得账户数据权限；默认未连接。"
 [sources.tushare]
 display_name = "Tushare Pro"
 status = "experimental"
-purposes = ["免费档全市场未复权日线"]
+purposes = ["免费档全市场未复权日线", "当前账户可读的备用交易日历和证券主表"]
 official_url = "https://tushare.pro/"
 application_url = "https://tushare.pro/register"
 authorization_basis = "personal_research_only"
 authorization_reference = ""
 configurable = true
-allowed_actions = ["market_data_read", "market_data_cache"]
-notes = "仅使用用户免费档明确允许的未复权日线；Token只放操作系统钥匙串。证券主表、交易日历和复权因子不冒充免费权限。"
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "不购买积分或绕过权限；备用trade_cal/stock_basic须当前Token实际可读，否则停止。Token只放钥匙串，复权因子未接入。"
 
 [sources.baostock]
 display_name = "BaoStock"

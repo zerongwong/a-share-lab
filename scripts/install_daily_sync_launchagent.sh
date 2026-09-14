@@ -13,6 +13,18 @@ LOG_DIR="$HOME/Library/Logs/A股研究助手"
 DOMAIN="gui/$(id -u)"
 SERVICE="$DOMAIN/$LABEL"
 
+# launchd can briefly retain the old service after bootout returns. Retry the
+# same exact label; never escalate to root or restart another app/service.
+bootstrap_with_retry() {
+    for attempt in 1 2 3 4 5; do
+        if /bin/launchctl bootstrap "$DOMAIN" "$TARGET"; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
 if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "未找到项目虚拟环境：$PYTHON_BIN" >&2
     echo "请先在当前项目完成依赖安装，再重新执行。" >&2
@@ -61,13 +73,13 @@ if /bin/launchctl print "$SERVICE" >/dev/null 2>&1; then
 fi
 /usr/bin/install -m 600 "$TEMP_PLIST" "$TARGET"
 /bin/launchctl enable "$SERVICE"
-if ! /bin/launchctl bootstrap "$DOMAIN" "$TARGET"; then
+if ! bootstrap_with_retry; then
     echo "新任务加载失败，正在恢复安装前状态。" >&2
     rm -f "$TARGET"
     if [[ "$HAD_TARGET" == true ]]; then
         /usr/bin/install -m 600 "$BACKUP_PLIST" "$TARGET"
         if [[ "$WAS_LOADED" == true ]]; then
-            /bin/launchctl bootstrap "$DOMAIN" "$TARGET" || true
+            bootstrap_with_retry || true
         fi
     fi
     exit 2

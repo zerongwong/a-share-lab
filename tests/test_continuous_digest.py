@@ -386,3 +386,42 @@ def test_unreadable_ledger_is_not_interpreted_as_an_empty_initial_account(monkey
     assert digest.continuous_plan["entries"] == []
     assert digest.continuous_plan["cash_weight"] is None
     assert "读取失败" in digest.continuous_plan["status_note"]
+
+
+def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkeypatch):
+    from test_evening_digest import CUTOFF, _hybrid, _result
+
+    from ashare_lab.services import marks_cycle_shadow
+    from ashare_lab.services.build_evening_digest import render_evening_digest_markdown
+
+    monkeypatch.setattr(service, "get_active_holding_portfolio", lambda _repo: None)
+    reports = []
+    calls = []
+    for cap in (0.0, 0.8):
+
+        def shadow(repository, *, _cap=cap, **kwargs):
+            calls.append(kwargs)
+            return {"state": "synthetic-internal-audit-only", "shadow_cap": _cap}
+
+        monkeypatch.setattr(marks_cycle_shadow, "run_marks_cycle_shadow", shadow)
+        reports.append(
+            service.build_continuous_research_digest(
+                dataset_root="synthetic",
+                overlay_root="synthetic",
+                reference_dataset_root="synthetic",
+                decision_date=CUTOFF,
+                repository=object(),
+                _hybrid_loader=lambda *_a, **_k: _hybrid(object()),
+                _portfolio_builder=lambda _h, _m, **kwargs: _result(kwargs["holding_weeks"]),
+            )
+        )
+    assert len(calls) == 2
+    assert calls[0]["price_cutoff"] == reports[0].common_cutoff
+    assert calls[0]["incumbent_cap"] == reports[0].max_stock_exposure
+    text = [render_evening_digest_markdown(r) for r in reports]
+    assert text[0] == text[1]
+    assert "synthetic-internal-audit-only" not in text[0]
+    plans = [
+        {k: v for k, v in r.continuous_plan.items() if k != "marks_cycle_shadow"} for r in reports
+    ]
+    assert plans[0] == plans[1]

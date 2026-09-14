@@ -7,9 +7,11 @@
 
     <key>ProgramArguments</key>
     <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
         <string>__PYTHON_BIN__</string>
         <string>-m</string>
-        <string>ashare_lab.cli.scheduled_sync</string>
+        <string>ashare_lab.cli.scheduled_sync_worker</string>
     </array>
 
     <key>WorkingDirectory</key>

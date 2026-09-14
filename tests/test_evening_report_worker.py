@@ -126,7 +126,7 @@ def test_known_plan_receipt_prevents_misleading_failure_notice(tmp_path):
     assert json.loads((state / "evening-digest-state.json").read_text()) == original
 
 
-@pytest.mark.parametrize("code", [2, -signal.SIGSEGV])
+@pytest.mark.parametrize("code", [1, 2, -signal.SIGSEGV])
 def test_failed_worker_is_observable_even_if_it_cannot_import_analytics(tmp_path, code):
     messages = []
     result, event = worker.supervise_evening_report(
@@ -134,7 +134,7 @@ def test_failed_worker_is_observable_even_if_it_cannot_import_analytics(tmp_path
         _popen=lambda *_args, **_kwargs: _Process([code]),
         _notifier=lambda message: messages.append(message) or True,
     )
-    assert result == 2
+    assert result == (1 if code == 1 else 2)
     assert event["reason"] == "evening_worker_not_completed"
     assert len(messages) == 1
 

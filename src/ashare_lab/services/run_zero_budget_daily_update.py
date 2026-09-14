@@ -16,8 +16,9 @@ from typing import Any
 from ashare_lab.adapters.akshare_eod_verifier import AKShareEodVerifier
 from ashare_lab.adapters.baostock_eod import (
     BAOSTOCK_CORE_INDEX_SYMBOLS,
-    BaoStockEodMarketData,
 )
+from ashare_lab.adapters.bounded_baostock import BoundedBaoStockEod
+from ashare_lab.adapters.free_eod_fallback import FreeEodMetadataFallback
 from ashare_lab.adapters.macos_keychain import load_tushare_token
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.adapters.tushare_daily import TushareDailyClient
@@ -50,7 +51,7 @@ def run_zero_budget_daily_update(
     core_index_symbols: tuple[str, ...] = BAOSTOCK_CORE_INDEX_SYMBOLS,
     required_stock_coverage_ratio: float = 0.98,
     _token_loader: Callable[[], str | None] = load_tushare_token,
-    _baostock_factory: Callable[..., Any] = BaoStockEodMarketData,
+    _baostock_factory: Callable[..., Any] = BoundedBaoStockEod,
     _tushare_factory: Callable[..., Any] = TushareDailyClient,
     _verifier_factory: Callable[..., Any] = AKShareEodVerifier,
     _provider_factory: Callable[..., Any] = ZeroBudgetEodMarketData,
@@ -61,9 +62,7 @@ def run_zero_budget_daily_update(
     resolved_now = now or datetime.now(UTC)
     requested_date = latest_complete_cn_candidate(resolved_now)
     data_root = Path(csmar_root or application_data_dir() / "cache" / "csmar")
-    increment_root = Path(
-        overlay_root or application_data_dir() / "cache" / "market_overlay"
-    )
+    increment_root = Path(overlay_root or application_data_dir() / "cache" / "market_overlay")
     baseline_cutoff = read_csmar_baseline_cutoff(data_root, through_date=requested_date)
     token = _token_loader()
     if not token or not str(token).strip():
@@ -76,7 +75,10 @@ def run_zero_budget_daily_update(
 
     rights_policy = _rights_policy or RightsPolicy(SourceRegistry.load_default())
     for source_id, actions in (
-        (SourceId.TUSHARE, (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE)),
+        (
+            SourceId.TUSHARE,
+            (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE, DataAction.METADATA_READ),
+        ),
         (
             SourceId.BAOSTOCK,
             (
@@ -85,7 +87,7 @@ def run_zero_budget_daily_update(
                 DataAction.METADATA_READ,
             ),
         ),
-        (SourceId.AKSHARE, (DataAction.MARKET_DATA_READ,)),
+        (SourceId.AKSHARE, (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE)),
         (
             SourceId.ZERO_BUDGET_EOD,
             (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE),
@@ -110,6 +112,9 @@ def run_zero_budget_daily_update(
             ),
         )
         components.append(tushare)
+        if _baostock_factory is BoundedBaoStockEod:
+            baostock = FreeEodMetadataFallback(baostock, tushare, clock=lambda: resolved_now)
+            components.append(baostock)
         verifier = _safe_construct(
             "AKShare核验组件",
             lambda: _verifier_factory(clock=lambda: resolved_now.astimezone(UTC)),
@@ -153,9 +158,7 @@ def run_zero_budget_daily_update(
     automatic_cutoff = chain[-1] if chain else None
     common_cutoff = automatic_cutoff or baseline_cutoff
     latest_session = (
-        range_report.expected_sessions[-1]
-        if range_report.expected_sessions
-        else common_cutoff
+        range_report.expected_sessions[-1] if range_report.expected_sessions else common_cutoff
     )
     updated = tuple(
         item.trade_date
@@ -193,8 +196,8 @@ def run_zero_budget_daily_update(
         unit_contract_version=ZERO_BUDGET_UNIT_CONTRACT_VERSION,
         unit_resolution_method_version=ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION,
         market_scope=(
-            "沪深A股：Tushare免费未复权日线；BaoStock交易日历、证券清单及六核心指数；"
-            "AKShare确定性抽样交叉核验；不含北交所"
+            "沪深A股：Tushare未复权日线及AKShare抽样核验；BaoStock日历/主表/六指数；"
+            "不可用时元数据备用Tushare、指数备用东财并由腾讯逐一核验；不含北交所"
         ),
         csmar_mutated=False,
         range_report=range_report,

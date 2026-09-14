@@ -222,3 +222,49 @@ def test_empty_response_is_unavailable_not_a_valid_zero_stock_session() -> None:
 
     assert len(client.calls) == 3
     assert delays == list(TUSHARE_DAILY_RETRY_DELAYS_SECONDS)
+
+
+def test_backup_calendar_requires_complete_natural_dates_and_keeps_closed_days():
+    raw = pd.DataFrame({"cal_date": ["20260911", "20260912"], "is_open": [1, 0]})
+    calls = []
+
+    def calendar(**kwargs):
+        calls.append(kwargs)
+        return raw.copy()
+
+    adapter = TushareDailyClient(client=SimpleNamespace(trade_cal=calendar))
+    assert adapter.fetch_cn_trading_days(date(2026, 9, 11), date(2026, 9, 12)) == (
+        date(2026, 9, 11),
+    )
+    assert calls[0]["exchange"] == "SSE"
+    raw.drop(index=1, inplace=True)
+    with pytest.raises(DataQualityError, match="日期覆盖不完整"):
+        adapter.fetch_cn_trading_days(date(2026, 9, 11), date(2026, 9, 12))
+
+
+def test_backup_security_master_preserves_listed_universe_and_rejects_duplicates():
+    raw = pd.DataFrame(
+        {"ts_code": ["600000.SH", "000001.SZ", "830799.BJ"], "list_status": ["L"] * 3}
+    )
+    calls = []
+
+    def stock_basic(**kwargs):
+        calls.append(kwargs)
+        return raw.copy()
+
+    adapter = TushareDailyClient(client=SimpleNamespace(stock_basic=stock_basic))
+    assert adapter.fetch_cn_stock_symbols() == ("000001.SZ", "600000.SH")
+    assert calls[0]["list_status"] == "L"
+    raw.loc[2, "ts_code"] = "600000.SH"
+    with pytest.raises(DataQualityError):
+        adapter.fetch_cn_stock_symbols()
+
+
+def test_unavailable_metadata_permission_is_redacted_and_does_not_purchase_access():
+    def denied(**_):
+        raise RuntimeError("permission denied token=synthetic-private-token")
+
+    adapter = TushareDailyClient(client=SimpleNamespace(stock_basic=denied))
+    with pytest.raises(DataUnavailableError) as caught:
+        adapter.fetch_cn_stock_symbols()
+    assert "synthetic-private-token" not in str(caught.value)

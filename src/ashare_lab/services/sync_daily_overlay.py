@@ -385,6 +385,8 @@ def _batch_receipt(batch: DailyIncrementBatch, *, asset_kind: AssetKind) -> dict
         "trace_ids": tuple(batch.trace_ids),
         "cutoff_timestamp": int(batch.cutoff_timestamp),
     }
+    if batch.metadata_sources:
+        receipt["metadata_sources"] = batch.metadata_sources
     for field in (
         "unit_contract_version",
         "unit_resolution_method_version",

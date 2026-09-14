@@ -4,12 +4,20 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
+
 from ashare_lab.cli import sync_daily
 from ashare_lab.domain.errors import DataUnavailableError
+from ashare_lab.services.daily_update_lock import daily_update_lock
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UI_ROOT = PROJECT_ROOT / "src" / "ashare_lab" / "ui"
 PAGE = UI_ROOT / "pages" / "09_自动数据更新.py"
+
+
+@pytest.fixture(autouse=True)
+def isolate_lock_from_live_scheduler(monkeypatch, tmp_path):
+    monkeypatch.setattr(sync_daily, "daily_update_lock", lambda: daily_update_lock(tmp_path / "test.lock"))
 
 
 def test_router_registers_automatic_daily_update_page() -> None:

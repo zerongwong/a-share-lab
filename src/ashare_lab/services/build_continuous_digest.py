@@ -84,6 +84,23 @@ def build_continuous_research_digest(
     }
     result = captured.get("result")
     snapshot = captured.get("snapshot")
+    # Independent daily audit only: its cap/state NEVER feeds selection, the
+    # holding ledger, protective stops, or the externally rendered plan.
+    try:
+        from ashare_lab.services.marks_cycle_shadow import run_marks_cycle_shadow
+
+        plan["marks_cycle_shadow"] = run_marks_cycle_shadow(
+            repository,
+            price_cutoff=digest.common_cutoff,
+            known_at=known_at or datetime.now(UTC),
+            incumbent_cap=digest.max_stock_exposure,
+        )
+    except Exception:
+        plan["marks_cycle_shadow"] = {
+            "state": "shadow_unavailable",
+            "mode": "shadow_only",
+            "production_decision_input": False,
+        }
     # A ledger read error is not proof of an empty portfolio.
     try:
         portfolio = get_active_holding_portfolio(repository)

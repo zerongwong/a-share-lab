@@ -1,10 +1,9 @@
 """Fail-closed composition of free A-share end-of-day components.
 
-BaoStock is authoritative only for the China calendar, listed SSE/SZSE stock
-universe and the six core-index bars.  Tushare supplies the stock cross
-section, while AKShare independently verifies that cross section.  AKShare is
-never a repair or fallback source: any result other than ``VERIFIED`` fails the
-entire stock batch.
+BaoStock supplies calendar, universe and indices, with explicit, audited
+metadata/index fallback handled by its injected adapter. Tushare supplies the
+stock cross-section, independently checked by AKShare. An index fallback is
+not a stock repair: anything other than ``VERIFIED`` fails the stock batch.
 """
 
 from __future__ import annotations
@@ -26,13 +25,11 @@ from ashare_lab.ports.daily_increment import AssetKind, DailyIncrementBatch
 ZERO_BUDGET_EOD_PROVIDER = "zero_budget_eod"
 ZERO_BUDGET_STOCK_SOURCE = "zero_budget_eod:tushare:daily_unadjusted:stocks"
 ZERO_BUDGET_INDEX_SOURCE = "zero_budget_eod:baostock:eod_unadjusted:indices"
-ZERO_BUDGET_UNIT_CONTRACT_VERSION = (
-    "zero-budget-eod-tushare-stocks-baostock-indices-v1"
-)
+ZERO_BUDGET_UNIT_CONTRACT_VERSION = "zero-budget-eod-explicit-free-index-fallback-v2"
 ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION = (
-    "static-units-plus-akshare-independent-verification-v1"
+    "static-units-akshare-stock-sample-em-tx-index-crosscheck-v2"
 )
-ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY = "tushare=1000;baostock=1"
+ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY = "tushare=1000;baostock=1;eastmoney=1;tencent=10000"
 
 _CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _CN_CLOSE = time(15, 0)
@@ -162,6 +159,7 @@ class ZeroBudgetEodMarketData:
             fetched_at=fetched_at,
             trace_ids=_prefix_trace_ids(trace_ids, "tushare"),
             cutoff_timestamp=cutoff,
+            metadata_sources=self._metadata_sources(),
         )
 
     def _fetch_index_increment(
@@ -184,8 +182,14 @@ class ZeroBudgetEodMarketData:
         )
         if not isinstance(batch, DailyIncrementBatch):
             raise DataQualityError("BaoStock核心指数没有返回DailyIncrementBatch。")
-        if batch.provider != "baostock" or batch.target_date != target_date:
+        if batch.provider not in {"baostock", "akshare"} or batch.target_date != target_date:
             raise DataQualityError("BaoStock核心指数批次的来源或日期不一致。")
+        if batch.provider == "akshare" and (
+            batch.unit_contract_version != "em-tx-index-shares-cny-v1"
+            or batch.unit_resolution_method_version != "em_tx_all_six_crosscheck-v1"
+            or batch.amount_multiplier_to_cny != "eastmoney=1;tencent=10000"
+        ):
+            raise DataQualityError("备用指数没有通过已声明的双源单位核验。")
         batch_requested = _normalize_index_symbols(batch.requested_symbols)
         batch_received = _normalize_index_symbols(batch.received_symbols)
         if set(batch_requested) != set(requested):
@@ -199,21 +203,32 @@ class ZeroBudgetEodMarketData:
         frame = normalize_overlay_daily(
             batch.frame,
             expected_date=target_date,
-            source_id="baostock",
+            source_id=batch.provider,
             asset_kind="indices",
         )
         expected_codes = {value[:6] for value in requested}
         if set(frame["symbol"]) != expected_codes or len(frame) != len(expected_codes):
             raise DataQualityError("BaoStock核心指数文件与请求身份不一致。")
-        frame["source"] = ZERO_BUDGET_INDEX_SOURCE
+        frame["source"] = (
+            ZERO_BUDGET_INDEX_SOURCE
+            if batch.provider == "baostock"
+            else "zero_budget_eod:akshare:eastmoney:indices:tx_verified"
+        )
         return _composite_batch(
             frame=frame,
             target_date=target_date,
             requested_symbols=requested,
             received_symbols=requested,
             fetched_at=fetched_at,
-            trace_ids=_prefix_trace_ids(batch.trace_ids, "baostock"),
+            trace_ids=_prefix_trace_ids(batch.trace_ids, batch.provider),
             cutoff_timestamp=cutoff,
+            metadata_sources=self._metadata_sources(),
+        )
+
+    def _metadata_sources(self):
+        return tuple(
+            f"{key}:{value}"
+            for key, value in sorted(getattr(self._baostock, "metadata_sources", {}).items())
         )
 
 
@@ -260,6 +275,7 @@ def _composite_batch(
     fetched_at: datetime,
     trace_ids: tuple[str, ...],
     cutoff_timestamp: int,
+    metadata_sources: tuple[str, ...] = (),
 ) -> DailyIncrementBatch:
     return DailyIncrementBatch(
         frame=frame,
@@ -273,6 +289,7 @@ def _composite_batch(
         unit_contract_version=ZERO_BUDGET_UNIT_CONTRACT_VERSION,
         unit_resolution_method_version=ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION,
         amount_multiplier_to_cny=ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY,
+        metadata_sources=metadata_sources,
     )
 
 
@@ -378,9 +395,7 @@ def _dependency_call[T](label: str, operation: Callable[[], T]) -> T:
 
 def _resolve_cutoff_timestamp(target_date: date, value: int | None) -> int:
     if value is None:
-        return int(
-            datetime.combine(target_date, time(23, 59, 59), tzinfo=_CN_TIMEZONE).timestamp()
-        )
+        return int(datetime.combine(target_date, time(23, 59, 59), tzinfo=_CN_TIMEZONE).timestamp())
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("cutoff_timestamp must be a positive Unix-seconds integer")
     try:

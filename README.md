@@ -8,6 +8,9 @@
 
 [当前策略合同](docs/CONTINUOUS_STRATEGY.md) · [数据与许可](docs/DATA_POLICY.md) · [旧版完整归档](README_LEGACY.md)
 
+新增：[马克斯周期风险层（影子运行）](docs/MARKS_CYCLE_SHADOW.md) · [免费数据超时与备用恢复](docs/FREE_DATA_RECOVERY.md)。
+周期层只做本地对比，四类时点证据未齐时明确等待，不改变生产仓位；推送仍为精简文字。
+
 ## 从证据到下一次复核
 
 ```mermaid
@@ -16,7 +19,7 @@ flowchart LR
     H["旧仓复核<br/>保护线 · 账户风险"]
     N["新股入场门<br/>早期转强 · 确认突破"]
     J{"联合比较<br/>保留旧仓＋替补／现金"}
-    R["简洁晚报＋日周图<br/>人工决定 · 成交后登记"]
+    R["精简文字晚报＋风险预警<br/>人工决定 · 成交后登记"]
     V["下一收盘复核<br/>趋势未坏，继续持有"]
     D --> H & N
     H --> J

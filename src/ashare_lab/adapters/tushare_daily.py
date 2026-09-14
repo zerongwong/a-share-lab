@@ -113,6 +113,48 @@ class TushareDailyClient:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._sleeper = sleeper or time.sleep
 
+    def fetch_cn_trading_days(self, start: date, end: date) -> tuple[date, ...]:
+        """Free calendar backup; require every calendar date, not just open rows."""
+        raw = self._metadata_request(
+            "trade_cal",
+            exchange="SSE",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+            fields="cal_date,is_open",
+        )
+        if not {"cal_date", "is_open"}.issubset(raw.columns):
+            raise DataQualityError("Tushare备用日历字段不完整。")
+        dates = pd.to_datetime(raw.cal_date, format="%Y%m%d", errors="coerce")
+        expected = set(pd.date_range(start, end).date)
+        if dates.isna().any() or dates.duplicated().any() or set(dates.dt.date) != expected:
+            raise DataQualityError("Tushare备用日历日期覆盖不完整。")
+        flags = raw.is_open.astype(str)
+        if not flags.isin(["0", "1"]).all():
+            raise DataQualityError("Tushare备用日历开市标记无效。")
+        return tuple(sorted(dates.loc[flags == "1"].dt.date))
+
+    def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+        raw = self._metadata_request(
+            "stock_basic", exchange="", list_status="L", fields="ts_code,list_status"
+        )
+        if not {"ts_code", "list_status"}.issubset(raw.columns) or len(raw) >= 6000:
+            raise DataQualityError("Tushare备用证券主表字段不完整或可能截断。")
+        if not raw.list_status.eq("L").all() or raw.ts_code.duplicated().any():
+            raise DataQualityError("Tushare备用证券主表身份状态无效。")
+        codes = raw.ts_code.astype(str)
+        if not codes.str.fullmatch(_PROVIDER_CODE).all():
+            raise DataQualityError("Tushare备用证券主表代码无效。")
+        return tuple(sorted(codes[codes.str.match(r"^(6\d{5}\.SH|(?:00|30)\d{4}\.SZ)$")]))
+
+    def _metadata_request(self, endpoint, **kwargs):
+        try:
+            raw = getattr(self._client, endpoint)(**kwargs)
+        except Exception:
+            raise DataUnavailableError("Tushare免费备用元数据不可用，未新增付费权限。") from None
+        if not isinstance(raw, pd.DataFrame) or raw.empty:
+            raise DataUnavailableError("Tushare备用元数据为空。")
+        return raw
+
     def fetch_daily(self, trade_date: date) -> TushareDailyFetch:
         """Return one canonical cross-section after a bounded same-source retry.
 
@@ -190,9 +232,7 @@ def normalize_tushare_daily(
     if isinstance(raw.columns, pd.MultiIndex):
         raise DataQualityError("Tushare 日线响应含多层列，字段合同不明确。")
     if len(raw) >= TUSHARE_DAILY_ROW_LIMIT:
-        raise DataQualityError(
-            "Tushare 日线响应达到 6000 行接口上限，可能已截断，拒绝进入研究。"
-        )
+        raise DataQualityError("Tushare 日线响应达到 6000 行接口上限，可能已截断，拒绝进入研究。")
 
     missing = set(_REQUIRED_COLUMNS).difference(raw.columns)
     if missing:
@@ -201,9 +241,7 @@ def normalize_tushare_daily(
     provider_codes = raw["ts_code"].astype("string").str.strip().str.upper()
     valid_codes = provider_codes.str.fullmatch(_PROVIDER_CODE).fillna(False)
     if not bool(valid_codes.all()):
-        raise DataQualityError(
-            f"Tushare 日线含 {int((~valid_codes).sum())} 行无效 A 股代码。"
-        )
+        raise DataQualityError(f"Tushare 日线含 {int((~valid_codes).sum())} 行无效 A 股代码。")
     if bool(provider_codes.duplicated().any()):
         raise DataQualityError("Tushare 日线含重复证券代码。")
     symbols = provider_codes.str.extract(_PROVIDER_CODE, expand=True)["symbol"]
@@ -230,7 +268,9 @@ def normalize_tushare_daily(
         "amount",
     ):
         values = pd.to_numeric(raw[column], errors="coerce")
-        finite = pd.Series(np.isfinite(values.to_numpy(dtype=float, na_value=np.nan)), index=raw.index)
+        finite = pd.Series(
+            np.isfinite(values.to_numpy(dtype=float, na_value=np.nan)), index=raw.index
+        )
         if bool(values.isna().any()) or not bool(finite.all()):
             raise DataQualityError(f"Tushare 日线字段 {column} 含空值或非有限数。")
         numeric[column] = values.astype(float)

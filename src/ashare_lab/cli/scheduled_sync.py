@@ -72,7 +72,7 @@ _AUTHORIZATION = re.compile(r"(?i)\b(authorization\s*:\s*)(?:bearer\s+)?\S+")
 _SERVERCHAN_SECRET = re.compile(r"\bSCT[A-Za-z0-9_-]{8,192}\b")
 _INFOWAY_SECRET = re.compile(r"(?i)\b[a-f0-9]{24,64}-infoway\b")
 _LAUNCHAGENT_LABEL = "com.zerong.asharelab.daily-sync"
-_LAUNCHAGENT_MODULE = "ashare_lab.cli.scheduled_sync"
+_LAUNCHAGENT_MODULE = "ashare_lab.cli.scheduled_sync_worker"
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,7 +115,7 @@ def render_launchagent_plist(
 
     macOS ``plutil -replace ProgramArguments.0`` can insert before an existing
     array element on some releases.  Replacing the complete array through
-    ``plistlib`` guarantees there are exactly three arguments in the required
+    ``plistlib`` guarantees there are exactly five arguments in the required
     order, including when filesystem paths contain spaces.
     """
 
@@ -137,7 +137,13 @@ def render_launchagent_plist(
         {"Hour": 20, "Minute": 0},
     ]:
         raise ValueError("daily sync LaunchAgent schedule is not the approved three-run contract")
-    document["ProgramArguments"] = [interpreter, "-m", _LAUNCHAGENT_MODULE]
+    document["ProgramArguments"] = [
+        "/usr/bin/caffeinate",
+        "-i",
+        interpreter,
+        "-m",
+        _LAUNCHAGENT_MODULE,
+    ]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))
     os.chmod(destination, 0o600)

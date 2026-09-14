@@ -196,7 +196,7 @@ def supervise_evening_report(
         return finish(2, "error", reason="evening_worker_start_or_wait_failed")
     if code == 0:
         return finish(0, "worker_completed")
-    if code != 1 or now.minute >= 45:
+    if code != 0:
         notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
         _safe_log(
             log_root,
