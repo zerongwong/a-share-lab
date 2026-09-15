@@ -155,9 +155,7 @@ class BaoStockEodMarketData:
             if exchange == "sz" and code.startswith(("00", "30")):
                 symbols.append(f"{code}.SZ")
                 continue
-            raise DataQualityError(
-                "BaoStock当前上市沪深股票出现未纳入已验证A股代码规则的新前缀。"
-            )
+            raise DataQualityError("BaoStock当前上市沪深股票出现未纳入已验证A股代码规则的新前缀。")
 
         if not symbols:
             raise DataUnavailableError("BaoStock没有返回当前上市的沪深A股清单。")
@@ -285,9 +283,7 @@ class BaoStockEodMarketData:
         except ImportError as exc:
             raise DataUnavailableError("BaoStock可选依赖不可用。") from exc
         except Exception as exc:  # noqa: BLE001 - provider import boundary
-            raise DataUnavailableError(
-                f"BaoStock组件加载失败：{type(exc).__name__}。"
-            ) from exc
+            raise DataUnavailableError(f"BaoStock组件加载失败：{type(exc).__name__}。") from exc
 
         login = _required_callable(module, "login")
         login_result = _provider_call("登录", login)

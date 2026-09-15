@@ -9,6 +9,8 @@ calendar session; this must never be reused as a stock ex-right reference.
 
 from __future__ import annotations
 
+import math
+import re
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -20,10 +22,89 @@ from ashare_lab.domain.errors import DataQualityError, DataUnavailableError
 from ashare_lab.ports.daily_increment import DailyIncrementBatch
 from ashare_lab.ports.market_data import CANONICAL_DAILY_COLUMNS
 
+_STOCK_MASTER_SYMBOL = re.compile(r"^(?:6\d{5}\.SH|(?:00|30)\d{4}\.SZ)$")
+_MIN_CURRENT_STOCK_MASTER_SIZE = 5_000
+_MAX_STOCK_MASTER_DRIFT_FRACTION = 0.005
+_MAX_STOCK_MASTER_DRIFT_FLOOR = 50
+
+
+def _validated_stock_master(values):
+    try:
+        symbols = tuple(values)
+    except TypeError:
+        raise DataQualityError("证券主表完整性证据不是可枚举的代码集合。") from None
+    if (
+        not symbols
+        or any(
+            not isinstance(symbol, str) or _STOCK_MASTER_SYMBOL.fullmatch(symbol) is None
+            for symbol in symbols
+        )
+        or tuple(sorted(symbols)) != symbols
+        or len(set(symbols)) != len(symbols)
+    ):
+        raise DataQualityError("证券主表完整性证据的身份、排序或唯一性无效。")
+    return symbols
+
+
+def _require_current_master_size(*masters):
+    if any(len(master) < _MIN_CURRENT_STOCK_MASTER_SIZE for master in masters):
+        raise DataQualityError("证券主表数量不足，禁止把可能截断的名单当作全市场。")
+
+
+def _require_bounded_stock_master_drift(candidate, reference):
+    candidate_symbols = _validated_stock_master(candidate)
+    reference_symbols = _validated_stock_master(reference)
+    _require_current_master_size(candidate_symbols, reference_symbols)
+    drift = len(set(candidate_symbols).symmetric_difference(reference_symbols))
+    allowed = max(
+        _MAX_STOCK_MASTER_DRIFT_FLOOR,
+        math.ceil(len(reference_symbols) * _MAX_STOCK_MASTER_DRIFT_FRACTION),
+    )
+    if drift > allowed:
+        raise DataQualityError("证券主表相对最近已验证名单漂移过大。")
+    return candidate_symbols, reference_symbols
+
+
+def _require_exact_stock_master_agreement(candidate, reference):
+    candidate_symbols = _validated_stock_master(candidate)
+    reference_symbols = _validated_stock_master(reference)
+    _require_current_master_size(candidate_symbols, reference_symbols)
+    if candidate_symbols != reference_symbols:
+        raise DataQualityError("BaoStock与交易所当前证券主表不一致，禁止发布。")
+    return candidate_symbols
+
+
+def _require_no_uncorroborated_contraction(candidate, reference):
+    candidate_symbols, reference_symbols = _require_bounded_stock_master_drift(candidate, reference)
+    if set(reference_symbols) - set(candidate_symbols):
+        raise DataQualityError("证券主表相对最近已验证名单出现未经独立确认的缩减。")
+    return candidate_symbols
+
 
 class FreeEodMetadataFallback:
-    def __init__(self, primary, metadata_backup, *, clock=None, client=None):
+    def __init__(
+        self,
+        primary,
+        metadata_backup,
+        *,
+        stock_master_backup=None,
+        expected_stock_symbols=None,
+        require_stock_master_completeness_evidence=False,
+        clock=None,
+        client=None,
+    ):
         self.primary, self.backup = primary, metadata_backup
+        self.stock_master_backup = (
+            metadata_backup if stock_master_backup is None else stock_master_backup
+        )
+        self.expected_stock_symbols = (
+            None
+            if expected_stock_symbols is None
+            else _validated_stock_master(expected_stock_symbols)
+        )
+        self.require_stock_master_completeness_evidence = bool(
+            require_stock_master_completeness_evidence
+        )
         self.clock = clock or (lambda: datetime.now(UTC))
         self.client = client or httpx.Client(timeout=10.0, follow_redirects=False)
         self.owns_client = client is None
@@ -47,7 +128,61 @@ class FreeEodMetadataFallback:
         return self._metadata("fetch_cn_trading_days", start, end)
 
     def fetch_cn_stock_symbols(self):
-        return self._metadata("fetch_cn_stock_symbols")
+        try:
+            result = self.primary.fetch_cn_stock_symbols()
+        except DataUnavailableError:
+            result, source = self._stock_master_after_primary_unavailable()
+        else:
+            result, source = self._validated_primary_stock_master(result)
+        self.metadata_sources["fetch_cn_stock_symbols"] = source
+        return result
+
+    def _stock_master_after_primary_unavailable(self):
+        if self.require_stock_master_completeness_evidence and self.expected_stock_symbols is None:
+            raise DataUnavailableError(
+                "首次证券主表同步缺少历史锚点，且BaoStock不可用；禁止用单一官方名单发布。"
+            ) from None
+        try:
+            result = self.stock_master_backup.fetch_cn_stock_symbols()
+        except DataUnavailableError:
+            raise DataUnavailableError("证券主表所有免费来源均不可用。") from None
+        if self.require_stock_master_completeness_evidence:
+            # With BaoStock unavailable, the current official list still needs
+            # the recent verified anchor.  Any contraction is ambiguous between
+            # a real delisting and a truncated response, so fail closed until a
+            # second current source can corroborate it.
+            result = _require_no_uncorroborated_contraction(result, self.expected_stock_symbols)
+        if self.stock_master_backup is self.backup:
+            source = "tushare"
+        else:
+            source = getattr(self.stock_master_backup, "last_evidence", "") or getattr(
+                self.stock_master_backup, "provider", "stock_master_backup"
+            )
+        return result, source
+
+    def _validated_primary_stock_master(self, result):
+        if not self.require_stock_master_completeness_evidence:
+            return result, "baostock"
+        candidate = _validated_stock_master(result)
+        try:
+            independent = self.stock_master_backup.fetch_cn_stock_symbols()
+        except DataUnavailableError:
+            if self.expected_stock_symbols is None:
+                raise DataUnavailableError("首次证券主表同步缺少可用的独立完整性证据。") from None
+            candidate = _require_no_uncorroborated_contraction(
+                candidate, self.expected_stock_symbols
+            )
+            return candidate, "baostock:checked_against_last_verified_master"
+
+        # A quality failure from the independent source intentionally escapes;
+        # it must never be downgraded into an availability fallback.
+        candidate = _require_exact_stock_master_agreement(candidate, independent)
+        if self.expected_stock_symbols is not None:
+            _require_bounded_stock_master_drift(independent, self.expected_stock_symbols)
+        evidence = getattr(self.stock_master_backup, "last_evidence", "") or getattr(
+            self.stock_master_backup, "provider", "stock_master_backup"
+        )
+        return candidate, f"baostock:crosschecked:{evidence}"
 
     def fetch_core_index_daily(self, target_date, *, cutoff_timestamp=None):
         try:

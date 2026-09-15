@@ -30,7 +30,19 @@
         </dict>
         <dict>
             <key>Hour</key>
+            <integer>16</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
             <integer>18</integer>
+            <key>Minute</key>
+            <integer>30</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>19</integer>
             <key>Minute</key>
             <integer>30</integer>
         </dict>
@@ -38,7 +50,13 @@
             <key>Hour</key>
             <integer>20</integer>
             <key>Minute</key>
-            <integer>0</integer>
+            <integer>20</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>20</integer>
+            <key>Minute</key>
+            <integer>50</integer>
         </dict>
     </array>
 

@@ -716,7 +716,17 @@ def _holding_review_lines(
         HoldingAction.TIGHTEN: 3,
         HoldingAction.HOLD: 4,
     }
-    rows = sorted(review.rows, key=lambda row: (priority[row.action], row.symbol))
+    rows = sorted(
+        review.rows,
+        key=lambda row: (
+            not any(
+                r.startswith(("cost_stop_8pct_touched:", "cost_stop_pending_breach:"))
+                for r in row.reasons
+            ),
+            priority[row.action],
+            row.symbol,
+        ),
+    )
     return [
         _holding_review_row_line(
             row,
@@ -771,6 +781,12 @@ def _holding_review_row_line(
 
 
 def _holding_reason(row: HoldingTreeReviewRow) -> str:
+    if any(r.startswith("cost_stop_pending_breach:") for r in row.reasons):
+        return "曾触及8%成本止损，最新证据待核验"
+    if any(r.startswith("cost_stop_8pct_touched:") for r in row.reasons):
+        if row.action is HoldingAction.REVIEW:
+            return "疑似触及8%成本止损·除权/分红待核验"
+        return "已触及8%成本止损，待确认卖出"
     if (
         row.action is HoldingAction.HOLD
         and "candidate_stop_not_persisted_without_company_action_clearance" in row.reasons

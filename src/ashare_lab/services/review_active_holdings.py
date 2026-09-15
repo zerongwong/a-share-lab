@@ -12,16 +12,22 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from decimal import ROUND_FLOOR, Decimal
 from enum import StrEnum
 from math import isfinite
 from typing import Final
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.cost_stop import (
+    COST_STOP_METHOD_VERSION,
+    CostStopObservation,
+    observe_cost_stop,
+)
 from ashare_lab.analytics.indicators import atr
 from ashare_lab.analytics.multi_timeframe import (
     ExecutionState,
@@ -42,7 +48,7 @@ from ashare_lab.services.holding_ledger import (
     resolve_current_holding_context,
 )
 
-HOLDING_TREE_METHOD_VERSION: Final = "magee-inspired-pivot-trailing-v0.1.0"
+HOLDING_TREE_METHOD_VERSION: Final = "magee-inspired-pivot-trailing-v0.2.0"
 ATR_BUFFER_MULTIPLE: Final = 0.50
 
 
@@ -113,12 +119,18 @@ class HoldingTreeReviewRow:
     company_action_clear_through: date | None = None
     method_version: str = HOLDING_TREE_METHOD_VERSION
     company_action_clear_from: date | None = None
+    cost_stop: float | None = None
+    cost_stop_touched_on: date | None = None
 
     @property
     def urgent(self) -> bool:
         return self.action in {HoldingAction.REDUCE, HoldingAction.EXIT} or (
             self.action is HoldingAction.REVIEW
-            and any("company_action_evidence_blocks" in reason for reason in self.reasons)
+            and any(
+                "company_action_evidence_blocks" in reason
+                or reason.startswith("cost_stop_pending_breach")
+                for reason in self.reasons
+            )
         )
 
 
@@ -319,11 +331,61 @@ def _review_one(
             reason="protective_stop_cutoff_after_review_rejected",
             persist=persist,
         )
+    if (
+        holding.cost_price is None
+        and stored is not None
+        and stored.get("details_json", {}).get("cost_stop_touched_on") is not None
+    ):
+        return _failed_row(
+            repository,
+            portfolio,
+            holding,
+            cutoff=cutoff,
+            review_time=review_time,
+            reason="confirmed_cost_missing_after_cost_stop_breach",
+            persist=persist,
+        )
 
+    cost_observation = None
+    company_action_clear = _company_action_is_clear(
+        company_action_clearance, holding, cutoff, require_start=continuous_profile
+    )
     try:
-        bars = build_completed_timeframes(frame, as_of=cutoff)
+        # A missing/invalid volume series must not hide a valid cost-loss
+        # observation; full technical assessment still validates its own data.
+        price_columns = ["trade_date", "open", "high", "low", "close"]
+        price_frame = (
+            frame.loc[:, price_columns] if all(c in frame for c in price_columns) else frame
+        )
+        bars = build_completed_timeframes(price_frame, as_of=cutoff)
         if bars.data_cutoff.date() != cutoff:
             raise MultiTimeframeDataError("holding_close_cutoff_mismatch")
+        if frame.attrs.get("adjustment", "none") != "none":
+            raise MultiTimeframeDataError("holding_prices_must_be_unadjusted")
+        if holding.cost_price is not None:
+            remembered = {} if stored is None else stored.get("details_json", {})
+            touched = remembered.get("cost_stop_touched_on")
+            from ashare_lab.services.intraday_alert_store import confirmed_cost_touch
+
+            intraday_touch = confirmed_cost_touch(
+                repository, holding.position_key, cutoff=cutoff, known_at=review_time
+            )
+            remembered_touch = None if touched is None else date.fromisoformat(touched)
+            if intraday_touch is not None:
+                remembered_touch = (
+                    min(remembered_touch, intraday_touch) if remembered_touch else intraday_touch
+                )
+            cost_observation = observe_cost_stop(
+                bars.daily,
+                cost_price=holding.cost_price,
+                entry_date=holding.entry_date,
+                remembered_line=remembered.get("cost_stop"),
+                remembered_touch=remembered_touch,
+                cost_update_date=portfolio.effective_at.astimezone(
+                    ZoneInfo("Asia/Shanghai")
+                ).date(),
+                remembered_history=remembered.get("cost_stop_history"),
+            )
         from ashare_lab.analytics.continuous_signals import CONTINUOUS_SIGNAL_CONTRACT
 
         profile_kwargs = (
@@ -347,14 +409,30 @@ def _review_one(
             entry_date=holding.entry_date,
         )
     except (MultiTimeframeDataError, ValueError, TypeError) as exc:
-        return _failed_row(
+        failed = _failed_row(
             repository,
             portfolio,
             holding,
             cutoff=cutoff,
             review_time=review_time,
             reason=f"holding_data_not_ready:{exc}",
+            persist=persist and cost_observation is None,
+            company_action_clearance=company_action_clearance,
+        )
+        if cost_observation is None:
+            return failed
+        # Technical history/ATR failure cannot mask an independently verified
+        # cost-loss breach. The corporate-action interval still has to pass.
+        return _cost_only_review(
+            repository,
+            portfolio,
+            holding,
+            failed,
+            cost_observation,
+            cutoff=cutoff,
+            review_time=review_time,
             persist=persist,
+            company_action_clearance=company_action_clearance,
         )
 
     latest_close = float(bars.daily.iloc[-1]["close"])
@@ -367,8 +445,12 @@ def _review_one(
     # Even a same-cutoff replay under a new signal profile must respect the
     # latest stored line, not just yesterday's previous_stop.
     stored_floor = candidate.stop if stored is None else float(stored["effective_stop"])
-    effective_stop = max(candidate.stop, previous_stop or candidate.stop, stored_floor)
-    effective_stop = _price_floor(effective_stop)
+    effective_stop = max(
+        _price_floor(candidate.stop), previous_stop or candidate.stop, stored_floor
+    )
+    if cost_observation is not None:
+        # Do not round the hard boundary down to a greater-than-8% loss.
+        effective_stop = max(effective_stop, cost_observation.line)
     stop_raised = previous_stop is not None and effective_stop > previous_stop + 0.005
     close_below_stop = latest_close < effective_stop
     raw_action, action_reasons = _holding_action(
@@ -376,18 +458,19 @@ def _review_one(
         close_below_stop=close_below_stop,
         stop_raised=stop_raised,
     )
-    company_action_clear = bool(
-        company_action_clearance is not None
-        and company_action_clearance.clear
-        and company_action_clearance.through_date >= cutoff
-        and (
-            not continuous_profile
-            or (
-                company_action_clearance.from_date is not None
-                and company_action_clearance.from_date <= holding.entry_date
-            )
+    cost_reasons = _cost_reasons(cost_observation)
+    if cost_observation is not None and cost_observation.touched_on is not None:
+        raw_action = HoldingAction.EXIT
+        action_reasons = (
+            "handle_only_at_next_tradable_session_subject_to_t_plus_one_suspension_and_limit_down",
+            "exited_weight_remains_cash_until_explicit_new_plan",
         )
-    )
+    # Actual-cost comparisons always require the entire holding interval,
+    # even for callers retaining the legacy horizon transport field.
+    if cost_observation is not None:
+        company_action_clear = _company_action_is_clear(
+            company_action_clearance, holding, cutoff, require_start=True
+        )
     company_action_detected = bool(
         company_action_clearance is not None and not company_action_clearance.clear
     )
@@ -421,6 +504,7 @@ def _review_one(
         f"primary_stop_source:{candidate.source_timeframe}",
         f"atr_buffer_multiple:{ATR_BUFFER_MULTIPLE:.2f}",
         *action_reasons,
+        *cost_reasons,
         *company_action_reasons,
         *(
             (f"company_action_coverage_from:{company_action_clearance.from_date.isoformat()}",)
@@ -440,6 +524,8 @@ def _review_one(
         action=action,
         latest_close=latest_close,
         cost_price=holding.cost_price,
+        cost_stop=None if cost_observation is None else cost_observation.line,
+        cost_stop_touched_on=(None if cost_observation is None else cost_observation.touched_on),
         stock_sleeve_weight=holding.stock_sleeve_weight,
         account_weight=holding.account_weight,
         candidate_stop=candidate.stop,
@@ -481,6 +567,7 @@ def _review_one(
             bars.daily.iloc[-1].to_dict(),
             candidate.stop,
             company_action_clearance,
+            cost_observation,
         )
         stop_state = None
         if company_action_clear:
@@ -502,7 +589,24 @@ def _review_one(
                     "atr_buffer_multiple": ATR_BUFFER_MULTIPLE,
                     "support": candidate.support,
                     "support_kind": candidate.support_kind,
+                    "cost_stop": row.cost_stop
+                    if cost_observation is not None
+                    else ({} if stored is None else stored.get("details_json", {})).get(
+                        "cost_stop"
+                    ),
+                    "cost_stop_touched_on": (
+                        row.cost_stop_touched_on.isoformat()
+                        if row.cost_stop_touched_on is not None
+                        else ({} if stored is None else stored.get("details_json", {})).get(
+                            "cost_stop_touched_on"
+                        )
+                    ),
                     "calendar_boundary": "existing_multi_timeframe_conservative_fallback",
+                    "cost_stop_history": cost_observation.line_history
+                    if cost_observation is not None
+                    else ({} if stored is None else stored.get("details_json", {})).get(
+                        "cost_stop_history"
+                    ),
                     "company_action_evidence_id": company_action_clearance.evidence_id,
                     "company_action_clear_from": None
                     if company_action_clearance.from_date is None
@@ -534,6 +638,121 @@ def _review_one(
                 reason="protective_stop_cutoff_after_review_rejected",
                 persist=True,
             )
+    return row
+
+
+def _company_action_is_clear(evidence, holding, cutoff, *, require_start):
+    return bool(
+        evidence is not None
+        and evidence.clear
+        and evidence.through_date >= cutoff
+        and (
+            not require_start
+            or (evidence.from_date is not None and evidence.from_date <= holding.entry_date)
+        )
+    )
+
+
+def _cost_reasons(observation: CostStopObservation | None) -> tuple[str, ...]:
+    if observation is None:
+        return ("cost_stop_unavailable_without_confirmed_cost",)
+    reasons = (f"cost_stop_method:{COST_STOP_METHOD_VERSION}",)
+    if observation.touched_on is not None:
+        reasons += (
+            f"cost_stop_8pct_touched:{observation.touched_on.isoformat()}",
+            "cost_stop_alert_latched_until_confirmed_position_closed",
+        )
+    return reasons
+
+
+def _cost_only_review(
+    repository,
+    portfolio,
+    holding,
+    failed,
+    observation,
+    *,
+    cutoff,
+    review_time,
+    persist,
+    company_action_clearance,
+):
+    """Independent safety guard when a technical pattern cannot be assessed."""
+    clear = _company_action_is_clear(company_action_clearance, holding, cutoff, require_start=True)
+    breached = observation.touched_on is not None
+    reasons = tuple(
+        r
+        for r in failed.reasons
+        if r != "fail_closed_no_holding_action" and not r.startswith("cost_stop_pending_breach:")
+    )
+    reasons += _cost_reasons(observation)
+    if breached and not clear:
+        reasons += (
+            "company_action_evidence_blocks_exit:cost_comparability_unverified",
+            "candidate_stop_not_persisted_without_company_action_clearance",
+        )
+    elif breached:
+        reasons += (
+            "cost_stop_exit_independent_of_technical_history",
+            "handle_only_at_next_tradable_session_subject_to_t_plus_one_suspension_and_limit_down",
+        )
+    row = replace(
+        failed,
+        status=HoldingReviewRowStatus.READY if breached and clear else failed.status,
+        action=HoldingAction.EXIT if breached and clear else HoldingAction.REVIEW,
+        latest_close=observation.latest_close,
+        cost_stop=observation.line,
+        cost_stop_touched_on=observation.touched_on,
+        effective_stop=max(failed.effective_stop or observation.line, observation.line),
+        close_below_stop=observation.latest_close
+        < max(failed.effective_stop or observation.line, observation.line),
+        reasons=reasons,
+    )
+    if persist:
+        # Persist the hard line and breach even without a usable technical
+        # pivot; future missing data must not quietly erase this warning.
+        stop_state = None
+        if clear:
+            stop_state = {
+                "position_key": holding.position_key,
+                "symbol": holding.symbol,
+                "entry_date": holding.entry_date,
+                "effective_stop": row.effective_stop,
+                "candidate_stop": observation.line,
+                "previous_stop": failed.effective_stop,
+                "data_cutoff": cutoff,
+                "source_timeframe": "confirmed_cost",
+                "evidence_date": observation.touched_on or cutoff,
+                "holding_version": portfolio.version,
+                "method_version": row.method_version,
+                "details_json": {
+                    "cost_stop": observation.line,
+                    "cost_stop_touched_on": None
+                    if observation.touched_on is None
+                    else observation.touched_on.isoformat(),
+                    "cost_stop_history": observation.line_history,
+                },
+                "updated_at": review_time,
+            }
+        evidence_hash = _evidence_hash(
+            holding,
+            cutoff,
+            {"close": observation.latest_close},
+            row.effective_stop,
+            company_action_clearance,
+            observation,
+        )
+        repository.record_holding_review(
+            _review_record(
+                portfolio,
+                holding,
+                row,
+                cutoff=cutoff,
+                review_time=review_time,
+                evidence_hash=evidence_hash,
+            ),
+            stop_state=stop_state,
+        )
     return row
 
 
@@ -667,6 +886,24 @@ def _failed_row(
         "fail_closed_no_holding_action",
         "candidate_ranking_not_used",
     )
+    remembered_touch = (
+        None
+        if stored is None or stored_is_future
+        else stored.get("details_json", {}).get("cost_stop_touched_on")
+    )
+    from ashare_lab.services.intraday_alert_store import confirmed_cost_touch
+
+    intraday_touch = confirmed_cost_touch(
+        repository, holding.position_key, cutoff=cutoff, known_at=review_time
+    )
+    if intraday_touch is not None:
+        remembered_touch = (
+            min(remembered_touch, intraday_touch.isoformat())
+            if remembered_touch
+            else intraday_touch.isoformat()
+        )
+    if remembered_touch is not None:
+        reasons += (f"cost_stop_pending_breach:{remembered_touch}",)
     row = HoldingTreeReviewRow(
         symbol=holding.symbol,
         name=holding.name,
@@ -701,6 +938,9 @@ def _failed_row(
         ),
         company_action_clear_through=(
             None if company_action_clearance is None else company_action_clearance.through_date
+        ),
+        company_action_clear_from=(
+            None if company_action_clearance is None else company_action_clearance.from_date
         ),
     )
     if persist:
@@ -817,6 +1057,7 @@ def _evidence_hash(
     latest: Mapping[str, object],
     candidate_stop: float,
     company_action_clearance: CompanyActionClearance | None,
+    cost_observation: CostStopObservation | None = None,
 ) -> str:
     payload = {
         "symbol": holding.symbol,
@@ -827,6 +1068,16 @@ def _evidence_hash(
             key: str(latest.get(key)) for key in ("trade_date", "open", "high", "low", "close")
         },
         "candidate_stop": candidate_stop,
+        "confirmed_cost": holding.cost_price,
+        "cost_observation": None
+        if cost_observation is None
+        else {
+            "line": cost_observation.line,
+            "touched_on": None
+            if cost_observation.touched_on is None
+            else cost_observation.touched_on.isoformat(),
+        },
+        "cost_line_history": None if cost_observation is None else cost_observation.line_history,
         "company_action_clearance": (
             None
             if company_action_clearance is None

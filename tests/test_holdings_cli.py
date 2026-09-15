@@ -34,6 +34,7 @@ def _file(tmp_path: Path) -> Path:
                         "stock_sleeve_weight": 1.0,
                         "account_weight": None,
                         "company_action_clear": True,
+                        "company_action_clear_from": "2026-08-24",
                         "company_action_clear_through": "2026-08-28",
                         "company_action_evidence_source": "user_reviewed_announcements",
                         "company_action_evidence_id": "local-check-20260828-600919",
@@ -86,6 +87,7 @@ def test_local_json_replace_list_and_clear(tmp_path: Path, capsys: object) -> No
     portfolio = get_active_holding_portfolio(repository)
     assert portfolio is not None
     assert portfolio.positions[0].metadata["company_action_clear"] is True
+    assert portfolio.positions[0].metadata["company_action_clear_from"] == "2026-08-24"
     assert portfolio.positions[0].metadata["company_action_clear_through"] == "2026-08-28"
 
     assert main(["clear", "--yes"], _repository=repository) == 0

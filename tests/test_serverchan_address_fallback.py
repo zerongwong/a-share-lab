@@ -115,7 +115,9 @@ def test_http_response_is_not_retried_or_redirected(status):
         return httpx.Response(status, headers={"location": "https://other.example/"})
 
     with (
-        _client(handler, lambda *_args, **_kwargs: pytest.fail("HTTP response forbids retry")) as client,
+        _client(
+            handler, lambda *_args, **_kwargs: pytest.fail("HTTP response forbids retry")
+        ) as client,
         pytest.raises(NotificationDeliveryError),
     ):
         channels.ServerChanNotificationChannel("SCTsynthetic123456", client=client).send(_message())
@@ -161,7 +163,9 @@ def test_fallback_is_limited_to_original_official_https_host():
         raise httpx.ConnectError("synthetic failure")
 
     with (
-        _client(handler, lambda *_args, **_kwargs: pytest.fail("wrong host must not resolve")) as client,
+        _client(
+            handler, lambda *_args, **_kwargs: pytest.fail("wrong host must not resolve")
+        ) as client,
         pytest.raises(NotificationDeliveryError),
     ):
         channels.ServerChanNotificationChannel(

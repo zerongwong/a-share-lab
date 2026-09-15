@@ -25,9 +25,9 @@ from ashare_lab.ports.daily_increment import AssetKind, DailyIncrementBatch
 ZERO_BUDGET_EOD_PROVIDER = "zero_budget_eod"
 ZERO_BUDGET_STOCK_SOURCE = "zero_budget_eod:tushare:daily_unadjusted:stocks"
 ZERO_BUDGET_INDEX_SOURCE = "zero_budget_eod:baostock:eod_unadjusted:indices"
-ZERO_BUDGET_UNIT_CONTRACT_VERSION = "zero-budget-eod-explicit-free-index-fallback-v2"
+ZERO_BUDGET_UNIT_CONTRACT_VERSION = "zero-budget-eod-explicit-verifier-fallback-v3"
 ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION = (
-    "static-units-akshare-stock-sample-em-tx-index-crosscheck-v2"
+    "static-units-independent-stock-sample-em-tx-index-crosscheck-v3"
 )
 ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY = "tushare=1000;baostock=1;eastmoney=1;tencent=10000"
 
@@ -135,18 +135,18 @@ class ZeroBudgetEodMarketData:
             raise DataQualityError("Tushare股票日线过滤后仍包含未请求股票。")
 
         verification = _dependency_call(
-            "AKShare独立核验",
+            "独立日线核验",
             lambda: _required_method(
                 self._verifier,
                 "verify_stock_frame",
-                "AKShare独立核验",
+                "独立日线核验",
             )(filtered.copy(), target_date, received_codes),
         )
         status = getattr(verification, "status", None)
         if status is not AKShareVerificationStatus.VERIFIED:
             if status is AKShareVerificationStatus.MISMATCH:
-                raise DataQualityError("AKShare独立核验不是VERIFIED，股票批次已拒绝。")
-            raise DataUnavailableError("AKShare独立核验不可用，股票批次已拒绝。")
+                raise DataQualityError("独立日线核验不是VERIFIED，股票批次已拒绝。")
+            raise DataUnavailableError("独立日线核验不可用，股票批次已拒绝。")
 
         output = filtered.sort_values("symbol").reset_index(drop=True)
         output["source"] = ZERO_BUDGET_STOCK_SOURCE
@@ -226,10 +226,14 @@ class ZeroBudgetEodMarketData:
         )
 
     def _metadata_sources(self):
-        return tuple(
+        sources = [
             f"{key}:{value}"
             for key, value in sorted(getattr(self._baostock, "metadata_sources", {}).items())
-        )
+        ]
+        verifier_evidence = getattr(self._verifier, "last_evidence", "")
+        if verifier_evidence:
+            sources.append(f"fetch_stock_verification:{verifier_evidence}")
+        return tuple(sources)
 
 
 def _validate_tushare_fetch(

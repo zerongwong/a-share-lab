@@ -73,6 +73,14 @@ _SERVERCHAN_SECRET = re.compile(r"\bSCT[A-Za-z0-9_-]{8,192}\b")
 _INFOWAY_SECRET = re.compile(r"(?i)\b[a-f0-9]{24,64}-infoway\b")
 _LAUNCHAGENT_LABEL = "com.zerong.asharelab.daily-sync"
 _LAUNCHAGENT_MODULE = "ashare_lab.cli.scheduled_sync_worker"
+_DAILY_SYNC_SCHEDULE = [
+    {"Hour": 15, "Minute": 30},
+    {"Hour": 16, "Minute": 30},
+    {"Hour": 18, "Minute": 30},
+    {"Hour": 19, "Minute": 30},
+    {"Hour": 20, "Minute": 20},
+    {"Hour": 20, "Minute": 50},
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,12 +139,8 @@ def render_launchagent_plist(
         raise ValueError("daily sync LaunchAgent template has an unexpected label")
     if "KeepAlive" in document:
         raise ValueError("daily sync LaunchAgent must not contain KeepAlive")
-    if document.get("StartCalendarInterval") != [
-        {"Hour": 15, "Minute": 30},
-        {"Hour": 18, "Minute": 30},
-        {"Hour": 20, "Minute": 0},
-    ]:
-        raise ValueError("daily sync LaunchAgent schedule is not the approved three-run contract")
+    if document.get("StartCalendarInterval") != _DAILY_SYNC_SCHEDULE:
+        raise ValueError("daily sync LaunchAgent schedule is not the approved retry contract")
     document["ProgramArguments"] = [
         "/usr/bin/caffeinate",
         "-i",
@@ -252,6 +256,7 @@ def run_scheduled_sync(
                 event = _base_event(now, status="error", exit_code=EXIT_ERROR)
                 event["error_type"] = type(exc).__name__
                 event["reason"] = "update_entrypoint_error"
+                event["failure_reasons"] = [f"{type(exc).__name__}: {_sanitize_text(str(exc))}"]
                 _handle_failure(
                     event,
                     state_path=state_path,

@@ -49,9 +49,7 @@ def _local_status(now: datetime) -> _LocalUpdateStatus:
         automatic = chain[-1] if chain else None
     except AShareLabError:
         pass
-    quarantine_root = (
-        OVERLAY_ROOT / "source=zero_budget_eod" / "adjust=none" / "quarantine"
-    )
+    quarantine_root = OVERLAY_ROOT / "source=zero_budget_eod" / "adjust=none" / "quarantine"
     quarantine_count = len(tuple(quarantine_root.glob("run=*")))
     return _LocalUpdateStatus(
         requested_complete_date=candidate,
@@ -65,9 +63,7 @@ def _local_status(now: datetime) -> _LocalUpdateStatus:
 def _save_key(value: str) -> None:
     save_tushare_token(value)
     st.session_state.pop("tushare_token_input", None)
-    st.session_state[_FLASH_KEY] = (
-        "Tushare Token已安全保存到macOS钥匙串；页面不会回显。"
-    )
+    st.session_state[_FLASH_KEY] = "Tushare Token已安全保存到macOS钥匙串；页面不会回显。"
     st.rerun()
 
 
@@ -129,8 +125,8 @@ def render() -> None:
     st.info(
         "盘中不会把今天的累计行情当成完整日线：上海时间15:30前只补到上一日期。"
         "15:30后当日只进入收盘候选，仍需通过BaoStock交易日历、Tushare覆盖和"
-        "AKShare独立核验；"
-        "不完整数据会被隔离，18:30复核，20:00晚报前再预检。"
+        "AKShare独立核验（网络不可用时由BaoStock按同一规则抽样核验）；"
+        "不完整数据会被隔离，16:30起有限重试，20:50做晚报前末次预检。"
     )
     st.warning(
         "当前免费链只覆盖沪深A股，不含北交所。北交所股票不会被伪造或静默补齐，"
@@ -138,8 +134,8 @@ def render() -> None:
     )
     st.caption(
         "本页提供一键追平和状态检查。项目另附独立LaunchAgent安装脚本；"
-        "只有使用者主动运行安装脚本后，才会在每日15:30首次同步、18:30质量复核、"
-        "20:00晚报前预检。"
+        "只有使用者主动运行安装脚本后，才会在每日15:30首次同步，并于16:30、"
+        "18:30、19:30、20:20、20:50有限重试。"
         "该任务不依赖本网页，不会常驻、连接券商或自动下单。"
     )
 
@@ -193,9 +189,7 @@ def render() -> None:
 
     if st.button("立即自动补齐缺失收盘数据", type="primary", width="stretch"):
         try:
-            with st.spinner(
-                "正在用BaoStock核对交易日历、Tushare取得日线、AKShare交叉核验…"
-            ):
+            with st.spinner("正在用BaoStock核对交易日历、Tushare取得日线、AKShare交叉核验…"):
                 _run_update()
         except (AShareLabError, ValueError) as exc:
             st.error(f"自动数据更新未完成：{exc}")

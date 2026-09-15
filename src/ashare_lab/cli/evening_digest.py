@@ -318,6 +318,51 @@ def run_evening_digest(
                     )
                 )
 
+            # Reject stale verified data before loading and scoring the full
+            # market.  A provider outage must not occupy the shared daily-data
+            # lock for tens of minutes only to reach the same fail-closed
+            # decision after the expensive build.
+            preflight_plan_for_date: date | None = None
+            if latest is not None:
+                if latest > target_date:
+                    return finish(
+                        _error(
+                            "verified_market_data_cutoff_after_decision_date",
+                            common_cutoff=latest.isoformat(),
+                        )
+                    )
+                try:
+                    preflight_plan_for_date = _validate_next_trading_day(
+                        latest,
+                        next_trading_day(latest),
+                    )
+                except Exception:  # noqa: BLE001 - provider details stay private
+                    return finish(
+                        _error(
+                            "next_trading_day_not_verified",
+                            common_cutoff=latest.isoformat(),
+                            plan_for_date=None,
+                        )
+                    )
+                if preflight_plan_for_date != target_date + timedelta(days=1):
+                    if preflight_plan_for_date <= target_date:
+                        return finish(
+                            _error(
+                                "verified_market_data_stale_for_tomorrow",
+                                common_cutoff=latest.isoformat(),
+                            )
+                        )
+                    return finish(
+                        EveningDigestOutcome(
+                            EXIT_OK,
+                            _event(
+                                "noop_not_next_session_eve",
+                                common_cutoff=latest.isoformat(),
+                                plan_for_date=preflight_plan_for_date.isoformat(),
+                            ),
+                        )
+                    )
+
             if _build_digest is None:
                 from ashare_lab.services.build_continuous_digest import (
                     build_continuous_research_digest,
@@ -368,19 +413,22 @@ def run_evening_digest(
                 )
 
             cutoff = digest.common_cutoff.isoformat()
-            try:
-                plan_for_date = _validate_next_trading_day(
-                    digest.common_cutoff,
-                    next_trading_day(digest.common_cutoff),
-                )
-            except Exception:  # noqa: BLE001 - provider details and secrets stay private
-                return finish(
-                    _error(
-                        "next_trading_day_not_verified",
-                        common_cutoff=cutoff,
-                        plan_for_date=None,
+            if digest.common_cutoff == latest and preflight_plan_for_date is not None:
+                plan_for_date = preflight_plan_for_date
+            else:
+                try:
+                    plan_for_date = _validate_next_trading_day(
+                        digest.common_cutoff,
+                        next_trading_day(digest.common_cutoff),
                     )
-                )
+                except Exception:  # noqa: BLE001 - provider details and secrets stay private
+                    return finish(
+                        _error(
+                            "next_trading_day_not_verified",
+                            common_cutoff=cutoff,
+                            plan_for_date=None,
+                        )
+                    )
             digest = replace(digest, plan_for_date=plan_for_date)
             if plan_for_date != target_date + timedelta(days=1):
                 if plan_for_date <= target_date:

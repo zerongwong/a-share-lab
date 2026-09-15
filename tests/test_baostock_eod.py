@@ -179,9 +179,7 @@ def test_calendar_requires_complete_natural_day_range_and_returns_open_days() ->
     result = _adapter(fake).fetch_cn_trading_days(date(2026, 8, 29), TARGET)
 
     assert result == (date(2026, 8, 31), TARGET)
-    assert fake.calendar_calls == [
-        {"start_date": "2026-08-29", "end_date": "2026-09-01"}
-    ]
+    assert fake.calendar_calls == [{"start_date": "2026-08-29", "end_date": "2026-09-01"}]
     assert fake.login_calls == 1
     assert fake.logout_calls == 1
 
@@ -263,9 +261,9 @@ def test_current_symbol_list_keeps_suspended_a_shares_and_excludes_other_product
             ],
             "重复",
         ),
-        ([ ["xx.600000", "A", "1999-01-01", "", "1", "1"] ], "无法识别"),
-        ([ ["sh.500001", "A", "1999-01-01", "", "1", "1"] ], "新前缀"),
-        ([ ["sh.600000", "A", "1999-01-01", "", "1", "active"] ], "type或status"),
+        ([["xx.600000", "A", "1999-01-01", "", "1", "1"]], "无法识别"),
+        ([["sh.500001", "A", "1999-01-01", "", "1", "1"]], "新前缀"),
+        ([["sh.600000", "A", "1999-01-01", "", "1", "active"]], "type或status"),
     ],
 )
 def test_symbol_list_rejects_duplicate_unknown_code_or_status(
@@ -288,10 +286,7 @@ def test_core_indices_are_complete_unadjusted_and_keep_documented_units() -> Non
     assert batch.coverage_ratio == 1.0
     assert batch.fetched_at == NOW
     assert batch.unit_contract_version == BAOSTOCK_INDEX_UNIT_CONTRACT_VERSION
-    assert (
-        batch.unit_resolution_method_version
-        == BAOSTOCK_INDEX_UNIT_RESOLUTION_METHOD_VERSION
-    )
+    assert batch.unit_resolution_method_version == BAOSTOCK_INDEX_UNIT_RESOLUTION_METHOD_VERSION
     assert batch.amount_multiplier_to_cny == "1"
     assert batch.trace_ids == ()
     assert list(batch.frame.columns) == ["symbol", *CANONICAL_DAILY_COLUMNS]
@@ -392,9 +387,7 @@ def test_result_iterator_shape_is_strict() -> None:
         def next(self) -> object:
             return "yes"
 
-    fake = FakeBaoStock(
-        calendar=BadIteratorResult(CALENDAR_FIELDS, [[TARGET.isoformat(), "1"]])
-    )
+    fake = FakeBaoStock(calendar=BadIteratorResult(CALENDAR_FIELDS, [[TARGET.isoformat(), "1"]]))
     with pytest.raises(DataQualityError, match="不是布尔值"):
         _adapter(fake).fetch_cn_trading_days(TARGET, TARGET)
 

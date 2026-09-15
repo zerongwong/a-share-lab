@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 import ashare_lab.services.run_zero_budget_daily_update as update_module
+from ashare_lab.adapters.free_eod_fallback import FreeEodMetadataFallback
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.adapters.tushare_daily import TushareDailyClient
 from ashare_lab.adapters.zero_budget_eod import (
@@ -97,9 +98,7 @@ def _daily_frame(
                 "amount_cny": close * volume,
                 "turnover_pct": None,
                 "source": (
-                    ZERO_BUDGET_STOCK_SOURCE
-                    if asset_kind == "stocks"
-                    else ZERO_BUDGET_INDEX_SOURCE
+                    ZERO_BUDGET_STOCK_SOURCE if asset_kind == "stocks" else ZERO_BUDGET_INDEX_SOURCE
                 ),
                 "retrieved_at": NOW.isoformat().replace("+00:00", "Z"),
             }
@@ -155,9 +154,7 @@ class FakeCompositeProvider(CloseableComponent):
             provider=ZERO_BUDGET_EOD_PROVIDER,
             cutoff_timestamp=cutoff_timestamp or 1_777_777_777,
             unit_contract_version=ZERO_BUDGET_UNIT_CONTRACT_VERSION,
-            unit_resolution_method_version=(
-                ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION
-            ),
+            unit_resolution_method_version=(ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION),
             amount_multiplier_to_cny=ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY,
         )
 
@@ -338,10 +335,7 @@ def test_two_missing_stock_rows_pass_the_98_percent_gate_and_publish_own_manifes
     assert report.current_through_latest_complete_session is True
     assert report.csmar_mutated is False
     assert report.unit_contract_version == ZERO_BUDGET_UNIT_CONTRACT_VERSION
-    assert (
-        report.unit_resolution_method_version
-        == ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION
-    )
+    assert report.unit_resolution_method_version == ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION
     assert seams["token"] == TOKEN
     _assert_components_closed(created)
 
@@ -354,6 +348,7 @@ def test_two_missing_stock_rows_pass_the_98_percent_gate_and_publish_own_manifes
         (SourceId.BAOSTOCK, DataAction.METADATA_READ),
         (SourceId.AKSHARE, DataAction.MARKET_DATA_READ),
         (SourceId.AKSHARE, DataAction.MARKET_DATA_CACHE),
+        (SourceId.AKSHARE, DataAction.METADATA_READ),
         (SourceId.ZERO_BUDGET_EOD, DataAction.MARKET_DATA_READ),
         (SourceId.ZERO_BUDGET_EOD, DataAction.MARKET_DATA_CACHE),
     )
@@ -403,6 +398,62 @@ def test_three_missing_stock_rows_are_quarantined_below_the_98_percent_gate(
     assert MarketOverlayStore(tmp_path / "overlay").read_verified_manifest().empty
     _assert_components_closed(created)
     _assert_secret_absent_from_tree(tmp_path / "overlay")
+
+
+def test_production_wiring_requires_stock_master_completeness_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_baseline(monkeypatch)
+    received: dict[str, object] = {}
+
+    class ProductionBaoStock(CloseableComponent):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__("baostock")
+            received["baostock_kwargs"] = kwargs
+
+    class ProductionTushare(CloseableComponent):
+        def __init__(self, _token: str, **kwargs: object) -> None:
+            super().__init__("tushare")
+            received["tushare_kwargs"] = kwargs
+
+    class OfficialMaster(CloseableComponent):
+        provider = "official"
+
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__("official")
+            received["official_kwargs"] = kwargs
+
+    class Verifier(CloseableComponent):
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__("verifier")
+            received["verifier_kwargs"] = kwargs
+
+    def provider_factory(**kwargs: object) -> FakeCompositeProvider:
+        received["provider_kwargs"] = kwargs
+        return FakeCompositeProvider()
+
+    monkeypatch.setattr(update_module, "BoundedBaoStockEod", ProductionBaoStock)
+    report = update_module.run_zero_budget_daily_update(
+        csmar_root=tmp_path / "csmar",
+        overlay_root=tmp_path / "overlay",
+        now=NOW,
+        core_index_symbols=CORE_INDICES,
+        _token_loader=lambda: TOKEN,
+        _baostock_factory=ProductionBaoStock,
+        _tushare_factory=ProductionTushare,
+        _verifier_factory=Verifier,
+        _stock_master_factory=OfficialMaster,
+        _provider_factory=provider_factory,
+        _rights_policy=RecordingRightsPolicy(),
+    )
+
+    assert report.updated_sessions == (DAY_25, DAY_26)
+    wrapper = received["provider_kwargs"]["baostock"]
+    assert isinstance(wrapper, FreeEodMetadataFallback)
+    assert wrapper.require_stock_master_completeness_evidence is True
+    assert wrapper.expected_stock_symbols is None
+    assert received["official_kwargs"]["expected_symbols"] is None
 
 
 def test_upstream_error_text_is_sanitized_in_report_and_all_components_close(

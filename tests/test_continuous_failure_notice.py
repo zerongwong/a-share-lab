@@ -146,6 +146,7 @@ def _run(
     minute=45,
     builder=_broken_builder,
     latest=CUTOFF,
+    next_day=date(2026, 8, 31),
 ):
     return cli.run_evening_digest(
         **_paths(tmp_path, minute=minute),
@@ -153,7 +154,7 @@ def _run(
         _build_digest=builder,
         _build_holding_review=reviewer,
         _latest_cutoff=lambda _root: latest,
-        _next_trading_day=lambda _cutoff: date(2026, 8, 28),
+        _next_trading_day=lambda _cutoff: next_day,
         _notifier=notifier or (lambda _message: _accepted()),
     )
 
@@ -409,9 +410,12 @@ def test_stale_plan_is_error_even_when_old_cutoff_was_already_accepted(tmp_path,
         return digest
 
     result = _run(
-        tmp_path, builder=builder, notifier=lambda msg: (messages.append(msg), _accepted())[1]
+        tmp_path,
+        builder=builder,
+        next_day=date(2026, 8, 28),
+        notifier=lambda msg: (messages.append(msg), _accepted())[1],
     )
-    assert builds == [True]
+    assert builds == []
     assert result.exit_code == cli.EXIT_ERROR
     assert result.event["reason"] == "verified_market_data_stale_for_tomorrow"
     assert len(messages) == 1

@@ -7,6 +7,7 @@ audit but can never be mixed into a new research cutoff.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -18,9 +19,14 @@ from ashare_lab.adapters.baostock_eod import (
     BAOSTOCK_CORE_INDEX_SYMBOLS,
 )
 from ashare_lab.adapters.bounded_baostock import BoundedBaoStockEod
+from ashare_lab.adapters.bounded_baostock_eod_verifier import (
+    BoundedBaoStockEodVerifier,
+    UnavailableOnlyEodVerifierFallback,
+)
 from ashare_lab.adapters.free_eod_fallback import FreeEodMetadataFallback
 from ashare_lab.adapters.macos_keychain import load_tushare_token
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
+from ashare_lab.adapters.official_exchange_stock_master import BoundedOfficialExchangeStockMaster
 from ashare_lab.adapters.tushare_daily import TushareDailyClient
 from ashare_lab.adapters.zero_budget_eod import (
     ZERO_BUDGET_EOD_PROVIDER,
@@ -30,7 +36,7 @@ from ashare_lab.adapters.zero_budget_eod import (
 )
 from ashare_lab.bootstrap import application_data_dir
 from ashare_lab.domain.data_sources import DataAction, RightsPolicy, SourceId, SourceRegistry
-from ashare_lab.domain.errors import DataUnavailableError
+from ashare_lab.domain.errors import DataQualityError, DataUnavailableError
 from ashare_lab.services.run_daily_update import (
     DailyUpdateReport,
     QuarantinedDailyUpdate,
@@ -54,6 +60,8 @@ def run_zero_budget_daily_update(
     _baostock_factory: Callable[..., Any] = BoundedBaoStockEod,
     _tushare_factory: Callable[..., Any] = TushareDailyClient,
     _verifier_factory: Callable[..., Any] = AKShareEodVerifier,
+    _backup_verifier_factory: Callable[..., Any] = BoundedBaoStockEodVerifier,
+    _stock_master_factory: Callable[..., Any] = BoundedOfficialExchangeStockMaster,
     _provider_factory: Callable[..., Any] = ZeroBudgetEodMarketData,
     _rights_policy: RightsPolicy | None = None,
 ) -> DailyUpdateReport:
@@ -87,7 +95,14 @@ def run_zero_budget_daily_update(
                 DataAction.METADATA_READ,
             ),
         ),
-        (SourceId.AKSHARE, (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE)),
+        (
+            SourceId.AKSHARE,
+            (
+                DataAction.MARKET_DATA_READ,
+                DataAction.MARKET_DATA_CACHE,
+                DataAction.METADATA_READ,
+            ),
+        ),
         (
             SourceId.ZERO_BUDGET_EOD,
             (DataAction.MARKET_DATA_READ, DataAction.MARKET_DATA_CACHE),
@@ -113,13 +128,42 @@ def run_zero_budget_daily_update(
         )
         components.append(tushare)
         if _baostock_factory is BoundedBaoStockEod:
-            baostock = FreeEodMetadataFallback(baostock, tushare, clock=lambda: resolved_now)
+            expected_stock_symbols = _latest_requested_stock_symbols(store)
+            stock_master = _safe_construct(
+                "上交所/深交所证券主表组件",
+                lambda: _stock_master_factory(
+                    expected_symbols=expected_stock_symbols,
+                    clock=lambda: resolved_now.astimezone(UTC),
+                ),
+            )
+            components.append(stock_master)
+            baostock = FreeEodMetadataFallback(
+                baostock,
+                tushare,
+                stock_master_backup=stock_master,
+                expected_stock_symbols=expected_stock_symbols,
+                require_stock_master_completeness_evidence=True,
+                clock=lambda: resolved_now,
+            )
             components.append(baostock)
         verifier = _safe_construct(
             "AKShare核验组件",
             lambda: _verifier_factory(clock=lambda: resolved_now.astimezone(UTC)),
         )
         components.append(verifier)
+        if _verifier_factory is AKShareEodVerifier:
+            backup_verifier = _safe_construct(
+                "BaoStock备用核验组件",
+                lambda: _backup_verifier_factory(
+                    clock=lambda: resolved_now.astimezone(UTC),
+                ),
+            )
+            components.append(backup_verifier)
+            verifier = UnavailableOnlyEodVerifierFallback(
+                primary=verifier,
+                backup=backup_verifier,
+            )
+            components.append(verifier)
         provider = _safe_construct(
             "零预算三源组合",
             lambda: _provider_factory(
@@ -196,8 +240,9 @@ def run_zero_budget_daily_update(
         unit_contract_version=ZERO_BUDGET_UNIT_CONTRACT_VERSION,
         unit_resolution_method_version=ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION,
         market_scope=(
-            "沪深A股：Tushare未复权日线及AKShare抽样核验；BaoStock日历/主表/六指数；"
-            "不可用时元数据备用Tushare、指数备用东财并由腾讯逐一核验；不含北交所"
+            "沪深A股：Tushare未复权日线；AKShare抽样核验不可用时由BaoStock同规则"
+            "独立抽样核验；BaoStock日历/六指数，证券主表不可用时读取上交所/深交所"
+            "官方清单；指数备用东财并由腾讯逐一核验；不含北交所"
         ),
         csmar_mutated=False,
         range_report=range_report,
@@ -230,6 +275,20 @@ def _safe_construct(label: str, factory: Callable[[], Any]) -> Any:
         raise DataUnavailableError(
             f"{label}初始化失败（{type(exc).__name__}），原始错误已脱敏。"
         ) from None
+
+
+def _latest_requested_stock_symbols(store: MarketOverlayStore) -> tuple[str, ...] | None:
+    manifest = store.read_verified_manifest(source_id=ZERO_BUDGET_EOD_PROVIDER)
+    if manifest.empty:
+        return None
+    try:
+        receipt = json.loads(manifest.sort_values("trade_date").iloc[-1]["receipt_json"])
+        values = receipt["stocks"]["requested_symbols"]
+        if not isinstance(values, list) or not values:
+            raise ValueError
+        return tuple(sorted(str(value) for value in values))
+    except (KeyError, TypeError, ValueError):
+        raise DataQualityError("最近已验证证券主表回执不可读取。") from None
 
 
 __all__ = ["run_zero_budget_daily_update"]

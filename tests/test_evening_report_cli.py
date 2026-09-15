@@ -707,12 +707,28 @@ def test_manual_send_never_relabels_stale_data_as_tomorrows_plan(tmp_path):
         send_now=True,
         _latest_cutoff=lambda _root: CUTOFF,
         _next_trading_day=lambda _cutoff: FRIDAY,
-        _build_digest=lambda **_kwargs: _digest(),
+        _build_digest=lambda **_kwargs: pytest.fail(
+            "stale verified cutoff must stop before full-market build"
+        ),
         _notifier=lambda _message: pytest.fail("stale plan must not send"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
     assert outcome.event["reason"] == "verified_market_data_stale_for_tomorrow"
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+
+
+def test_future_verified_cutoff_fails_closed_before_calendar_or_build(tmp_path):
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF + timedelta(days=1),
+        _next_trading_day=lambda _cutoff: pytest.fail("future cutoff must stop before calendar"),
+        _build_digest=lambda **_kwargs: pytest.fail("future cutoff must stop before build"),
+        _notifier=lambda _message: pytest.fail("future cutoff must not send"),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "verified_market_data_cutoff_after_decision_date"
 
 
 @pytest.mark.parametrize(
@@ -723,9 +739,7 @@ def test_manual_send_never_relabels_stale_data_as_tomorrows_plan(tmp_path):
         (True, datetime(2026, 8, 27, 17, 25, tzinfo=UTC)),
     ],
 )
-def test_long_build_crossing_submission_window_is_a_visible_failure(
-    tmp_path, send_now, end_time
-):
+def test_long_build_crossing_submission_window_is_a_visible_failure(tmp_path, send_now, end_time):
     current = [datetime(2026, 8, 27, 13, tzinfo=UTC)]
     options = _paths(tmp_path)
     options["_clock"] = lambda: current[0]
@@ -739,7 +753,7 @@ def test_long_build_crossing_submission_window_is_a_visible_failure(
         send_now=send_now,
         _latest_cutoff=lambda _root: CUTOFF,
         _build_digest=build,
-        _next_trading_day=lambda _cutoff: pytest.fail("expired build must stop before network"),
+        _next_trading_day=lambda _cutoff: FRIDAY,
         _notifier=lambda _message: pytest.fail("expired plan must not send"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
@@ -763,7 +777,9 @@ def test_default_text_only_ignores_old_chart_grants_and_pending_image_retry(tmp_
         _build_digest=lambda **_kwargs: _digest(),
         _repository=repository,
         _build_holding_review=lambda *_args, **_kwargs: _holding_review_for_portfolio(portfolio),
-        _build_holding_chart_report=lambda *_args, **_kwargs: pytest.fail("text-only must not draw"),
+        _build_holding_chart_report=lambda *_args, **_kwargs: pytest.fail(
+            "text-only must not draw"
+        ),
         _holding_chart_publisher=publisher,
         _notifier=lambda message: messages.append(message) or _accepted_summary(),
     )
@@ -1957,8 +1973,10 @@ def test_cli_manual_send_keeps_production_text_only(monkeypatch, capsys):
     monkeypatch.setattr(
         evening_digest,
         "run_evening_digest",
-        lambda **kwargs: calls.append(kwargs)
-        or evening_report.EveningDigestOutcome(evening_report.EXIT_OK, {"status": "checked"}),
+        lambda **kwargs: (
+            calls.append(kwargs)
+            or evening_report.EveningDigestOutcome(evening_report.EXIT_OK, {"status": "checked"})
+        ),
     )
     assert evening_report.main(["--send-now"]) == evening_report.EXIT_OK
     assert calls[0]["send_now"] is True

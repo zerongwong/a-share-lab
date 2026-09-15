@@ -307,16 +307,33 @@ def _company_action_metadata(row: dict[str, object]) -> dict[str, object]:
     """Accept dated evidence only when every field is explicitly supplied."""
 
     clear = row.get("company_action_clear")
+    coverage_from = row.get("company_action_clear_from")
     through = row.get("company_action_clear_through")
     source = str(row.get("company_action_evidence_source", "")).strip()
     evidence_id = str(row.get("company_action_evidence_id", "")).strip()
-    if clear is None and through in (None, "") and not source and not evidence_id:
+    if (
+        clear is None
+        and coverage_from in (None, "")
+        and through in (None, "")
+        and not source
+        and not evidence_id
+    ):
         return {}
-    if not isinstance(clear, bool) or through in (None, "") or not source or not evidence_id:
+    if (
+        not isinstance(clear, bool)
+        or coverage_from in (None, "")
+        or through in (None, "")
+        or not source
+        or not evidence_id
+    ):
         raise ValueError("公司行动核验信息不完整")
+    from_date = datetime.strptime(str(coverage_from), "%Y-%m-%d").date()
     through_date = datetime.strptime(str(through), "%Y-%m-%d").date()
+    if from_date > through_date:
+        raise ValueError("公司行动核验区间无效")
     return {
         "company_action_clear": clear,
+        "company_action_clear_from": from_date.isoformat(),
         "company_action_clear_through": through_date.isoformat(),
         "company_action_evidence_source": source,
         "company_action_evidence_id": evidence_id,

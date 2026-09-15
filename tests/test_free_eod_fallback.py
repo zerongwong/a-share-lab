@@ -47,6 +47,194 @@ def test_metadata_failover_on_unavailability_only():
             adapter.fetch_cn_stock_symbols()
 
 
+def test_stock_master_uses_official_backup_only_when_baostock_is_unavailable():
+    calls = []
+
+    class official:
+        provider = "sse_szse_official_via_akshare"
+        last_evidence = "official-exchange-evidence"
+
+        @staticmethod
+        def fetch_cn_stock_symbols():
+            calls.append("official")
+            return ("600000.SH",)
+
+    with httpx.Client() as client:
+        adapter = FreeEodMetadataFallback(
+            primary(), backup(), stock_master_backup=official(), client=client
+        )
+        assert adapter.fetch_cn_stock_symbols() == ("600000.SH",)
+    assert calls == ["official"]
+    assert adapter.metadata_sources["fetch_cn_stock_symbols"] == "official-exchange-evidence"
+
+
+def test_stock_master_quality_failure_never_silently_uses_official_backup():
+    calls = []
+
+    class official:
+        @staticmethod
+        def fetch_cn_stock_symbols():
+            calls.append("official")
+            return ("600000.SH",)
+
+    with httpx.Client() as client:
+        adapter = FreeEodMetadataFallback(
+            primary(DataQualityError), backup(), stock_master_backup=official(), client=client
+        )
+        with pytest.raises(DataQualityError):
+            adapter.fetch_cn_stock_symbols()
+    assert calls == []
+
+
+def test_stock_master_reports_all_free_sources_unavailable_without_falling_through():
+    class unavailable_official:
+        @staticmethod
+        def fetch_cn_stock_symbols():
+            raise DataUnavailableError("private upstream detail")
+
+    with httpx.Client() as client:
+        adapter = FreeEodMetadataFallback(
+            primary(), backup(), stock_master_backup=unavailable_official(), client=client
+        )
+        with pytest.raises(DataUnavailableError, match="所有免费来源") as caught:
+            adapter.fetch_cn_stock_symbols()
+    assert "private upstream" not in str(caught.value)
+
+
+def complete_stock_master() -> tuple[str, ...]:
+    sh = (f"{600_000 + value:06d}.SH" for value in range(2_600))
+    sz = (f"{value:06d}.SZ" for value in range(2_600))
+    return tuple(sorted((*sh, *sz)))
+
+
+class StaticStockMaster:
+    provider = "synthetic_stock_master"
+    last_evidence = "synthetic-independent-evidence"
+
+    def __init__(self, value=None, error=None):
+        self.value = value
+        self.error = error
+        self.calls = 0
+
+    def fetch_cn_stock_symbols(self):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error("private provider details")
+        return self.value
+
+
+def completeness_adapter(primary_master, official_master, *, expected=None):
+    return FreeEodMetadataFallback(
+        primary_master,
+        backup(),
+        stock_master_backup=official_master,
+        expected_stock_symbols=expected,
+        require_stock_master_completeness_evidence=True,
+        client=SimpleNamespace(close=lambda: None),
+    )
+
+
+def test_well_formed_baostock_truncation_is_rejected_against_current_official_master():
+    complete = complete_stock_master()
+    truncated = complete[:-1]
+    baostock = StaticStockMaster(truncated)
+    official = StaticStockMaster(complete)
+    adapter = completeness_adapter(baostock, official, expected=complete)
+
+    with pytest.raises(DataQualityError, match="不一致"):
+        adapter.fetch_cn_stock_symbols()
+
+    assert baostock.calls == official.calls == 1
+    assert "fetch_cn_stock_symbols" not in adapter.metadata_sources
+
+
+def test_quality_mismatch_does_not_switch_to_the_official_result():
+    complete = complete_stock_master()
+    candidate = tuple(sorted((*complete[:-1], "603000.SH")))
+    adapter = completeness_adapter(
+        StaticStockMaster(candidate),
+        StaticStockMaster(complete),
+        expected=complete,
+    )
+
+    with pytest.raises(DataQualityError):
+        adapter.fetch_cn_stock_symbols()
+
+
+def test_recent_anchor_can_cover_temporary_official_unavailability_without_allowing_shrink():
+    complete = complete_stock_master()
+    official = StaticStockMaster(error=DataUnavailableError)
+    accepted = completeness_adapter(StaticStockMaster(complete), official, expected=complete)
+
+    assert accepted.fetch_cn_stock_symbols() == complete
+    assert accepted.metadata_sources["fetch_cn_stock_symbols"] == (
+        "baostock:checked_against_last_verified_master"
+    )
+
+    rejected = completeness_adapter(
+        StaticStockMaster(complete[:-1]),
+        StaticStockMaster(error=DataUnavailableError),
+        expected=complete,
+    )
+    with pytest.raises(DataQualityError, match="未经独立确认的缩减"):
+        rejected.fetch_cn_stock_symbols()
+
+
+def test_first_master_requires_exact_baostock_and_official_agreement():
+    complete = complete_stock_master()
+    official = StaticStockMaster(complete)
+    adapter = completeness_adapter(StaticStockMaster(complete), official)
+
+    assert adapter.fetch_cn_stock_symbols() == complete
+    assert adapter.metadata_sources["fetch_cn_stock_symbols"] == (
+        "baostock:crosschecked:synthetic-independent-evidence"
+    )
+
+    mismatch = completeness_adapter(StaticStockMaster(complete[:-1]), StaticStockMaster(complete))
+    with pytest.raises(DataQualityError, match="不一致"):
+        mismatch.fetch_cn_stock_symbols()
+
+
+def test_first_master_never_publishes_a_single_official_list():
+    official = StaticStockMaster(complete_stock_master())
+    adapter = completeness_adapter(StaticStockMaster(error=DataUnavailableError), official)
+
+    with pytest.raises(DataUnavailableError, match="单一官方名单"):
+        adapter.fetch_cn_stock_symbols()
+
+    assert official.calls == 0
+
+
+def test_official_quality_failure_is_not_downgraded_to_anchor_only_success():
+    complete = complete_stock_master()
+    adapter = completeness_adapter(
+        StaticStockMaster(complete),
+        StaticStockMaster(error=DataQualityError),
+        expected=complete,
+    )
+
+    with pytest.raises(DataQualityError, match="private provider details"):
+        adapter.fetch_cn_stock_symbols()
+
+
+def test_two_current_sources_can_confirm_a_small_real_membership_change():
+    old = complete_stock_master()
+    current = tuple(sorted((*old[:-1], "603000.SH")))
+    adapter = completeness_adapter(
+        StaticStockMaster(current), StaticStockMaster(current), expected=old
+    )
+
+    assert adapter.fetch_cn_stock_symbols() == current
+
+
+def test_two_matching_but_obviously_short_lists_are_not_complete_evidence():
+    short = complete_stock_master()[:4_999]
+    adapter = completeness_adapter(StaticStockMaster(short), StaticStockMaster(short))
+
+    with pytest.raises(DataQualityError, match="数量不足"):
+        adapter.fetch_cn_stock_symbols()
+
+
 def response(request, *, mismatch=False, wrong_date=False):
     if "eastmoney.com" in request.url.host:
         code = request.url.params["secid"].split(".")[1]

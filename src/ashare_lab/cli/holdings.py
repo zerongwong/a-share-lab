@@ -200,6 +200,7 @@ def _company_action_metadata(row: dict[str, object]) -> dict[str, object]:
 
     clear = row.get("company_action_clear")
     fields = (
+        row.get("company_action_clear_from"),
         row.get("company_action_clear_through"),
         row.get("company_action_evidence_source"),
         row.get("company_action_evidence_id"),
@@ -208,9 +209,13 @@ def _company_action_metadata(row: dict[str, object]) -> dict[str, object]:
         return {}
     if not isinstance(clear, bool) or any(value in (None, "") for value in fields):
         raise ValueError("Company-action evidence must be complete and explicit")
+    coverage_from = _iso_date(row["company_action_clear_from"])
     through = _iso_date(row["company_action_clear_through"])
+    if coverage_from > through:
+        raise ValueError("Company-action evidence interval is invalid")
     return {
         "company_action_clear": clear,
+        "company_action_clear_from": coverage_from.isoformat(),
         "company_action_clear_through": through.isoformat(),
         "company_action_evidence_source": str(row["company_action_evidence_source"]).strip(),
         "company_action_evidence_id": str(row["company_action_evidence_id"]).strip(),

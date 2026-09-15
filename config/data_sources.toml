@@ -112,13 +112,13 @@ notes = "未取得可核验书面授权前，不抓取、不落盘、不发送�
 [sources.akshare]
 display_name = "AKShare"
 status = "experimental"
-purposes = ["个人研究用实验行情", "已标记缓存"]
+purposes = ["个人研究用实验行情", "交易所官方证券清单适配", "已标记缓存"]
 official_url = "https://akshare.akfamily.xyz/"
 application_url = "https://akshare.akfamily.xyz/"
 authorization_basis = "personal_research_only"
 configurable = false
-allowed_actions = ["market_data_read", "market_data_cache"]
-notes = "非生产级授权源；接口可能变化，结果必须保留来源、时间戳和质量标记。"
+allowed_actions = ["market_data_read", "market_data_cache", "metadata_read"]
+notes = "非生产级授权源；接口可能变化。交易所证券清单须保留上交所/深交所来源、时间戳、完整性和漂移校验，行情结果必须保留质量标记。"
 
 [sources.yahoo]
 display_name = "Yahoo Finance"

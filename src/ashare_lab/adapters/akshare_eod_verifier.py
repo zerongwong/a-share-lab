@@ -177,9 +177,7 @@ class AKShareEodVerificationResult:
         if self.status is AKShareVerificationStatus.VERIFIED:
             return
         if self.status is AKShareVerificationStatus.MISMATCH:
-            fields = ", ".join(
-                f"{item.symbol}:{item.field}" for item in self.mismatches[:8]
-            )
+            fields = ", ".join(f"{item.symbol}:{item.field}" for item in self.mismatches[:8])
             raise DataQualityError(f"AKShare交叉核验数值不一致：{fields or 'unknown'}")
         reason = "; ".join(self.unavailable_reasons) or "AKShare evidence unavailable"
         raise DataUnavailableError(reason)
@@ -195,9 +193,7 @@ def _load_akshare() -> ModuleType:
     try:
         return importlib.import_module("akshare")
     except ImportError as exc:
-        raise DataUnavailableError(
-            "未安装AKShare；无法进行独立收盘数据核验。"
-        ) from exc
+        raise DataUnavailableError("未安装AKShare；无法进行独立收盘数据核验。") from exc
 
 
 class AKShareEodVerifier:
@@ -208,6 +204,8 @@ class AKShareEodVerifier:
     The class is safe to construct when AKShare is not installed; its import is
     deferred until :meth:`verify` needs the default historical fetcher.
     """
+
+    provider = "akshare"
 
     def __init__(
         self,
@@ -241,11 +239,41 @@ class AKShareEodVerifier:
         ``UNAVAILABLE``; proven numeric disagreements are ``MISMATCH``.
         """
 
+        return self._verify_result(
+            tushare_batch,
+            target_date,
+            preserve_quality_errors=False,
+        )
+
+    def _verify_result(
+        self,
+        tushare_batch: pd.DataFrame,
+        target_date: date,
+        *,
+        preserve_quality_errors: bool,
+    ) -> AKShareEodVerificationResult:
+        """Run one verification while optionally preserving quality failures.
+
+        The public :meth:`verify` method keeps its explicit-result contract for
+        diagnostic callers.  The daily-sync strict entrypoint uses this helper
+        with ``preserve_quality_errors=True`` so a malformed provider payload
+        cannot be reclassified as mere unavailability and hidden by a backup
+        verifier.
+        """
+
         if not isinstance(target_date, date) or isinstance(target_date, datetime):
             raise TypeError("target_date must be a date")
         try:
             canonical = _validate_tushare_batch(tushare_batch, target_date)
-        except (DataQualityError, DataUnavailableError, TypeError, ValueError) as exc:
+        except DataQualityError as exc:
+            if preserve_quality_errors:
+                raise
+            return _unavailable_result(
+                target_date,
+                len(tushare_batch) if isinstance(tushare_batch, pd.DataFrame) else 0,
+                f"TUSHARE_BATCH_UNUSABLE: {type(exc).__name__}: {exc}",
+            )
+        except (DataUnavailableError, TypeError, ValueError) as exc:
             return _unavailable_result(
                 target_date,
                 len(tushare_batch) if isinstance(tushare_batch, pd.DataFrame) else 0,
@@ -259,10 +287,12 @@ class AKShareEodVerifier:
                 comparison = self._verify_snapshot(canonical, target_date, evidence)
                 if comparison is not None:
                     return comparison
-            except (DataQualityError, DataUnavailableError, TypeError, ValueError) as exc:
-                snapshot_rejection = (
-                    f"SNAPSHOT_UNUSABLE: {type(exc).__name__}: {str(exc)[:240]}"
-                )
+            except DataQualityError as exc:
+                if preserve_quality_errors:
+                    raise
+                snapshot_rejection = f"SNAPSHOT_UNUSABLE: {type(exc).__name__}: {str(exc)[:240]}"
+            except (DataUnavailableError, TypeError, ValueError) as exc:
+                snapshot_rejection = f"SNAPSHOT_UNUSABLE: {type(exc).__name__}: {str(exc)[:240]}"
             except Exception as exc:  # noqa: BLE001 - normalize provider boundary
                 snapshot_rejection = f"SNAPSHOT_FETCH_FAILED: {type(exc).__name__}"
 
@@ -272,7 +302,23 @@ class AKShareEodVerifier:
                 target_date,
                 prior_reason=snapshot_rejection,
             )
-        except (DataQualityError, DataUnavailableError, TypeError, ValueError) as exc:
+        except DataQualityError as exc:
+            if preserve_quality_errors:
+                raise
+            reasons = tuple(
+                value
+                for value in (
+                    snapshot_rejection,
+                    f"HISTORICAL_SAMPLE_UNUSABLE: {type(exc).__name__}: {str(exc)[:240]}",
+                )
+                if value
+            )
+            return _unavailable_result(
+                target_date,
+                len(canonical),
+                *reasons,
+            )
+        except (DataUnavailableError, TypeError, ValueError) as exc:
             reasons = tuple(
                 value
                 for value in (
@@ -314,7 +360,9 @@ class AKShareEodVerifier:
         requested = tuple(requested_symbols)
         if not requested:
             raise DataUnavailableError("AKShare核验没有收到目标股票代码。")
-        if any(not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None for symbol in requested):
+        if any(
+            not isinstance(symbol, str) or _SYMBOL.fullmatch(symbol) is None for symbol in requested
+        ):
             raise DataQualityError("AKShare核验目标必须是精确的六位字符串股票代码。")
         if len(set(requested)) != len(requested):
             raise DataQualityError("AKShare核验目标股票代码重复。")
@@ -324,7 +372,11 @@ class AKShareEodVerifier:
         if set(frame_symbols) != set(requested) or len(frame_symbols) != len(requested):
             raise DataQualityError("Tushare股票批次与请求身份集合不一致。")
 
-        result = self.verify(frame, target_date)
+        result = self._verify_result(
+            frame,
+            target_date,
+            preserve_quality_errors=True,
+        )
         result.require_verified()
         return result
 
@@ -336,9 +388,7 @@ class AKShareEodVerifier:
     ) -> AKShareEodVerificationResult | None:
         if not isinstance(evidence, AKShareSnapshotEvidence):
             raise DataUnavailableError("snapshot fetcher did not return dated evidence")
-        if not isinstance(evidence.trade_date, date) or isinstance(
-            evidence.trade_date, datetime
-        ):
+        if not isinstance(evidence.trade_date, date) or isinstance(evidence.trade_date, datetime):
             raise DataUnavailableError("snapshot trade date is not an exact date")
         if evidence.trade_date != target_date:
             raise DataUnavailableError(
@@ -513,9 +563,11 @@ def _validate_tushare_batch(frame: pd.DataFrame, target_date: date) -> pd.DataFr
         raise DataQualityError("Tushare symbol identity is not an exact six-digit stock code")
     if result["symbol"].duplicated().any():
         raise DataQualityError("Tushare batch contains duplicate stock identities")
-    if not result["source"].map(
-        lambda value: isinstance(value, str) and value.strip().lower().startswith("tushare")
-    ).all():
+    if (
+        not result["source"]
+        .map(lambda value: isinstance(value, str) and value.strip().lower().startswith("tushare"))
+        .all()
+    ):
         raise DataQualityError("batch source is not explicitly identified as Tushare")
 
     parsed_dates = _exact_dates(result["trade_date"], "Tushare")
@@ -574,9 +626,7 @@ def _normalize_snapshot(
         result[field] = _strict_numbers(selected[column], f"AKShare snapshot {field}").to_numpy()
     volume_column = columns["volume_lots"]
     assert volume_column is not None
-    volume_lots = _strict_numbers(
-        selected[volume_column], "AKShare snapshot volume_lots"
-    )
+    volume_lots = _strict_numbers(selected[volume_column], "AKShare snapshot volume_lots")
     result["volume_shares"] = (volume_lots * 100.0).to_numpy()
     result["trade_date"] = target_date
     _validate_bar_frame(result, unit_band=unit_band, provider="AKShare snapshot")
@@ -621,14 +671,10 @@ def _normalize_history_bar(
     working = working.sort_values("__date").reset_index(drop=True)
     target_indexes = working.index[working["__date"] == target_date].tolist()
     if len(target_indexes) != 1:
-        raise DataUnavailableError(
-            f"AKShare history has no unique target-date row for {symbol}"
-        )
+        raise DataUnavailableError(f"AKShare history has no unique target-date row for {symbol}")
     target_index = target_indexes[0]
     if target_index == 0:
-        raise DataUnavailableError(
-            f"AKShare history cannot establish previous close for {symbol}"
-        )
+        raise DataUnavailableError(f"AKShare history cannot establish previous close for {symbol}")
 
     target = working.loc[target_index]
     previous = working.loc[target_index - 1]
@@ -640,10 +686,7 @@ def _normalize_history_bar(
     volume_column = columns["volume_lots"]
     assert volume_column is not None
     result["volume_shares"] = (
-        _strict_scalar(
-            target[volume_column], f"AKShare history {symbol} volume_lots"
-        )
-        * 100.0
+        _strict_scalar(target[volume_column], f"AKShare history {symbol} volume_lots") * 100.0
     )
     close_column = columns["close"]
     assert close_column is not None
@@ -725,9 +768,7 @@ def _comparison_result(
                 )
     return AKShareEodVerificationResult(
         status=(
-            AKShareVerificationStatus.MISMATCH
-            if mismatches
-            else AKShareVerificationStatus.VERIFIED
+            AKShareVerificationStatus.MISMATCH if mismatches else AKShareVerificationStatus.VERIFIED
         ),
         target_date=target_date,
         mode=mode,

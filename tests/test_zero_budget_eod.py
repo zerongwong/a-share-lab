@@ -72,7 +72,9 @@ def _stock_frame(
     )
 
 
-def _index_frame(*, trade_date: date = TARGET, source: str = "baostock:eod_unadjusted:indices") -> pd.DataFrame:
+def _index_frame(
+    *, trade_date: date = TARGET, source: str = "baostock:eod_unadjusted:indices"
+) -> pd.DataFrame:
     rows = []
     for offset, external in enumerate(BAOSTOCK_CORE_INDEX_SYMBOLS):
         low = 100.0 + offset
@@ -203,6 +205,7 @@ def test_delegates_calendar_and_list_and_satisfies_daily_increment_port() -> Non
 def test_stock_batch_filters_extras_and_uses_akshare_verification() -> None:
     tushare = FakeTushare()
     verifier = FakeVerifier()
+    verifier.last_evidence = "baostock:historical-sample:target=2026-09-01:sample=2"
     batch = _adapter(tushare=tushare, verifier=verifier).fetch_daily_increment(
         STOCKS,
         TARGET,
@@ -217,6 +220,9 @@ def test_stock_batch_filters_extras_and_uses_akshare_verification() -> None:
     assert batch.trace_ids == ("tushare:stock-trace",)
     assert batch.frame["symbol"].tolist() == ["000001", "600000"]
     assert set(batch.frame["source"]) == {ZERO_BUDGET_STOCK_SOURCE}
+    assert batch.metadata_sources == (
+        "fetch_stock_verification:baostock:historical-sample:target=2026-09-01:sample=2",
+    )
     assert len(verifier.calls) == 1
     verified_frame, verified_date, verified_symbols = verifier.calls[0]
     assert verified_frame["symbol"].tolist() == ["000001", "600000"]
@@ -242,10 +248,7 @@ def test_index_batch_is_baostock_only_and_uses_identical_composite_unit_audit() 
     assert set(indices.frame["source"]) == {ZERO_BUDGET_INDEX_SOURCE}
     for batch in (stocks, indices):
         assert batch.unit_contract_version == ZERO_BUDGET_UNIT_CONTRACT_VERSION
-        assert (
-            batch.unit_resolution_method_version
-            == ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION
-        )
+        assert batch.unit_resolution_method_version == ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION
         assert batch.amount_multiplier_to_cny == ZERO_BUDGET_AMOUNT_MULTIPLIER_TO_CNY
 
 
