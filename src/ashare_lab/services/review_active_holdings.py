@@ -82,6 +82,7 @@ class CompanyActionClearance:
     source: str
     evidence_id: str
     from_date: date | None = None
+    knowledge_time: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,7 +238,13 @@ def review_active_holdings(
             reason="holding_knowledge_time_after_review_time_rejected",
         )
     normalized_histories = _normalize_histories(histories)
-    clearances = _normalize_company_action_clearances(company_action_clear_by_symbol or {})
+    clearances = {
+        symbol: evidence
+        for symbol, evidence in _normalize_company_action_clearances(
+            company_action_clear_by_symbol or {}
+        ).items()
+        if evidence.knowledge_time is None or evidence.knowledge_time <= review_time
+    }
     rows = tuple(
         _review_one(
             repository,
@@ -1091,6 +1098,11 @@ def _evidence_hash(
                     if company_action_clearance.from_date is not None
                     else {}
                 ),
+                **(
+                    {"knowledge_time": company_action_clearance.knowledge_time.isoformat()}
+                    if company_action_clearance.knowledge_time is not None
+                    else {}
+                ),
             }
         ),
         "method_version": HOLDING_TREE_METHOD_VERSION,
@@ -1127,6 +1139,8 @@ def _normalize_company_action_clearances(
             raise ValueError("company action evidence symbol mismatch")
         if not evidence.source.strip() or not evidence.evidence_id.strip():
             raise ValueError("company action evidence source and id cannot be blank")
+        if evidence.knowledge_time is not None and evidence.knowledge_time.tzinfo is None:
+            raise ValueError("company action evidence knowledge_time must be timezone-aware")
         normalized[symbol] = evidence
     return normalized
 

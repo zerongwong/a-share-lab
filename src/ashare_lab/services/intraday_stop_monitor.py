@@ -59,8 +59,17 @@ def write_private_json(path: Path, document):
         temporary.unlink(missing_ok=True)
 
 
-def _corporate_clear(holding, today, evidence=None):
+def _corporate_clear(
+    holding,
+    now,
+    evidence=None,
+    *,
+    allow_manual_fallback=True,
+    require_knowledge_time=False,
+):
+    today = now.date()
     if evidence is not None:
+        knowledge_time = getattr(evidence, "knowledge_time", None)
         return bool(
             evidence.symbol == holding.symbol
             and evidence.clear
@@ -69,7 +78,17 @@ def _corporate_clear(holding, today, evidence=None):
             and evidence.through_date >= today
             and evidence.source
             and evidence.evidence_id
+            and (
+                (knowledge_time is None and not require_knowledge_time)
+                or (
+                    knowledge_time is not None
+                    and knowledge_time.tzinfo is not None
+                    and knowledge_time <= now
+                )
+            )
         )
+    if not allow_manual_fallback:
+        return False
     m = holding.metadata
     try:
         return (
@@ -93,6 +112,9 @@ def run_monitor(
     notifier,
     clock=None,
     company_action_clear_by_symbol=None,
+    company_action_clearance_loader=None,
+    allow_manual_company_action_fallback=True,
+    company_action_authorization_checker=None,
 ):
     now = now.astimezone(CN)
     event = {
@@ -154,6 +176,35 @@ def run_monitor(
         health("持仓数量超出已验证的5只监控范围，请核验登记。")
         event["status"] = "holding_scope_unavailable"
     else:
+        clearances = company_action_clear_by_symbol
+        if clearances is None and company_action_clearance_loader is not None:
+            try:
+                clearances = company_action_clearance_loader(
+                    repository,
+                    as_of=now.date(),
+                    reviewed_at=now,
+                    phase="intraday",
+                )
+                if not isinstance(clearances, dict):
+                    clearances = {}
+            except Exception:  # noqa: BLE001 - UNKNOWN must not stop risk monitoring
+                clearances = {}
+            if clock is not None:
+                now = clock().astimezone(CN)
+            if not allowed():
+                event["status"] = "holding_or_authorization_changed"
+                return event
+
+        def manual_company_action_fallback_allowed():
+            if not allow_manual_company_action_fallback:
+                return False
+            if company_action_authorization_checker is None:
+                return True
+            try:
+                return company_action_authorization_checker() is False
+            except Exception:  # noqa: BLE001 - a broken grant check fails closed
+                return False
+
         try:
             batches = quote_fetcher(tuple(h.symbol for h in portfolio.positions))
         except Exception:
@@ -179,8 +230,17 @@ def run_monitor(
                 issues.add("部分持仓行情过期、缺失或双源不一致；不能当作安全持有。")
             if not quotes:
                 continue
-            clearance = (company_action_clear_by_symbol or {}).get(holding.symbol)
-            clear = _corporate_clear(holding, now.date(), clearance)
+            clearance = (clearances or {}).get(holding.symbol)
+            clear = _corporate_clear(
+                holding,
+                now,
+                clearance,
+                allow_manual_fallback=manual_company_action_fallback_allowed(),
+                require_knowledge_time=(
+                    company_action_clearance_loader is not None
+                    and company_action_clear_by_symbol is None
+                ),
+            )
             if not clear:
                 issues.add(
                     "已发现公司行动；触线会优先核对除权影响，不伪造确认卖出。"

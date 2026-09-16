@@ -14,7 +14,10 @@ from ashare_lab.services.holding_ledger import (
     holding_knowledge_context,
     replace_active_holdings,
 )
-from ashare_lab.services.review_active_holdings import HoldingReviewSummaryStatus
+from ashare_lab.services.review_active_holdings import (
+    CompanyActionClearance,
+    HoldingReviewSummaryStatus,
+)
 from ashare_lab.services.run_active_holding_review import (
     build_evening_holding_review,
     load_active_holding_histories,
@@ -182,6 +185,131 @@ def test_evening_entrypoint_reuses_verified_cutoff_and_core(
     assert result.data_cutoff == date(2026, 8, 28)
     assert result.holding_version == 1
     assert result.rows[0].symbol == "600919"
+
+
+def test_authorized_automatic_evidence_is_used_and_review_time_is_not_backdated(
+    repository: SQLiteRepository,
+) -> None:
+    started = datetime(2026, 8, 28, 22, 0, tzinfo=UTC)
+    known = datetime(2026, 8, 28, 22, 0, 5, tzinfo=UTC)
+    calls: list[dict[str, object]] = []
+
+    def loader(repo, **kwargs):
+        assert repo is repository
+        calls.append(kwargs)
+        return {
+            "600919": CompanyActionClearance(
+                symbol="600919",
+                through_date=date(2026, 8, 28),
+                clear=True,
+                source="cninfo_official_read",
+                evidence_id="company-action:test",
+                from_date=date(2026, 8, 24),
+                knowledge_time=known,
+            )
+        }
+
+    result = run_active_holding_review(
+        repository,
+        dataset_root="unused",
+        overlay_root="unused",
+        as_of=date(2026, 8, 28),
+        reviewed_at=started,
+        persist=False,
+        _baseline_market=FakeBaseline(),
+        _overlay_store=FakeOverlay(),
+        _company_action_loader=loader,
+        _company_action_authorized=lambda: True,
+    )
+
+    assert calls == [
+        {
+            "as_of": date(2026, 8, 28),
+            "reviewed_at": started,
+            "phase": "eod",
+        }
+    ]
+    assert result.reviewed_at == known
+    assert result.rows[0].company_action_clear is True
+    assert result.rows[0].company_action_evidence_source == "cninfo_official_read"
+
+
+def test_authorized_unknown_does_not_fall_back_to_manual_clearance(
+    repository: SQLiteRepository,
+) -> None:
+    replace_active_holdings(
+        repository,
+        (
+            HoldingPositionInput(
+                symbol="600919",
+                name="江苏银行",
+                entry_date=date(2026, 8, 24),
+                stock_sleeve_weight=1.0,
+                metadata={
+                    "company_action_clear": True,
+                    "company_action_clear_from": "2026-08-24",
+                    "company_action_clear_through": "2026-08-28",
+                    "company_action_evidence_source": "legacy-manual",
+                    "company_action_evidence_id": "legacy:clear",
+                },
+            ),
+        ),
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 25, 21, 0, tzinfo=UTC),
+    )
+
+    result = run_active_holding_review(
+        repository,
+        dataset_root="unused",
+        overlay_root="unused",
+        as_of=date(2026, 8, 28),
+        reviewed_at=datetime(2026, 8, 28, 22, 0, tzinfo=UTC),
+        persist=False,
+        _baseline_market=FakeBaseline(),
+        _overlay_store=FakeOverlay(),
+        _company_action_loader=lambda *_args, **_kwargs: {},
+        _company_action_authorized=lambda: True,
+    )
+
+    assert result.rows[0].company_action_clear is None
+    assert result.rows[0].company_action_evidence_source is None
+
+
+@pytest.mark.parametrize(
+    "knowledge_time",
+    [None, datetime(2099, 1, 1, tzinfo=UTC)],
+)
+def test_automatic_evidence_without_current_knowledge_time_is_rejected(
+    repository: SQLiteRepository,
+    knowledge_time: datetime | None,
+) -> None:
+    started = datetime(2026, 8, 28, 22, 0, tzinfo=UTC)
+
+    result = run_active_holding_review(
+        repository,
+        dataset_root="unused",
+        overlay_root="unused",
+        as_of=date(2026, 8, 28),
+        reviewed_at=started,
+        persist=False,
+        _baseline_market=FakeBaseline(),
+        _overlay_store=FakeOverlay(),
+        _company_action_loader=lambda *_args, **_kwargs: {
+            "600919": CompanyActionClearance(
+                symbol="600919",
+                through_date=date(2026, 8, 28),
+                clear=True,
+                source="cninfo_official_read",
+                evidence_id="company-action:invalid-time",
+                from_date=date(2026, 8, 24),
+                knowledge_time=knowledge_time,
+            )
+        },
+        _company_action_authorized=lambda: True,
+    )
+
+    assert result.reviewed_at == started
+    assert result.rows[0].company_action_clear is None
 
 
 def test_live_holding_context_uses_latest_revision_on_older_market_cutoff(

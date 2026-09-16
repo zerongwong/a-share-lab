@@ -12,6 +12,7 @@ import hashlib
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
+from functools import wraps
 from math import isclose, isfinite
 from typing import Any, Final
 from uuid import UUID, uuid4, uuid5
@@ -27,6 +28,26 @@ HOLDING_CHART_DELIVERY_CHANNELS_KEY: Final = "holding_chart_delivery_channels"
 HOLDING_CHART_PUBLISHER_ID_KEY: Final = "holding_chart_publisher_id"
 HOLDING_CHART_PUBLISHER_IDS: Final = ("cloudflare_r2",)
 _HOLDING_REVISION_NAMESPACE = UUID("2f8f1a72-6e63-44e1-a87f-7be76e6575f5")
+
+
+def _serialize_canonical_holding_mutation(function):
+    """Do not let a confirmed holding change race a code-only provider read."""
+
+    @wraps(function)
+    def wrapped(repository, *args, **kwargs):
+        from ashare_lab.bootstrap import application_data_dir
+        from ashare_lab.services.company_action_lock import company_action_lock
+
+        app_data = application_data_dir()
+        if repository.db_path != (app_data / "research.db").resolve():
+            return function(repository, *args, **kwargs)
+        config_path = app_data / "scheduler" / "company-actions" / "config.json"
+        with company_action_lock(config_path, blocking=True) as acquired:
+            if not acquired:  # pragma: no cover - a blocking lock acquires or raises
+                raise RuntimeError("holding_mutation_lock_unavailable")
+            return function(repository, *args, **kwargs)
+
+    return wrapped
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -131,6 +152,7 @@ def resolve_current_holding_context(
     return current
 
 
+@_serialize_canonical_holding_mutation
 def replace_active_holdings(
     repository: SQLiteRepository,
     positions: Iterable[HoldingPositionInput],
@@ -234,6 +256,7 @@ def replace_active_holdings(
     return result
 
 
+@_serialize_canonical_holding_mutation
 def clear_active_holdings(
     repository: SQLiteRepository,
     *,

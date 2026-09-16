@@ -124,6 +124,10 @@ def send_serverchan(message):
 def run_once():
     from ashare_lab.adapters.free_intraday_quotes import fetch_intraday_quotes
     from ashare_lab.bootstrap import build_repository
+    from ashare_lab.services.company_action_evidence import (
+        is_company_action_authorized,
+        refresh_and_load_company_action_clearances,
+    )
     from ashare_lab.services.daily_update_lock import daily_update_lock
     from ashare_lab.services.intraday_stop_monitor import run_monitor, write_private_json
 
@@ -140,6 +144,8 @@ def run_once():
             calendar=lambda day: calendar_for_day(root, day),
             notifier=send_serverchan,
             clock=lambda: datetime.now(CN),
+            company_action_clearance_loader=refresh_and_load_company_action_clearances,
+            company_action_authorization_checker=is_company_action_authorized,
         )
         write_private_json(root / "last-status.json", event)
         return event
@@ -158,7 +164,7 @@ def supervise():
         start_new_session=True,
     )
     try:
-        code = child.wait(timeout=45)
+        code = child.wait(timeout=90)
     except subprocess.TimeoutExpired:
         terminate_worker_group(child)
         write_private_json(

@@ -48,6 +48,9 @@ flowchart LR
   触线后反弹不自动解除警报，除权/分红待核验会明确报警；不是自动止损成交保证。
 - 可启用[盘中一分钟风险监控](docs/INTRADAY_RISK_MONITOR.md)：只检查已确认持仓，成本触线或结构触线即尝试发 Server酱。
   结构触线不冒充收盘确认；行情过期/断线报警，推荐不视为成交。需要本机开机联网，不保证瞬时送达。
+- 经使用者另行授权后，公司行动核验每天仅向巨潮资讯提交仍有效持仓的六位股票代码；
+  不提交名称、成本、股数、金额、权重、入场日、组合编号或保护线。完整结果分为“无事件 / 已发现 / 未知”，
+  任何超时、字段漂移或身份不一致都按未知处理，不会把未知冒充安全，也不会阻断整份晚报。
 - 已持有股票不重新套用新买门，不因排名下降、进入成熟趋势或到期而自动换股。
   保护线只随已确认结构上移，同日重算、切换模型也不降低已有线。
 - 每行业最多一只、单股不超过总资金 30%，行业 40% 上限不放宽；组合仍须通过相关性、回撤、尾部风险等门。
@@ -96,6 +99,7 @@ Tushare、BaoStock、AKShare 提供增量与核验适配，来源权限、更新
 .venv/bin/ashare-import-csmar "/path/to/CSMAR-export" --as-of YYYY-MM-DD
 .venv/bin/ashare-sync-daily
 .venv/bin/python -m ashare_lab.cli.evening_report
+.venv/bin/python -m ashare_lab.cli.company_actions authorize --yes
 .venv/bin/python -m pytest
 ```
 

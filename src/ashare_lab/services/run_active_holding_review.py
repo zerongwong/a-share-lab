@@ -7,6 +7,7 @@ never loads or screens the full stock universe.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -231,6 +232,8 @@ def run_active_holding_review(
     _baseline_market: _BaselineMarket | None = None,
     _overlay_store: _OverlayMarket | None = None,
     holding_context: HoldingKnowledgeContext | None = None,
+    _company_action_loader: Callable[..., dict[str, CompanyActionClearance]] | None = None,
+    _company_action_authorized: Callable[[], bool] | None = None,
 ) -> HoldingTreeReviewSummary:
     """Load verified local evidence and run the holding-management core."""
 
@@ -239,6 +242,7 @@ def run_active_holding_review(
         if reviewed_at is None and holding_context is not None
         else reviewed_at
     )
+    resolved_reviewed_at = resolved_reviewed_at or datetime.now(UTC)
     loaded = load_active_holding_histories(
         repository,
         dataset_root=dataset_root,
@@ -259,10 +263,13 @@ def run_active_holding_review(
             persist=persist,
             holding_context=holding_context,
         )
-    clearances = _local_company_action_clearances(
+    clearances, resolved_reviewed_at = _company_action_clearances(
         repository,
         cutoff=loaded.data_cutoff,
+        reviewed_at=resolved_reviewed_at,
         holding_context=holding_context,
+        loader=_company_action_loader,
+        authorization_checker=_company_action_authorized,
     )
     return review_active_holdings(
         repository,
@@ -290,6 +297,8 @@ def build_evening_holding_review(
     _baseline_market: _BaselineMarket | None = None,
     _overlay_store: _OverlayMarket | None = None,
     holding_context: HoldingKnowledgeContext | None = None,
+    _company_action_loader: Callable[..., dict[str, CompanyActionClearance]] | None = None,
+    _company_action_authorized: Callable[[], bool] | None = None,
 ) -> HoldingTreeReviewSummary:
     """Stable, side-effect-bounded evening-digest integration entrypoint."""
 
@@ -313,7 +322,97 @@ def build_evening_holding_review(
         _baseline_market=_baseline_market,
         _overlay_store=_overlay_store,
         holding_context=context,
+        _company_action_loader=_company_action_loader,
+        _company_action_authorized=_company_action_authorized,
     )
+
+
+def _company_action_clearances(
+    repository: SQLiteRepository,
+    *,
+    cutoff: date,
+    reviewed_at: datetime,
+    holding_context: HoldingKnowledgeContext | None,
+    loader: Callable[..., dict[str, CompanyActionClearance]] | None,
+    authorization_checker: Callable[[], bool] | None,
+) -> tuple[dict[str, CompanyActionClearance], datetime]:
+    """Prefer consent-gated automated evidence without weakening fail-closed rules."""
+
+    explicitly_injected = loader is not None or authorization_checker is not None
+    if not explicitly_injected:
+        # The machine-level grant belongs only to the canonical private ledger.
+        # It must never make a temporary/test repository contact a provider.
+        from ashare_lab.bootstrap import application_data_dir
+
+        canonical = (application_data_dir() / "research.db").resolve()
+        if repository.db_path != canonical:
+            return (
+                _local_company_action_clearances(
+                    repository,
+                    cutoff=cutoff,
+                    holding_context=holding_context,
+                ),
+                reviewed_at,
+            )
+    try:
+        if authorization_checker is None:
+            from ashare_lab.services.company_action_evidence import (
+                is_company_action_authorized,
+            )
+
+            authorized = is_company_action_authorized()
+        else:
+            authorized = authorization_checker() is True
+    except Exception:  # noqa: BLE001 - a broken grant never expands disclosure
+        authorized = False
+
+    if not authorized:
+        return (
+            _local_company_action_clearances(
+                repository,
+                cutoff=cutoff,
+                holding_context=holding_context,
+            ),
+            reviewed_at,
+        )
+
+    if loader is None:
+        from ashare_lab.services.company_action_evidence import (
+            refresh_and_load_company_action_clearances,
+        )
+
+        loader = refresh_and_load_company_action_clearances
+    try:
+        clearances = loader(
+            repository,
+            as_of=cutoff,
+            reviewed_at=reviewed_at,
+            phase="eod",
+        )
+        if not isinstance(clearances, dict):
+            raise TypeError("company-action loader must return a dict")
+    except Exception:  # noqa: BLE001 - UNKNOWN must not suppress the report
+        clearances = {}
+
+    completed_at = datetime.now(UTC)
+    validated_clearances = {
+        symbol: evidence
+        for symbol, evidence in clearances.items()
+        if isinstance(evidence, CompanyActionClearance)
+        and evidence.knowledge_time is not None
+        and evidence.knowledge_time.tzinfo is not None
+        and evidence.knowledge_time.utcoffset() is not None
+        and evidence.knowledge_time <= completed_at
+    }
+    # Provider evidence becomes knowable only after the bounded read finishes.
+    # Move the actual review timestamp forward; never backdate fresh evidence.
+    knowledge_times = tuple(
+        evidence.knowledge_time
+        for evidence in validated_clearances.values()
+        if evidence.knowledge_time is not None
+    )
+    completed_review_time = max((reviewed_at, *knowledge_times))
+    return validated_clearances, completed_review_time
 
 
 def _local_company_action_clearances(
@@ -344,7 +443,13 @@ def _local_company_action_clearances(
             through_date = date.fromisoformat(str(through_raw))
             from_raw = metadata.get("company_action_clear_from")
             from_date = None if from_raw is None else date.fromisoformat(str(from_raw))
+            knowledge_raw = metadata.get("company_action_knowledge_time")
+            knowledge_time = (
+                None if knowledge_raw is None else datetime.fromisoformat(str(knowledge_raw))
+            )
         except ValueError:
+            continue
+        if knowledge_time is not None and knowledge_time.tzinfo is None:
             continue
         if through_date < holding.entry_date or through_date > cutoff:
             # A pre-entry or future-dated assertion is not evidence for this
@@ -359,5 +464,6 @@ def _local_company_action_clearances(
             source=source,
             evidence_id=evidence_id,
             from_date=from_date,
+            knowledge_time=knowledge_time,
         )
     return clearances

@@ -86,6 +86,9 @@ def run(
     notifier=None,
     calendar=lambda _d: True,
     company_action_clear_by_symbol=None,
+    company_action_clearance_loader=None,
+    allow_manual_company_action_fallback=True,
+    company_action_authorization_checker=None,
 ):
     sent = []
     result = run_monitor(
@@ -96,6 +99,9 @@ def run(
         calendar=calendar,
         notifier=notifier or (lambda msg: sent.append(msg) or True),
         company_action_clear_by_symbol=company_action_clear_by_symbol,
+        company_action_clearance_loader=company_action_clearance_loader,
+        allow_manual_company_action_fallback=allow_manual_company_action_fallback,
+        company_action_authorization_checker=company_action_authorization_checker,
     )
     return result, sent
 
@@ -195,6 +201,114 @@ def test_archived_independent_clearance_confirms_without_manual_metadata(env):
     assert any("已触及8%" in message.body for message in sent)
 
 
+def test_automatic_company_action_clearance_is_loaded_inside_verified_session(env):
+    from ashare_lab.services.review_active_holdings import CompanyActionClearance
+
+    register(env[0], clear=False)
+    calls = []
+
+    def load(repository, *, as_of, reviewed_at, phase):
+        calls.append((repository, as_of, reviewed_at, phase))
+        return {
+            "600919": CompanyActionClearance(
+                symbol="600919",
+                through_date=NOW.date(),
+                clear=True,
+                source="cninfo",
+                evidence_id="cninfo:auto",
+                from_date=ENTRY,
+                knowledge_time=NOW,
+            )
+        }
+
+    _, sent = run(
+        env,
+        batches=quotes(9.1),
+        company_action_clearance_loader=load,
+        allow_manual_company_action_fallback=False,
+    )
+
+    assert calls == [(env[0], NOW.date(), NOW, "intraday")]
+    assert alerts(env[0], "cost_exit")
+    assert any("已触及8%" in message.body for message in sent)
+
+
+def test_authorized_unknown_does_not_fall_back_to_manual_clearance(env):
+    _, sent = run(
+        env,
+        batches=quotes(9.1),
+        company_action_clearance_loader=lambda *_a, **_kw: {},
+        allow_manual_company_action_fallback=False,
+    )
+
+    assert alerts(env[0], "cost_review") and not alerts(env[0], "cost_exit")
+    assert any("疑似触及8%" in message.body for message in sent)
+
+
+def test_automatic_clearance_without_knowledge_time_cannot_confirm_exit(env):
+    from ashare_lab.services.review_active_holdings import CompanyActionClearance
+
+    clearance = CompanyActionClearance(
+        symbol="600919",
+        through_date=NOW.date(),
+        clear=True,
+        source="cninfo",
+        evidence_id="cninfo:no-knowledge-time",
+        from_date=ENTRY,
+    )
+
+    _, sent = run(
+        env,
+        batches=quotes(9.1),
+        company_action_clearance_loader=lambda *_a, **_kw: {"600919": clearance},
+        company_action_authorization_checker=lambda: True,
+    )
+
+    assert alerts(env[0], "cost_review") and not alerts(env[0], "cost_exit")
+    assert any("疑似触及8%" in message.body for message in sent)
+
+
+def test_new_authorization_during_refresh_disables_manual_fallback(env):
+    state = {"authorized": False}
+
+    def load(*_args, **_kwargs):
+        state["authorized"] = True
+        return {}
+
+    _, sent = run(
+        env,
+        batches=quotes(9.1),
+        company_action_clearance_loader=load,
+        company_action_authorization_checker=lambda: state["authorized"],
+    )
+
+    assert alerts(env[0], "cost_review") and not alerts(env[0], "cost_exit")
+    assert any("疑似触及8%" in message.body for message in sent)
+
+
+def test_future_company_action_knowledge_cannot_confirm_intraday_exit(env):
+    from ashare_lab.services.review_active_holdings import CompanyActionClearance
+
+    clearance = CompanyActionClearance(
+        symbol="600919",
+        through_date=NOW.date(),
+        clear=True,
+        source="cninfo",
+        evidence_id="cninfo:future",
+        from_date=ENTRY,
+        knowledge_time=NOW + timedelta(seconds=1),
+    )
+
+    _, sent = run(
+        env,
+        batches=quotes(9.1),
+        company_action_clear_by_symbol={"600919": clearance},
+    )
+
+    assert alerts(env[0], "cost_review") and not alerts(env[0], "cost_exit")
+    assert any("疑似触及8%" in message.body for message in sent)
+
+
 def test_detected_independent_company_action_blocks_manual_clear_flag(env):
     from ashare_lab.services.review_active_holdings import CompanyActionClearance
 
@@ -248,6 +362,7 @@ def test_outside_trading_hours_is_quiet_without_network(env, now):
         quote_fetcher=lambda _s: pytest.fail("no quote request"),
         calendar=lambda _d: pytest.fail("no calendar request"),
         notifier=lambda _m: pytest.fail("no notification"),
+        company_action_clearance_loader=lambda *_a, **_kw: pytest.fail("no company-action request"),
     )
     assert event["status"] == "outside_session"
 
@@ -309,6 +424,26 @@ def test_holding_change_during_quote_fetch_cancels_old_disclosure(env):
         calendar=lambda _d: True,
         notifier=lambda _m: pytest.fail("stale holding leaked"),
     )
+    assert event["status"] == "holding_or_authorization_changed"
+    assert not alerts(env[0], "cost_exit")
+
+
+def test_holding_change_during_company_action_read_cancels_quote_and_disclosure(env):
+    def load(*_args, **_kwargs):
+        clear_active_holdings(env[0], effective_at=NOW)
+        return {}
+
+    event = run_monitor(
+        env[0],
+        root=env[1],
+        now=NOW,
+        quote_fetcher=lambda _s: pytest.fail("stale holding must not fetch quotes"),
+        calendar=lambda _d: True,
+        notifier=lambda _m: pytest.fail("stale holding leaked"),
+        company_action_clearance_loader=load,
+        allow_manual_company_action_fallback=False,
+    )
+
     assert event["status"] == "holding_or_authorization_changed"
     assert not alerts(env[0], "cost_exit")
 

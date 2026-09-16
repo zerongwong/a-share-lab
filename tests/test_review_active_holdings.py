@@ -462,3 +462,56 @@ def test_detected_company_action_blocks_even_an_apparent_hold(
     assert row.status is HoldingReviewRowStatus.DATA_NOT_READY
     assert row.urgent is True
     assert repository.get_holding_protective_stop(row.position_key) is None
+
+
+def test_company_action_evidence_not_known_at_review_time_is_ignored(
+    repository: SQLiteRepository,
+) -> None:
+    _set_one(repository, holding_weeks=4)
+    reviewed_at = datetime(2026, 8, 28, 22, 0, tzinfo=UTC)
+    future_evidence = CompanyActionClearance(
+        symbol="600919",
+        through_date=date(2026, 8, 28),
+        clear=False,
+        source="cninfo",
+        evidence_id="cninfo:future",
+        from_date=date(1990, 1, 1),
+        knowledge_time=datetime(2026, 8, 29, 9, 0, tzinfo=UTC),
+    )
+
+    row = review_active_holdings(
+        repository,
+        {"600919": _history(periods=320)},
+        as_of="2026-08-28",
+        reviewed_at=reviewed_at,
+        company_action_clear_by_symbol={"600919": future_evidence},
+    ).rows[0]
+
+    assert row.company_action_clear is None
+    assert row.action is HoldingAction.HOLD
+    assert row.status is HoldingReviewRowStatus.READY
+    assert repository.get_holding_protective_stop(row.position_key) is None
+
+
+def test_company_action_evidence_rejects_naive_knowledge_time(
+    repository: SQLiteRepository,
+) -> None:
+    _set_one(repository, holding_weeks=4)
+    evidence = CompanyActionClearance(
+        symbol="600919",
+        through_date=date(2026, 8, 28),
+        clear=True,
+        source="cninfo",
+        evidence_id="cninfo:naive",
+        from_date=date(1990, 1, 1),
+        knowledge_time=datetime(2026, 8, 28, 22, 0),
+    )
+
+    with pytest.raises(ValueError, match="knowledge_time"):
+        review_active_holdings(
+            repository,
+            {"600919": _history(periods=320)},
+            as_of="2026-08-28",
+            reviewed_at=datetime(2026, 8, 28, 22, 0, tzinfo=UTC),
+            company_action_clear_by_symbol={"600919": evidence},
+        )
