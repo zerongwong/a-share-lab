@@ -18,7 +18,17 @@ import pandas as pd
 
 from ashare_lab.analytics.adaptive_portfolio import AdaptiveCandidate
 from ashare_lab.analytics.continuous_portfolio import select_continuous_replacement
-from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
+from ashare_lab.analytics.continuous_signals import (
+    CONTINUOUS_METHOD_VERSION,
+    CONTINUOUS_SIGNAL_CONTRACT,
+)
+from ashare_lab.analytics.portfolio_count_policy import (
+    CONTINUOUS_COUNT_POLICY_VERSION,
+    MAX_CONTINUOUS_HOLDINGS,
+    MAX_NEW_ACCOUNT_WEIGHT,
+    NORMAL_NEW_ACCOUNT_WEIGHT,
+    continuous_count_state,
+)
 from ashare_lab.services.build_evening_digest import _format_plan, build_evening_research_digest
 from ashare_lab.services.build_midterm_portfolio import (
     MidtermPortfolioStatus,
@@ -73,14 +83,23 @@ def build_continuous_research_digest(
         "mode": "continuous",
         "method_version": CONTINUOUS_METHOD_VERSION,
         "planned_exit_date": None,
-        "signal_profile": "daily_weekly_v1",
+        "signal_profile": CONTINUOUS_SIGNAL_CONTRACT.label,
         "risk_observation_sessions": 20,
         "validation": "research_only_not_walk_forward_validated",
         "entries": [],
         "cash_weight": None,
+        "holding_count": None,
+        "count_state": "unknown",
+        "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
+        "normal_new_account_weight": NORMAL_NEW_ACCOUNT_WEIGHT,
+        "maximum_new_account_weight": MAX_NEW_ACCOUNT_WEIGHT,
+        "replacement_account_weight_options": [0.10, 0.20],
         "holding_based": False,
         "status_note": "数据或市场证据不足，暂不生成新买计划。",
-        "search_scope": "initial_top36_beam128;single_replacement_all_admitted_plus_cash",
+        "search_scope": (
+            "initial_0_to_8_no_slot_filling;"
+            "single_replacement_all_admitted_plus_cash;one_stock_per_industry"
+        ),
     }
     result = captured.get("result")
     snapshot = captured.get("snapshot")
@@ -107,9 +126,16 @@ def build_continuous_research_digest(
     except Exception:
         plan["status_note"] = "持仓登记读取失败，暂停新买，等待核验。"
         return replace(digest, method_version=CONTINUOUS_METHOD_VERSION, continuous_plan=plan)
-    if portfolio is not None and portfolio.positions:
-        plan["holding_based"] = True
-        plan["holding_identity"] = [portfolio.id, portfolio.version]
+    if portfolio is not None:
+        if portfolio.positions:
+            plan["holding_based"] = True
+            plan["holding_identity"] = [portfolio.id, portfolio.version]
+            if len(portfolio.positions) <= MAX_CONTINUOUS_HOLDINGS:
+                plan.update(_count_metadata(len(portfolio.positions)))
+            else:
+                plan["status_note"] = "登记持仓超过八只，须先复核组合结构；暂停新增。"
+        else:
+            plan.update(_count_metadata(0))
     if result is None or snapshot is None or result.price_cycle is None:
         return replace(digest, method_version=CONTINUOUS_METHOD_VERSION, continuous_plan=plan)
     if portfolio is None or not portfolio.positions:
@@ -154,6 +180,13 @@ def _entry(
         raise ValueError("entry ceiling and structural protection are mandatory")
     if pd.Timestamp(price_plan.data_cutoff).date() != expected_cutoff:
         raise ValueError("entry plan cutoff mismatch")
+    if (
+        isinstance(weight, bool)
+        or not isinstance(weight, (int, float))
+        or not math.isfinite(float(weight))
+        or not 0 < float(weight) <= MAX_NEW_ACCOUNT_WEIGHT
+    ):
+        raise ValueError("entry account weight must be positive and at most 20%")
     label = _format_plan(
         price_plan, expected_cutoff=expected_cutoff, expected_sessions=20, observation=False
     )
@@ -175,7 +208,23 @@ def _initial_plan(result) -> dict[str, Any]:
         return {
             "entries": [],
             "cash_weight": 1.0,
+            **_count_metadata(0),
             "status_note": "暂无同时通过早期形态、证据和组合风险门的初建组合；暂不新买。",
+        }
+    industries = tuple(
+        row.industry.strip() if isinstance(row.industry, str) else ""
+        for row in result.positions
+    )
+    if (
+        len(result.positions) > MAX_CONTINUOUS_HOLDINGS
+        or any(not industry for industry in industries)
+        or len(set(industries)) != len(industries)
+    ):
+        return {
+            "entries": [],
+            "cash_weight": 1.0,
+            **_count_metadata(0),
+            "status_note": "组合数量或行业分散核验未通过；不降低门槛、不凑数，暂不新买。",
         }
     entries = [
         _entry(
@@ -187,11 +236,21 @@ def _initial_plan(result) -> dict[str, Any]:
         )
         for row in result.positions
     ]
+    count = len(entries)
+    state = continuous_count_state(count)
+    note = "初建成型组合；次日仍需核对可成交性，超过买价上限不追。"
+    if state == "concentrated_transition":
+        note = "初建过渡组合；合格股票不足时保留现金，不为凑数降低门槛。"
     return {
         "entries": entries,
         "cash_weight": result.cash_weight,
-        "status_note": "初建研究方案；次日仍需核对可成交性，超过买价上限不追。",
+        **_count_metadata(count),
+        "status_note": note,
     }
+
+
+def _count_metadata(count: int) -> dict[str, Any]:
+    return {"holding_count": count, "count_state": continuous_count_state(count)}
 
 
 def mark_locked_account_weights(portfolio, histories, *, as_of: date, review):
@@ -262,6 +321,8 @@ def build_locked_replacement_plan(*, result, histories, metadata, portfolio, rev
     blocked = {
         "entries": [],
         "cash_weight": None,
+        "holding_count": None,
+        "count_state": "unknown",
         "status_note": "持仓或风险证据待核验，暂不补位；未确认的卖出不视为成交。",
     }
     if result.data_cutoff is None or pd.Timestamp(result.data_cutoff).date() != as_of:
@@ -355,6 +416,7 @@ def build_locked_replacement_plan(*, result, histories, metadata, portfolio, rev
     return {
         "entries": entries,
         "cash_weight": decision.cash_weight,
+        **_count_metadata(len(decision.account_weights)),
         "status_note": note,
         "pending_exit_symbols": sorted(exits),
         "joint_evaluation": joint,

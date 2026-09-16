@@ -8,7 +8,7 @@ result: an unattended daily call must not create a broken unavailable NAV chain.
 
 Each snapshot must include as_of and data_cutoff (the exact ISO close date),
 holding_revision_id and holding_version (the current explicit revision),
-mode='actual', method_version='continuous-signal-v1', and a stable portfolio_id
+mode='actual', method_version='continuous-signal-v2', and a stable portfolio_id
 identifying this continuous accounting stream, NOT a legacy cohort or changing
 holding revision. Required inputs are position_units, close_prices,
 cash_before_fees_and_dividends, fees, dividend_cash, external_flow, and evidence.

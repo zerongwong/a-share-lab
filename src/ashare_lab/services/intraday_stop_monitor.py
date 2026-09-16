@@ -172,8 +172,8 @@ def run_monitor(
     if open_today is not True:
         health("交易日历未核验，暂不能可靠监控。")
         event["status"] = "calendar_unavailable"
-    elif len(portfolio.positions) > 5:
-        health("持仓数量超出已验证的5只监控范围，请核验登记。")
+    elif len(portfolio.positions) > 8:
+        health("持仓数量超出已验证的8只监控范围，请核验登记。")
         event["status"] = "holding_scope_unavailable"
     else:
         clearances = company_action_clear_by_symbol

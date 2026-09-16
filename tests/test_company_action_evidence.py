@@ -619,7 +619,7 @@ def test_evidence_known_after_completed_load_time_remains_unknown_to_that_call(
     assert clearances == {}
 
 
-def test_zero_and_more_than_five_holdings_never_call_provider(
+def test_zero_and_more_than_eight_holdings_never_call_provider(
     repository: SQLiteRepository,
     config_path: Path,
 ) -> None:
@@ -627,16 +627,34 @@ def test_zero_and_more_than_five_holdings_never_call_provider(
         pytest.fail("provider must not be called")
 
     assert _refresh(repository, config_path, forbidden) == {}
-    _register(repository, tuple(f"60000{index}" for index in range(6)))
+    _register(repository, tuple(f"6000{index:02}" for index in range(9)))
     assert _refresh(repository, config_path, forbidden) == {}
     with repository.connection() as connection:
         rows = connection.execute(
             "SELECT status, reason_code FROM company_action_evidence_attempts"
         ).fetchall()
-    assert len(rows) == 6
+    assert len(rows) == 9
     assert {(row["status"], row["reason_code"]) for row in rows} == {
         ("unknown", "holding_limit_exceeded")
     }
+
+
+def test_exactly_eight_holdings_are_individually_verified(
+    repository: SQLiteRepository,
+    config_path: Path,
+) -> None:
+    symbols = tuple(f"6000{index:02}" for index in range(8))
+    _register(repository, symbols)
+    calls = []
+
+    def fetcher(requested, _as_of, *, timeout_seconds):
+        calls.append((requested, timeout_seconds))
+        return (_evidence(requested[0]),)
+
+    clearances = _refresh(repository, config_path, fetcher)
+
+    assert set(clearances) == set(symbols)
+    assert calls == [((symbol,), 8) for symbol in symbols]
 
 
 def test_holding_or_authorization_change_during_fetch_discards_all_evidence(

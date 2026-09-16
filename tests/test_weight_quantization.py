@@ -42,6 +42,24 @@ def test_input_order_is_preserved_instead_of_sorting_by_weight() -> None:
     assert reverse == tuple(reversed(forward))
 
 
+@pytest.mark.parametrize(
+    ("weights", "expected"),
+    [
+        ((1.0,), (1.0,)),
+        ((0.57, 0.43), (0.60, 0.40)),
+        ((0.20, 0.18, 0.17, 0.16, 0.15, 0.14), (0.20, 0.20, 0.20, 0.20, 0.10, 0.10)),
+        (
+            (0.15, 0.14, 0.13, 0.13, 0.12, 0.12, 0.11, 0.10),
+            (0.20, 0.20, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10),
+        ),
+    ],
+)
+def test_continuous_policy_counts_one_to_eight_are_supported(
+    weights: tuple[float, ...], expected: tuple[float, ...]
+) -> None:
+    assert quantize_stock_sleeve_weights(weights) == expected
+
+
 def test_selected_allocation_has_no_higher_error_than_any_feasible_three_name_set() -> None:
     exact = (0.381, 0.333, 0.286)
     observed = quantize_stock_sleeve_weights(exact)
@@ -59,8 +77,8 @@ def test_selected_allocation_has_no_higher_error_than_any_feasible_three_name_se
 @pytest.mark.parametrize(
     "weights",
     [
-        (0.6, 0.4),
-        (0.20, 0.20, 0.15, 0.15, 0.15, 0.15),
+        (),
+        (0.12, 0.11, 0.11, 0.11, 0.11, 0.11, 0.11, 0.11, 0.11),
         (0.50, 0.50, 0.0),
         (0.60, 0.50, -0.10),
         (0.50, 0.30, float("nan")),

@@ -519,7 +519,11 @@ def _review_one(
             and company_action_clearance.from_date is not None
             else ()
         ),
-        *(("signal_profile:continuous_daily_weekly_v1;no_expiry",) if continuous_profile else ()),
+        *(
+            (f"signal_profile:{CONTINUOUS_SIGNAL_CONTRACT.label};no_expiry",)
+            if continuous_profile
+            else ()
+        ),
     )
     row = HoldingTreeReviewRow(
         symbol=holding.symbol,
@@ -562,7 +566,7 @@ def _review_one(
             None if company_action_clearance is None else company_action_clearance.from_date
         ),
         method_version=(
-            f"{HOLDING_TREE_METHOD_VERSION}+continuous-v1"
+            f"{HOLDING_TREE_METHOD_VERSION}+continuous-v2"
             if continuous_profile
             else HOLDING_TREE_METHOD_VERSION
         ),

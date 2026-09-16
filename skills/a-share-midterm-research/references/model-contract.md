@@ -1,8 +1,9 @@
 # A-share model contract
 
-Production uses [continuous-signal-v1](#current-production-mode-continuous-signal-v1),
+Production uses [continuous-signal-v2](#current-production-mode-continuous-signal-v2),
 whose section below takes precedence over all legacy horizon/default/output
-rules. The fixed-horizon sections are preserved for historical research only.
+rules. The fixed-horizon sections, including every earlier 3–5-security search
+and output rule, are preserved as read-only historical research only.
 
 ## Version and implementation truth
 
@@ -373,14 +374,21 @@ review condition. A report declaring `multi-timeframe-contract-v0.2.0` must addi
 daily/weekly/monthly bar cutoffs, per-horizon structure/risk/LCB status, pairwise horizon overlap, and
 per-security difference attribution. The exact serialized field names may evolve, but these audit
 semantics may not be omitted.
-# Current production mode: continuous-signal-v1
+# Current production mode: continuous-signal-v2
 
 This section supersedes the **horizon/default/output** provisions of the legacy
 contract below; its evidence, privacy, point-in-time and no-order safeguards
 still apply. Do not silently reactivate six-horizon production recommendations.
 
-- One ongoing 3–5-stock research target, no forced holding deadline. Fewer
-  remaining positions or cash are valid; do not relax risk gates to fill slots.
+- One ongoing zero-to-eight-stock research target, no forced holding deadline.
+  Zero names means cash; one to three are concentrated transition states and
+  must use reduced stock exposure; four to eight form a portfolio; five to six
+  are the normal preference. Every count is conditional on eligible evidence,
+  so do not relax risk gates or add an inferior name merely to fill a slot.
+  Before the cycle overlay, the count-specific stock-exposure ceilings for one
+  through eight names are 15%, 30%, 45%, 60%, 75%, 80%, 80% and 80%; actual
+  exposure is the lower of that ceiling and the current cycle ceiling, with the
+  remainder in cash.
 - Daily/completed-weekly signal windows are independently frozen. The old
   `holding_weeks=4` transport field is not a sell date. Protect existing stops
   from downward movement, including same-day recomputation/model migration.
@@ -393,12 +401,36 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   coverage (from entry through cutoff) blocks confirmed exit/stop persistence.
 - Lock actual retained weights and compare every admitted replacement plus
   cash. Initial top36/beam128 search is approximate; single replacement is
-  enumerated on 10% total-account new-allocation steps. Do not round old weights.
-  One name per industry, <=30% total-account single-name cap and original risk
-  constraints remain binding; 1–2 remaining names do not waive risk-contribution limits.
+  enumerated on the versioned operational grid. Do not round old weights.
+  One name per industry and a <=20% total-account cap for every new name are
+  binding; roughly 15% is the preferred new-name center when the cycle exposure,
+  available cash and risk constraints permit. Existing drifted weights are facts,
+  not permission to add or rebalance automatically. Pair correlation is explicitly
+  not applicable to a one-name state. Normalized single-name downside-risk
+  contribution is explicitly not applicable to one-to-three-name transition states,
+  where it is mechanically high; reduced total exposure, the 20% account cap and
+  all absolute path/tail/data gates remain binding. Four through eight names restore
+  the normalized contribution hard gate. Never fabricate a passing value for an
+  inapplicable statistic.
+- Initial allocation still projects the continuous target to ten-percentage-point
+  increments inside the stock sleeve and then applies the 20% total-account cap.
+  A single replacement currently enumerates 10% and 20% total-account allocations;
+  the former 30% choice is not a v2 production option. The roughly 15% center is a
+  portfolio concentration target, not a requirement to fabricate an exact 15% grid.
 - Require an explicit whole-account snapshot and verified price/corporate-action
   interval for drifted weights. No recommendation constitutes a confirmed sale,
   purchase, deposit or withdrawal. Pending exits are local contingencies only.
+- The v2 database migration changes schemas and identity rules only. It never
+  infers a sale or automatically clears a previously active tracking set. An
+  open-source installation must record an explicit cleared revision only after
+  the user confirms that the account is flat. This local installation has done
+  so for this transition without deleting or rewriting holding, notification,
+  decision, NAV or performance history. No old recommendation is carried
+  forward as a live position. The next
+  explicitly confirmed actual build creates a fresh holding revision and position
+  identity. A new actual continuous performance chain additionally requires a
+  complete, explicitly confirmed account-valuation snapshot; a recommendation,
+  notification or inferred fill cannot start any of these records.
 - Rank with the frozen historical 20-session return-LCB proxy; do not claim
   future/global optimum Sharpe or validated dynamic-strategy returns. New
   continuous decision/NAV records are separate from immutable legacy maturities.
@@ -408,5 +440,10 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   Verify exact holding version before disclosure; R2 secrets and raw financial
   data are never report content. Provider acceptance is not end-device delivery.
 
-The remainder is the preserved fixed-horizon research contract, used only for
-explicit legacy comparisons and interpreting frozen historical archives.
+All earlier six-horizon 3–5-name objective, weight-grid and final-report clauses
+remain read-only compatibility rules. They may be used to interpret immutable
+legacy archives, but they cannot create a v2 live holding, replacement or
+continuous performance record.
+
+The earlier fixed-horizon sections are preserved only for explicit legacy
+comparisons and interpretation of frozen historical archives.

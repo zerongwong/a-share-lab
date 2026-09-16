@@ -46,6 +46,8 @@ def _view(pending=False):
                 }
             ],
             "cash_weight": 0.8,
+            "holding_count": 1,
+            "count_state": "concentrated_transition",
             "status_note": "先处理旧仓",
             "pending_exit_symbols": ["600001"] if pending else [],
         },
@@ -66,6 +68,8 @@ def test_import_and_initial_page_do_not_load_data_or_call_network():
     page.render(ui, decision_date=TODAY, _view_loader=forbidden)
     assert "不发送微信" in _text(ui)
     assert "一组组合" in _text(ui)
+    assert "0–8只" in _text(ui)
+    assert "新仓通常约总资金15%" in _text(ui)
     assert not any(kind in {"selectbox", "radio"} for kind, _args, _kwargs in ui.messages)
 
 
@@ -86,6 +90,7 @@ def test_unverified_date_shows_observation_without_buy_weights():
     assert "仅研究，不作买入配置" in text
     assert "总资金20%" not in text
     assert "确认≥10，买≤10.30+量" in text
+    assert "1只·过渡组合" in text
 
 
 def test_explicit_calendar_button_allows_future_qualified_plan():

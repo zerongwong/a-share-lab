@@ -2,7 +2,7 @@
 
 Inputs must already have passed point-in-time market/entry/price-risk gates. This
 module cannot verify those gates from returns alone. It locks retained *account*
-weights, compares every supplied replacement at 10/20/30% account weight with
+weights, compares every supplied replacement at 10/20% account weight with
 leaving that cash idle, and never rebalances a retained position. The historical
 20-session LCB is only a proxy, not a dynamic-strategy backtest or future optimum.
 """
@@ -33,10 +33,13 @@ from ashare_lab.analytics.adaptive_portfolio import (
     _fixed_share_rolling_drawdown_magnitudes,
     _non_overlapping_portfolio_returns,
 )
+from ashare_lab.analytics.portfolio_count_policy import CONTINUOUS_POSITION_LIMITS
 
-CONTINUOUS_PORTFOLIO_METHOD_VERSION = "locked-holdings-single-replacement-lcb20-v0.1.0"
+CONTINUOUS_PORTFOLIO_METHOD_VERSION = "locked-holdings-single-replacement-lcb20-v0.2.0"
 _PROXY_SESSIONS = 20
-_NEW_WEIGHTS = (0.10, 0.20, 0.30)
+_NEW_WEIGHTS = (0.10, 0.20)
+_MAX_HOLDINGS = 8
+_MAX_ACCOUNT_WEIGHT = 0.20
 _WARNINGS = (
     "research_only_not_future_return_or_global_optimum",
     "historical_fixed_shares_cash_20_session_proxy_not_dynamic_strategy_validation",
@@ -68,6 +71,7 @@ class ContinuousPortfolioMetrics:
     holding_period_cost_rate: float
     lcb_confidence: float
     correlation_applicable: bool
+    position_risk_contribution_applicable: bool
     cash_only: bool = False
     holding_period_sessions: int = _PROXY_SESSIONS
     is_out_of_sample: bool = False
@@ -154,6 +158,7 @@ def _metrics(
             0.0,
             budget.lcb_confidence,
             False,
+            False,
             cash_only=True,
         )
     if np.any(np.mean(np.minimum(matrix, 0.0) ** 2, axis=0) <= 0.0):
@@ -202,6 +207,7 @@ def _metrics(
         budget.holding_period_cost_rate,
         budget.lcb_confidence,
         len(weights) > 1,
+        len(weights) >= 4,
     )
 
 
@@ -227,7 +233,9 @@ def _risk_reasons(
             "down_period_correlation",
         ),
         (
-            metrics.max_position_downside_risk_contribution,
+            metrics.max_position_downside_risk_contribution
+            if metrics.position_risk_contribution_applicable
+            else None,
             budget.max_position_downside_risk_contribution,
             "position_downside_risk_contribution",
         ),
@@ -243,10 +251,10 @@ def _structure_reasons(
     budget: AdaptiveRiskBudget,
 ) -> tuple[str, ...]:
     reasons: list[str] = []
-    if len(candidates) > 5:
-        reasons.append("maximum_five_holdings")
-    if any(weight > 0.30 + 1e-12 for weight in weights.values()):
-        reasons.append("maximum_30pct_account_weight")
+    if len(candidates) > _MAX_HOLDINGS:
+        reasons.append("maximum_eight_holdings")
+    if any(weight > _MAX_ACCOUNT_WEIGHT + 1e-12 for weight in weights.values()):
+        reasons.append("maximum_20pct_account_weight")
     industries: dict[str, float] = {}
     for candidate in candidates:
         if candidate.industry in industries:
@@ -258,11 +266,16 @@ def _structure_reasons(
         weight > min(0.40, budget.industry_weight_limit) + 1e-12 for weight in industries.values()
     ):
         reasons.append("industry_concentration")
-    exposure_limit = (
-        0.85 if budget.maximum_stock_exposure is None else budget.maximum_stock_exposure
+    cycle_exposure_limit = (
+        0.80 if budget.maximum_stock_exposure is None else budget.maximum_stock_exposure
     )
-    if math.fsum(weights.values()) > exposure_limit + 1e-12:
+    total_exposure = math.fsum(weights.values())
+    if total_exposure > cycle_exposure_limit + 1e-12:
         reasons.append("maximum_stock_exposure")
+    if 0 < len(candidates) <= _MAX_HOLDINGS:
+        count_exposure_limit = CONTINUOUS_POSITION_LIMITS[len(candidates)][0]
+        if total_exposure > count_exposure_limit + 1e-12:
+            reasons.append("holding_count_stock_exposure")
     return tuple(dict.fromkeys(reasons))
 
 
@@ -368,8 +381,11 @@ def select_continuous_replacement(
         return result(
             ContinuousPortfolioStatus.REVIEW_REQUIRED, ("retained_portfolio_requires_review", *risk)
         )
-    if len(retained) == 5:
-        return result(ContinuousPortfolioStatus.HOLD_CASH, ("maximum_five_holdings_no_free_slot",))
+    if len(retained) == _MAX_HOLDINGS:
+        return result(
+            ContinuousPortfolioStatus.HOLD_CASH,
+            ("maximum_eight_holdings_no_free_slot",),
+        )
     valid: list[AdaptiveCandidate] = []
     replacement_symbols = [row.symbol for row in replacements if isinstance(row, AdaptiveCandidate)]
     duplicates = {symbol for symbol, count in Counter(replacement_symbols).items() if count > 1}

@@ -73,26 +73,38 @@ def parse_quotes(text: str, source: str, symbols: tuple[str, ...]) -> dict[str, 
     return result
 
 
-def fetch_intraday_quotes(symbols: tuple[str, ...], *, client=None) -> dict[str, dict]:
-    if not symbols or len(symbols) > 5 or len(set(symbols)) != len(symbols):
-        raise ValueError("monitor_requires_one_to_five_unique_holdings")
-    codes = ",".join(provider_code(s) for s in symbols)
+def fetch_intraday_quotes(
+    symbols: tuple[str, ...], *, client=None
+) -> dict[str, dict[str, IntradayQuote]]:
+    normalized = tuple(normalize_symbol(symbol) for symbol in symbols)
+    if not normalized or len(normalized) > 8 or len(set(normalized)) != len(normalized):
+        raise ValueError("monitor_requires_one_to_eight_unique_holdings")
+    batches = tuple(normalized[index : index + 5] for index in range(0, len(normalized), 5))
     own = client is None
     client = client or httpx.Client(timeout=4.0, trust_env=False, follow_redirects=False)
-    result = {}
+    result: dict[str, dict[str, IntradayQuote]] = {}
     try:
         for source, root in (
             ("tencent", "https://qt.gtimg.cn/q="),
             ("sina", "https://hq.sinajs.cn/list="),
         ):
-            try:
-                response = client.get(
-                    root + codes, headers={"Referer": "https://finance.sina.com.cn/"}
-                )
-                response.raise_for_status()
-                result[source] = parse_quotes(response.content.decode("gb18030"), source, symbols)
-            except (httpx.HTTPError, UnicodeError, ValueError):
-                result[source] = {}
+            merged: dict[str, IntradayQuote] = {}
+            for batch in batches:
+                codes = ",".join(provider_code(symbol) for symbol in batch)
+                try:
+                    response = client.get(
+                        root + codes, headers={"Referer": "https://finance.sina.com.cn/"}
+                    )
+                    response.raise_for_status()
+                    parsed = parse_quotes(response.content.decode("gb18030"), source, batch)
+                    if set(merged).intersection(parsed):
+                        raise ValueError("duplicate_quote_identity_across_batches")
+                    merged.update(parsed)
+                except (httpx.HTTPError, UnicodeError, ValueError):
+                    # One provider/batch failure must not erase independently
+                    # parsed quotes from another bounded request.
+                    continue
+            result[source] = merged
     finally:
         if own:
             client.close()

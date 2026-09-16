@@ -6,11 +6,19 @@ from datetime import date
 
 import pytest
 
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION as SIGNAL_VERSION
+from ashare_lab.services.continuous_strategy_journal import (
+    CONTINUOUS_METHOD_VERSION as JOURNAL_VERSION,
+)
 from ashare_lab.services.continuous_strategy_journal import (
     archive_continuous_decision,
     ensure_continuous_strategy_schema,
     record_continuous_valuation,
 )
+
+
+def test_journal_and_signal_contract_share_v2_identity():
+    assert JOURNAL_VERSION == SIGNAL_VERSION == "continuous-signal-v2"
 
 
 @pytest.fixture

@@ -88,7 +88,7 @@ def _price_plan(**changes):
     return ConditionalEntryPlan(
         kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
         data_cutoff=pd.Timestamp(changes.pop("data_cutoff", AS_OF)),
-        horizon="continuous_daily_weekly_v1",
+        horizon="continuous_daily_weekly_v2",
         sessions=20,
         trigger_price=10.0,
         invalidation_price=9.4,
@@ -325,6 +325,11 @@ def test_entry_formatter_cannot_return_empty_condition_or_reverse_price_interval
             service._entry("601999", "合成", 0.1, invalid, expected_cutoff=AS_OF)
 
 
+def test_entry_formatter_enforces_total_account_twenty_percent_hard_cap():
+    with pytest.raises(ValueError, match="at most 20%"):
+        service._entry("601999", "合成", 0.2001, _price_plan(), expected_cutoff=AS_OF)
+
+
 def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_new_report(
     monkeypatch,
 ):
@@ -352,6 +357,11 @@ def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_
     assert digest.method_version == CONTINUOUS_METHOD_VERSION
     assert digest.continuous_plan["planned_exit_date"] is None
     assert digest.continuous_plan["holding_based"] is False
+    assert digest.continuous_plan["signal_profile"] == "continuous_daily_weekly_v2"
+    assert digest.continuous_plan["holding_count"] == 0
+    assert digest.continuous_plan["count_state"] == "cash"
+    assert digest.continuous_plan["maximum_new_account_weight"] == pytest.approx(0.20)
+    assert digest.continuous_plan["replacement_account_weight_options"] == [0.10, 0.20]
     calls.clear()
     legacy = build_evening_research_digest(
         dataset_root="synthetic",

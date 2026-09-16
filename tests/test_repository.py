@@ -59,7 +59,7 @@ def test_initialize_is_idempotent_and_records_version(repository: SQLiteReposito
         versions = connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    assert {1, 2, 3, 4, 6}.issubset({row["version"] for row in versions})
+    assert {1, 2, 3, 4, 6, 7, 9, 10}.issubset({row["version"] for row in versions})
 
 
 def test_atomic_settlement_rolls_back_member_on_invalid_batch(repository: SQLiteRepository) -> None:

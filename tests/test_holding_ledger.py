@@ -9,6 +9,7 @@ from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.services.holding_ledger import (
     HOLDING_CHART_DELIVERY_CHANNELS_KEY,
     HOLDING_CHART_PUBLISHER_ID_KEY,
+    HOLDING_LEDGER_METHOD_VERSION,
     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY,
     HoldingPositionInput,
     clear_active_holdings,
@@ -256,6 +257,9 @@ def test_change_id_retry_is_idempotent_but_conflicting_payload_is_rejected(
     retry = replace_active_holdings(repository, _positions(), **arguments)
 
     assert retry == first
+    assert tuple(item.position_key for item in retry.positions) == tuple(
+        item.position_key for item in first.positions
+    )
     assert repository.next_holding_snapshot_version() == 2
 
     with pytest.raises(ValueError, match="different holding"):
@@ -271,6 +275,72 @@ def test_change_id_retry_is_idempotent_but_conflicting_payload_is_rejected(
             ),
             **arguments,
         )
+
+
+def test_active_lot_keeps_identity_but_reentry_after_clear_gets_a_fresh_identity(
+    repository: SQLiteRepository,
+) -> None:
+    position = (
+        HoldingPositionInput(
+            symbol="600919",
+            name="江苏银行",
+            entry_date=date(2026, 8, 28),
+            stock_sleeve_weight=1.0,
+        ),
+    )
+    first = replace_active_holdings(
+        repository,
+        position,
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 28, 21, 0, tzinfo=UTC),
+        change_id="first-confirmed-lot",
+    )
+    second = replace_active_holdings(
+        repository,
+        position,
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 29, 21, 0, tzinfo=UTC),
+        change_id="second-confirmed-lot",
+    )
+    clear_active_holdings(
+        repository,
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 30, 21, 0, tzinfo=UTC),
+        change_id="explicit-flat-boundary",
+    )
+    third = replace_active_holdings(
+        repository,
+        position,
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 31, 21, 0, tzinfo=UTC),
+        change_id="third-confirmed-lot-after-clear",
+    )
+
+    assert first.method_version == HOLDING_LEDGER_METHOD_VERSION
+    assert second.method_version == HOLDING_LEDGER_METHOD_VERSION
+    assert first.positions[0].symbol == second.positions[0].symbol
+    assert first.positions[0].entry_date == second.positions[0].entry_date
+    assert first.positions[0].position_key == second.positions[0].position_key
+    assert second.positions[0].position_key != third.positions[0].position_key
+    assert first.id in first.positions[0].position_key
+    assert third.id in third.positions[0].position_key
+
+    with repository.connection() as connection:
+        stored = connection.execute(
+            """
+            SELECT revision_id, position_key
+            FROM holding_positions
+            WHERE symbol = ? AND entry_date = ?
+            ORDER BY version
+            """,
+            ("600919", "2026-08-28"),
+        ).fetchall()
+
+    assert [(row["revision_id"], row["position_key"]) for row in stored] == [
+        (first.id, first.positions[0].position_key),
+        (second.id, second.positions[0].position_key),
+        (third.id, third.positions[0].position_key),
+    ]
 
 
 def test_clear_change_id_retry_is_idempotent(repository: SQLiteRepository) -> None:

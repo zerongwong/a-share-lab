@@ -197,12 +197,28 @@ def _report_text(view: LocalContinuousView) -> str:
     return render_continuous_report(
         as_of=view.digest.common_cutoff,
         plan_date=view.plan_date,
-        market_summary=str(getattr(view.digest, "cycle_label", "市场证据待核验")),
+        market_summary=(
+            f"{getattr(view.digest, 'cycle_label', '市场证据待核验')}｜"
+            f"{_count_summary(plan)}"
+        ),
         holding_lines=_holding_review_lines(view.holding_review, name_bytes=36, reason_bytes=180),
         entries=plan.get("entries", ()) if formal else (),
         cash_weight=plan.get("cash_weight") if formal else None,
         status_note=note,
     )
+
+
+def _count_summary(plan: Mapping[str, Any]) -> str:
+    count, state = plan.get("holding_count"), plan.get("count_state")
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 8:
+        return "组合只数待核验"
+    label = {
+        "cash": "现金观察",
+        "concentrated_transition": "过渡组合",
+        "preferred_formed": "常态组合",
+        "formed": "成型组合",
+    }.get(state, "状态待核验")
+    return f"{count}只·{label}"
 
 
 def render(
@@ -220,6 +236,10 @@ def render(
     ui.set_page_config(page_title="持续信号组合", page_icon="🪻", layout="wide")
     ui.title(PAGE_TITLE)
     ui.caption("一组组合，持续跟踪｜先处理弱仓，再择机补位｜不设到期卖出")
+    ui.caption(
+        "0–8只：0只现金观察，1–3只过渡，4–8只成型，5–6只常态优先｜"
+        "每行业最多1只｜新仓通常约总资金15%，上限20%｜不凑数"
+    )
     ui.info("本页仅在本机研究和看图，不发送微信、不上传图片、不自动改动持仓。")
     if ui.button("生成持续组合", type="primary"):
         try:

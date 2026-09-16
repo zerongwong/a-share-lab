@@ -40,11 +40,15 @@ def test_locks_exact_drifted_account_weights_and_evaluates_every_new_account_gri
     decision = _select([_candidate("NEW", 9, mean=0.004)], retained_account_weights=weights)
     assert decision.status is ContinuousPortfolioStatus.SELECTED
     assert decision.selected_symbol == "NEW"
-    assert decision.new_account_weight in (0.1, 0.2, 0.3)
+    assert decision.new_account_weight in (0.1, 0.2)
     assert {key: dict(decision.account_weights)[key] for key in weights} == weights
     assert weights == {"OLD0": 0.137, "OLD1": 0.163, "OLD2": 0.15}
     assert sum(dict(decision.account_weights).values()) + decision.cash_weight == pytest.approx(1)
-    assert decision.evaluated_count == 4  # Cash + all three new-weight grids.
+    assert decision.evaluated_count == 2  # Cash + the 10% grid within the four-name cap.
+    assert any(
+        row.new_account_weight == 0.2 and "holding_count_stock_exposure" in row.reasons
+        for row in decision.candidate_rejections
+    )
     assert not decision.holding_membership_changed
     assert not decision.auto_order_allowed
     assert not decision.metrics.is_out_of_sample
@@ -96,12 +100,12 @@ def test_retained_risk_breach_cannot_be_rescued_by_a_new_stock():
 def test_overweight_old_stock_requires_review_without_quantizing_it():
     decision = _select(
         [_candidate("NEW", 9, mean=0.004)],
-        retained_account_weights={"OLD0": 0.301, "OLD1": 0.10, "OLD2": 0.15},
-        cash_weight=0.449,
+        retained_account_weights={"OLD0": 0.201, "OLD1": 0.10, "OLD2": 0.15},
+        cash_weight=0.549,
     )
     assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
-    assert "maximum_30pct_account_weight" in decision.reasons
-    assert dict(decision.account_weights)["OLD0"] == 0.301
+    assert "maximum_20pct_account_weight" in decision.reasons
+    assert dict(decision.account_weights)["OLD0"] == 0.201
 
 
 def test_no_same_industry_replacement_and_no_pyramiding_retained_position():
@@ -138,7 +142,7 @@ def test_bad_candidate_does_not_suppress_valid_candidate():
         row.symbol == "BAD" and "candidate_history_unavailable" in row.reasons
         for row in decision.candidate_rejections
     )
-    assert decision.evaluated_count == 4
+    assert decision.evaluated_count == 2
 
 
 def test_stale_or_different_candidate_calendar_never_shrinks_baseline_window():
@@ -169,7 +173,7 @@ def test_all_valid_candidates_are_enumerated_not_top36_or_beam_pruned():
     candidates.append(_candidate("ZZZ_BEST", 9, mean=0.004))
     decision = _select(candidates)
     assert decision.candidate_count == 41
-    assert decision.evaluated_count == 1 + 41 * 3
+    assert decision.evaluated_count == 1 + 41
     assert decision.selected_symbol == "ZZZ_BEST"
     reversed_decision = _select(tuple(reversed(candidates)))
     assert decision == reversed_decision
@@ -204,10 +208,12 @@ def test_zero_stock_cash_metrics_are_not_fabricated_equity_correlations():
     assert decision.metrics.observation_count == 0
 
 
-@pytest.mark.parametrize("count", [1, 2])
-def test_one_or_two_old_holdings_are_representable_but_do_not_waive_45pct_risk_cap(count):
+@pytest.mark.parametrize("count", [1, 2, 3])
+def test_one_to_three_holdings_are_valid_transition_states_without_normalized_risk_rejection(
+    count,
+):
     retained = _retained()[:count]
-    weights = {row.symbol: 0.2 for row in retained}
+    weights = {row.symbol: 0.15 for row in retained}
     decision = select_continuous_replacement(
         retained,
         weights,
@@ -215,37 +221,108 @@ def test_one_or_two_old_holdings_are_representable_but_do_not_waive_45pct_risk_c
         cash_weight=1 - sum(weights.values()),
         budget=AdaptiveRiskBudget(),
     )
-    assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
-    assert "position_downside_risk_contribution" in decision.reasons
-    assert decision.metrics.max_position_downside_risk_contribution >= 1 / count
+    assert decision.status is ContinuousPortfolioStatus.SELECTED
+    assert "position_downside_risk_contribution" not in decision.reasons
+    assert decision.baseline_metrics.max_position_downside_risk_contribution >= 1 / count
+    assert decision.baseline_metrics.position_risk_contribution_applicable is False
+    assert decision.new_account_weight == 0.1
+    assert any(
+        row.new_account_weight == 0.2 and "holding_count_stock_exposure" in row.reasons
+        for row in decision.candidate_rejections
+    )
     if count == 1:
-        assert decision.metrics.max_down_period_correlation is None
-        assert not decision.metrics.correlation_applicable
+        assert decision.baseline_metrics.max_down_period_correlation is None
+        assert not decision.baseline_metrics.correlation_applicable
 
 
-def test_initial_empty_portfolio_does_not_secretly_relax_single_stock_risk():
+def test_initial_empty_portfolio_can_add_one_stock_without_normalized_risk_false_rejection():
     decision = select_continuous_replacement(
         [], {}, [_candidate("NEW", 9, mean=0.004)], cash_weight=1, budget=AdaptiveRiskBudget()
     )
-    assert decision.status is ContinuousPortfolioStatus.HOLD_CASH
+    assert decision.status is ContinuousPortfolioStatus.SELECTED
+    assert decision.selected_symbol == "NEW"
+    assert decision.new_account_weight == 0.1
+    assert decision.metrics.position_risk_contribution_applicable is False
     assert all(
-        "position_downside_risk_contribution" in row.reasons
+        "position_downside_risk_contribution" not in row.reasons
         for row in decision.candidate_rejections
     )
 
 
-def test_five_positions_have_no_slot_but_still_get_baseline_risk_review():
-    retained = tuple(_candidate(f"OLD{i}", i) for i in range(5))
+def test_four_to_eight_holdings_keep_normalized_position_risk_constraint():
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(4))
+    decision = select_continuous_replacement(
+        retained,
+        {row.symbol: 0.1 for row in retained},
+        [],
+        cash_weight=0.6,
+        budget=replace(
+            AdaptiveRiskBudget(),
+            max_position_downside_risk_contribution=0.01,
+        ),
+    )
+    assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
+    assert decision.metrics.position_risk_contribution_applicable is True
+    assert "position_downside_risk_contribution" in decision.reasons
+
+
+@pytest.mark.parametrize(
+    ("count", "weight"),
+    [
+        (1, 0.151),
+        (2, 0.151),
+        (3, 0.151),
+        (4, 0.151),
+        (5, 0.151),
+        (6, 0.134),
+        (7, 0.115),
+        (8, 0.101),
+    ],
+)
+def test_count_specific_stock_exposure_ceiling_blocks_overdeployed_retained_state(
+    count,
+    weight,
+):
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(count))
+    weights = {row.symbol: weight for row in retained}
+    decision = select_continuous_replacement(
+        retained,
+        weights,
+        [],
+        cash_weight=1 - sum(weights.values()),
+        budget=AdaptiveRiskBudget(),
+    )
+    assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
+    assert "holding_count_stock_exposure" in decision.reasons
+    assert decision.evaluated_count == 0
+
+
+def test_eight_positions_have_no_slot_but_still_get_baseline_risk_review():
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(8))
     decision = select_continuous_replacement(
         retained,
         {row.symbol: 0.1 for row in retained},
         [_candidate("NEW", 9, mean=0.004)],
-        cash_weight=0.5,
+        cash_weight=0.2,
         budget=AdaptiveRiskBudget(),
     )
     assert decision.status is ContinuousPortfolioStatus.HOLD_CASH
-    assert decision.reasons == ("maximum_five_holdings_no_free_slot",)
+    assert decision.reasons == ("maximum_eight_holdings_no_free_slot",)
     assert decision.evaluated_count == 1
+
+
+def test_more_than_eight_positions_requires_review_before_market_comparison():
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(9))
+    decision = select_continuous_replacement(
+        retained,
+        {row.symbol: 0.09 for row in retained},
+        [],
+        cash_weight=0.19,
+        budget=AdaptiveRiskBudget(),
+    )
+    assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
+    assert "maximum_eight_holdings" in decision.reasons
+    assert decision.evaluated_count == 0
 
 
 def test_other_proxy_horizon_is_not_silently_relabeled_twenty_sessions():
@@ -258,6 +335,7 @@ def test_undefined_correlation_and_all_positive_history_are_not_treated_as_zero_
     candidate = replace(candidate, returns=pd.Series(0.01, index=candidate.returns.index))
     decision = _select([candidate])
     assert decision.status is ContinuousPortfolioStatus.HOLD_CASH
-    assert all(
+    assert any(
         "candidate_joint_risk_unavailable" in row.reasons for row in decision.candidate_rejections
     )
+    assert any("holding_count_stock_exposure" in row.reasons for row in decision.candidate_rejections)

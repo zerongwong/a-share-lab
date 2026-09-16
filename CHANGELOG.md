@@ -5,6 +5,25 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Promote the live continuous strategy to `continuous-signal-v2`.  The legal
+  state is now zero through eight holdings: zero means cash, one through three
+  are lower-exposure transition states, four through eight are formed
+  portfolios, and five or six are the normal preference only when joint
+  return/risk evidence supports them.  Initial construction searches every
+  feasible count without weakening entry gates or filling slots, permits at
+  most one stock per industry, uses a 20% total-account hard cap per new name,
+  applies the same 15/30/45/60/75/80/80/80% count-exposure ceilings to locked
+  replacement comparisons, keeps replacement choices at 10% or 20% of account
+  equity, and lets cash win an exact zero-LCB tie.  Legacy
+  six-horizon 3--5-name reports remain read-only compatibility records.
+- Isolate the next user-confirmed live portfolio from all former active
+  tracking.  A holding lot now includes its immutable revision in
+  `position_key`; migration 010 preserves every historical stop while removing
+  the old same-symbol/same-date uniqueness collision.  The migration never
+  infers a sale or clears holdings; this installation records an explicit
+  cleared revision until the user confirms a new build.  Historical
+  holdings, decisions, alerts and performance records are retained for audit
+  rather than deleted.
 - Add an isolated, append-only Howard Marks-inspired cycle shadow: four provenance- and
   knowledge-time-gated dimensions, explicit unavailable states, frozen experimental thresholds,
   weekly ordinary-state persistence and immediate risk tightening. The daily report builder archives

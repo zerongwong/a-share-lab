@@ -6,7 +6,7 @@ so the
 returned allocation is the global minimum of squared weight error under these
 constraints:
 
-* three to five securities;
+* one to eight securities;
 * one unit (ten percent by default) minimum per security;
 * ten units in total under the default step;
 * original input order is preserved.
@@ -23,7 +23,7 @@ from decimal import Decimal
 from numbers import Real
 
 DEFAULT_QUANTIZATION_STEP = Decimal("0.10")
-WEIGHT_QUANTIZATION_METHOD_VERSION = "exhaustive-stock-sleeve-grid-v1.0.0"
+WEIGHT_QUANTIZATION_METHOD_VERSION = "exhaustive-stock-sleeve-grid-v2.0.0"
 MINIMUM_UNITS_PER_SECURITY = 1
 _SUM_TOLERANCE = Decimal("1e-9")
 _INTEGER_TOLERANCE = Decimal("1e-12")
@@ -41,7 +41,7 @@ def quantize_stock_sleeve_weights(
     """Return the closest integer-step allocation in the original order.
 
     Closeness is the sum of squared differences from the supplied exact stock-
-    sleeve weights.  Inputs must contain three to five finite, strictly
+    sleeve weights.  Inputs must contain one to eight finite, strictly
     positive real values whose sum is one (within floating-point tolerance).
     ``step`` defaults to ten percent and must be a finite positive reciprocal
     of an integer that leaves at least one unit per security.  Optional minimum,
@@ -102,7 +102,7 @@ def quantize_stock_sleeve_weights(
             best_key = key
             best_units = units
 
-    if best_units is None:  # Defensive: valid 3--5-name inputs always have a composition.
+    if best_units is None:  # Defensive: valid 1--8-name inputs always have a composition.
         raise ValueError("no feasible integer-step allocation")
     return tuple(float(Decimal(unit) * step_decimal) for unit in best_units)
 
@@ -114,8 +114,8 @@ def _validated_weights(weights: Sequence[float]) -> tuple[Decimal, ...]:
         values = tuple(weights)
     except TypeError as exc:
         raise ValueError("weights must be a sequence of real numbers") from exc
-    if not 3 <= len(values) <= 5:
-        raise ValueError("weights must contain three to five securities")
+    if not 1 <= len(values) <= 8:
+        raise ValueError("weights must contain one to eight securities")
 
     exact: list[Decimal] = []
     for index, value in enumerate(values):

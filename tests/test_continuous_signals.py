@@ -84,5 +84,5 @@ def test_every_hard_admission_gate_is_required(kwargs):
 def test_continuous_profile_is_independently_named_without_mutating_legacy_contract():
     legacy = horizon_contract(4)
     assert CONTINUOUS_SIGNAL_CONTRACT is not legacy
-    assert CONTINUOUS_SIGNAL_CONTRACT.label == "continuous_daily_weekly_v1"
+    assert CONTINUOUS_SIGNAL_CONTRACT.label == "continuous_daily_weekly_v2"
     assert legacy.label != CONTINUOUS_SIGNAL_CONTRACT.label

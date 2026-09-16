@@ -684,15 +684,33 @@ def _render_continuous_digest(digest, review, include_holdings):
     lines = [line.removeprefix("- ") for line in lines]
     for label in _HORIZON_LABELS.values():
         lines = [line.replace(f"｜{label}｜", "｜") for line in lines]
+    count_summary = _continuous_count_summary(
+        plan.get("holding_count"), plan.get("count_state")
+    )
     return render_continuous_report(
         as_of=digest.common_cutoff,
         plan_date=digest.plan_for_date,
-        market_summary=f"{digest.cycle_label}｜股票敞口上限{digest.max_stock_exposure:.0%}",
+        market_summary=(
+            f"{digest.cycle_label}｜{count_summary}｜"
+            f"股票敞口上限{digest.max_stock_exposure:.0%}"
+        ),
         holding_lines=lines,
         entries=entries,
         cash_weight=cash,
         status_note=note,
     )
+
+
+def _continuous_count_summary(count: object, state: object) -> str:
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 8:
+        return "组合只数待核验"
+    labels = {
+        "cash": "现金观察",
+        "concentrated_transition": "过渡组合",
+        "preferred_formed": "常态组合",
+        "formed": "成型组合",
+    }
+    return f"{count}只·{labels.get(state, '状态待核验')}"
 
 
 def _holding_review_lines(

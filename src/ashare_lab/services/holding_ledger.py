@@ -21,7 +21,7 @@ from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics.multi_timeframe import SUPPORTED_HOLDING_WEEKS
 from ashare_lab.ports.market_data import normalize_symbol
 
-HOLDING_LEDGER_METHOD_VERSION: Final = "holding-ledger-v0.1.0"
+HOLDING_LEDGER_METHOD_VERSION: Final = "holding-ledger-v0.2.0"
 HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: Final = "holding_summary_delivery_channels"
 HOLDING_SUMMARY_DELIVERY_CHANNELS: Final = ("serverchan", "bark")
 HOLDING_CHART_DELIVERY_CHANNELS_KEY: Final = "holding_chart_delivery_channels"
@@ -213,6 +213,15 @@ def replace_active_holdings(
             metadata=normalized_metadata,
         )
         return result
+    current = get_active_holding_portfolio(repository)
+    carried_position_keys = (
+        {
+            (position.symbol, position.entry_date): position.position_key
+            for position in current.positions
+        }
+        if current is not None and current.status == "active"
+        else {}
+    )
     version = repository.next_holding_snapshot_version()
     revision = {
         "id": revision_id,
@@ -226,7 +235,13 @@ def replace_active_holdings(
     }
     rows = []
     for item in normalized:
-        position_key = _position_key(item.symbol, item.entry_date)
+        position_key = carried_position_keys.get((item.symbol, item.entry_date))
+        if position_key is None:
+            position_key = _position_key(
+                revision_id=revision_id,
+                symbol=item.symbol,
+                entry_date=item.entry_date,
+            )
         rows.append(
             {
                 "id": f"holding-position:{revision_id}:{item.symbol}",
@@ -548,9 +563,22 @@ def _revision_id(change_id: str | None) -> str:
     return f"holding-revision:{uuid5(_HOLDING_REVISION_NAMESPACE, normalized)}"
 
 
-def _position_key(symbol: str, entry_date: date) -> str:
-    digest = hashlib.sha256(f"{symbol}|{entry_date.isoformat()}".encode()).hexdigest()[:24]
-    return f"holding:{symbol}:{digest}"
+def _position_key(*, revision_id: str, symbol: str, entry_date: date) -> str:
+    """Return the immutable identity of one newly confirmed holding lot.
+
+    A still-active symbol with the same entry date carries its existing key
+    across metadata, consent, cost or weight revisions.  This constructor is
+    used only for a genuinely new member, including any re-entry after an
+    explicit cleared revision.  Including that new revision prevents the new
+    lot from inheriting the former lot's protective stop, alert latch,
+    company-action evidence or performance history.  Reusing ``change_id``
+    remains idempotent because it recreates the same revision identity.
+    """
+
+    normalized_revision = _nonblank(revision_id, "revision_id")
+    lot_identity = f"{normalized_revision}|{symbol}|{entry_date.isoformat()}"
+    digest = hashlib.sha256(lot_identity.encode()).hexdigest()[:24]
+    return f"holding-lot:{normalized_revision}:{symbol}:{digest}"
 
 
 def _validate_holding_weeks(value: int) -> None:

@@ -9,6 +9,7 @@ import pytest
 from ashare_lab.adapters.free_intraday_quotes import (
     IntradayQuote,
     crosscheck,
+    fetch_intraday_quotes,
     fresh_quotes,
     parse_quotes,
     provider_code,
@@ -380,6 +381,44 @@ def test_empty_portfolio_has_no_quotes_or_alerts(env):
     assert event["status"] == "no_holdings"
 
 
+def test_exactly_eight_holdings_are_monitored_not_rejected_as_out_of_scope(env):
+    positions = tuple(
+        HoldingPositionInput(
+            symbol=f"6000{index:02}",
+            name=f"测试股票{index}",
+            entry_date=ENTRY,
+            cost_price=10.0,
+            stock_sleeve_weight=0.125,
+            account_weight=0.10,
+            metadata={
+                "company_action_clear": True,
+                "company_action_clear_from": ENTRY.isoformat(),
+                "company_action_clear_through": NOW.date().isoformat(),
+                "company_action_evidence_source": "synthetic-only",
+                "company_action_evidence_id": f"test-{index}",
+            },
+        )
+        for index in range(8)
+    )
+    replace_active_holdings(
+        env[0],
+        positions,
+        holding_weeks=4,
+        effective_at=datetime(2026, 9, 11, 16, tzinfo=CN),
+    )
+    seen = []
+    event = run_monitor(
+        env[0],
+        root=env[1],
+        now=NOW,
+        quote_fetcher=lambda symbols: seen.append(symbols) or {},
+        calendar=lambda _d: True,
+        notifier=lambda _m: True,
+    )
+    assert len(seen) == 1 and len(seen[0]) == 8
+    assert event["status"] == "degraded"
+
+
 def test_verified_holiday_is_quiet(env):
     event, sent = run(env, calendar=lambda _d: False)
     assert event["status"] == "market_closed" and not sent
@@ -505,6 +544,31 @@ def test_pair_check_rejects_future_stale_and_different_prices():
     assert crosscheck(pair)
     assert not fresh_quotes(pair, now=NOW - timedelta(minutes=2))
     assert not crosscheck(pair[:1])
+
+
+def test_six_to_eight_holdings_are_fetched_in_provider_batches_of_at_most_five():
+    class Response:
+        content = b""
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        def __init__(self):
+            self.urls = []
+
+        def get(self, url, **_kwargs):
+            self.urls.append(url)
+            return Response()
+
+    client = Client()
+    symbols = tuple(f"6000{index:02}" for index in range(8))
+    assert fetch_intraday_quotes(symbols, client=client) == {"tencent": {}, "sina": {}}
+    assert len(client.urls) == 4
+    assert all(len(url.rsplit("=", 1)[-1].split(",")) <= 5 for url in client.urls)
+    with pytest.raises(ValueError, match="one_to_eight"):
+        fetch_intraday_quotes((*symbols, "600008"), client=client)
 
 
 def test_worker_is_independent_and_runs_every_minute():

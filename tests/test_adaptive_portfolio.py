@@ -18,6 +18,7 @@ from ashare_lab.analytics.adaptive_portfolio import (
     evaluate_operational_adaptive_portfolio,
     optimize_adaptive_portfolio,
 )
+from ashare_lab.analytics.portfolio_count_policy import CONTINUOUS_COUNT_POLICY_VERSION
 
 
 def _candidate_set(
@@ -203,7 +204,7 @@ def test_evaluation_keeps_continuous_target_and_audits_grid_method() -> None:
 
     assert dict(result.exact_target_weights) == pytest.approx(target)
     assert result.stock_sleeve_weight_step == pytest.approx(0.10)
-    assert result.weight_quantization_method_version == ("exhaustive-stock-sleeve-grid-v1.0.0")
+    assert result.weight_quantization_method_version == ("exhaustive-stock-sleeve-grid-v2.0.0")
     operation = {position.symbol: position.weight for position in result.positions}
     assert operation != pytest.approx(target)
     assert sum(operation.values()) == pytest.approx(result.stock_exposure)
@@ -650,6 +651,50 @@ def test_optimizer_is_deterministic_and_invariant_to_candidate_order() -> None:
 def test_candidate_count_outside_three_to_five_fails_closed(count: int) -> None:
     with pytest.raises(AdaptivePortfolioDataError, match="three, four, or five"):
         optimize_adaptive_portfolio(_candidate_set(count), budget=_lax_budget())
+
+
+@pytest.mark.parametrize(
+    ("count", "expected_exposure", "correlation_applicable", "contribution_applicable"),
+    (
+        (1, 0.15, False, False),
+        (2, 0.30, True, False),
+        (3, 0.45, True, False),
+        (6, 0.80, True, True),
+        (8, 0.80, True, True),
+    ),
+)
+def test_continuous_count_policy_supports_one_to_eight_without_weakening_gates(
+    count: int,
+    expected_exposure: float,
+    correlation_applicable: bool,
+    contribution_applicable: bool,
+) -> None:
+    result = optimize_adaptive_portfolio(
+        _candidate_set(count),
+        budget=_lax_budget(industry_weight_limit=0.40),
+        count_policy=CONTINUOUS_COUNT_POLICY_VERSION,
+    )
+
+    assert result.stock_exposure == pytest.approx(expected_exposure)
+    assert max(position.weight for position in result.positions) <= 0.20 + 1e-12
+    assert result.metrics.correlation_applicable is correlation_applicable
+    assert result.metrics.position_risk_contribution_applicable is contribution_applicable
+    assert result.risk_budget.correlation_applicable is correlation_applicable
+    assert result.risk_budget.position_risk_contribution_applicable is contribution_applicable
+
+
+def test_continuous_single_name_exposure_respects_tighter_cycle_industry_cap() -> None:
+    result = optimize_adaptive_portfolio(
+        _candidate_set(1),
+        budget=_lax_budget(
+            maximum_stock_exposure=0.20,
+            industry_weight_limit=0.10,
+        ),
+        count_policy=CONTINUOUS_COUNT_POLICY_VERSION,
+    )
+
+    assert result.stock_exposure == pytest.approx(0.10)
+    assert result.positions[0].weight == pytest.approx(0.10)
 
 
 def test_short_missing_or_misaligned_returns_fail_closed() -> None:

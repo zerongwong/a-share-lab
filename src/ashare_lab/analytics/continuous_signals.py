@@ -17,10 +17,10 @@ from ashare_lab.analytics.multi_timeframe import (
     StructureState,
 )
 
-CONTINUOUS_METHOD_VERSION = "continuous-signal-v1"
+CONTINUOUS_METHOD_VERSION = "continuous-signal-v2"
 CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
     4,  # legacy transport discriminator ONLY; not a holding deadline
-    "continuous_daily_weekly_v1",
+    "continuous_daily_weekly_v2",
     BarTimeframe.WEEKLY,
     8,
     26,

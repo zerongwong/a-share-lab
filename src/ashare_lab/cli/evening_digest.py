@@ -36,6 +36,7 @@ from ashare_lab.adapters.notification_channels import (
     ServerChanNotificationChannel,
 )
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
 from ashare_lab.bootstrap import application_data_dir, project_root
 from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
 from ashare_lab.domain.errors import AShareLabError, DataUnavailableError
@@ -288,7 +289,7 @@ def run_evening_digest(
             last_sent = _state_cutoff(prior_state)
             current_method_matches = (
                 _build_digest is not None
-                or prior_state.get("method_version") == "continuous-signal-v1"
+                or prior_state.get("method_version") == CONTINUOUS_METHOD_VERSION
             )
             latest = latest_reader(resolved_overlay)
             retry_chart = (

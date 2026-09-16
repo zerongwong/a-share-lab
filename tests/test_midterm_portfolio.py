@@ -981,6 +981,57 @@ def test_five_stocks_replace_four_only_for_material_diversification() -> None:
     assert chosen is strong_five
 
 
+def test_continuous_count_policy_uses_five_as_tie_preference_not_a_quota() -> None:
+    two = _selection_row(2, lcb=0.05, correlation=0.50, contribution=0.30)
+    five = _selection_row(5, lcb=0.05, correlation=0.50, contribution=0.30)
+
+    chosen = _select_stock_count(
+        {2: [two], 5: [five]},
+        continuous_policy=True,
+        maximum_stock_exposure=0.80,
+    )
+
+    assert chosen is five
+
+
+def test_continuous_count_policy_does_not_fill_slots_at_lower_conservative_return() -> None:
+    two = _selection_row(2, lcb=0.07, correlation=0.50, contribution=0.70)
+    five = _selection_row(5, lcb=0.06, correlation=0.40, contribution=0.25)
+
+    chosen = _select_stock_count(
+        {2: [two], 5: [five]},
+        continuous_policy=True,
+        maximum_stock_exposure=0.80,
+    )
+
+    assert chosen is two
+
+
+def test_continuous_cash_option_wins_an_exact_zero_lcb_tie(monkeypatch) -> None:
+    import ashare_lab.services.build_midterm_portfolio as module
+
+    evaluation = SimpleNamespace(
+        risk_budget=SimpleNamespace(violations=()),
+        metrics=SimpleNamespace(holding_period_return_lcb=0.0),
+        positions=(),
+    )
+    monkeypatch.setattr(module, "_beam_candidate_sets", lambda *_args, **_kwargs: ((0,),))
+    monkeypatch.setattr(module, "_evaluate_candidate_set", lambda *_args, **_kwargs: evaluation)
+    monkeypatch.setattr(module, "_normalized_rejection_overrun", lambda *_args, **_kwargs: 0.0)
+
+    viable, rejected, evaluated = module._search_candidate_portfolios(
+        [SimpleNamespace(symbol="000001", industry="银行")],
+        budget=AdaptiveRiskBudget(),
+        beam_width=1,
+        minimum_historical_return_lcb=0.0,
+        continuous_policy=True,
+    )
+
+    assert evaluated == 1
+    assert all(not rows for rows in viable.values())
+    assert rejected[1][0].rejection_reasons == ("holding_period_return_lcb_below_minimum",)
+
+
 def test_final_portfolio_order_uses_horizon_drawdown_not_legacy_60_day_value() -> None:
     first = _selection_row(
         4,

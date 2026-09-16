@@ -84,6 +84,8 @@ def render_continuous_report(
         name = _text(_required_string(entry, "name"), "name")
         condition = _text(_required_string(entry, "entry_label"), "entry_label")
         weight = _fraction(entry.get("account_weight"), "account_weight", positive=True)
+        if weight > Decimal("0.20"):
+            raise ValueError("qualified entry account_weight cannot exceed 20%")
         protection = _number(entry.get("protection_line"), "protection_line")
         if protection <= 0:
             raise ValueError("protection_line must be positive")
@@ -91,8 +93,8 @@ def render_continuous_report(
         qualified.append(
             f"- {name}({symbol})｜总资金{_percent(weight)}｜{condition}｜保护{_decimal(protection)}"
         )
-    if len(qualified) > 5:
-        raise ValueError("a continuous portfolio supports at most five qualified new entries")
+    if len(qualified) > 8:
+        raise ValueError("a continuous portfolio supports at most eight qualified new entries")
     cash = None if cash_weight is None else _fraction(cash_weight, "cash_weight")
     if total_new_weight > 1 or (cash is not None and total_new_weight + cash > 1 + Decimal("1e-9")):
         raise ValueError("new entries and planned cash cannot exceed the total account")

@@ -1,4 +1,4 @@
-"""Build one adaptive 3--5 stock medium-term A-share research portfolio.
+"""Build one adaptive A-share research portfolio.
 
 This is the main strategy service for the post-prototype model.  It keeps the
 legacy fixed-four builder intact for archive compatibility, but it does not use
@@ -11,8 +11,9 @@ from current entry permission:
   never stops an otherwise data-complete full-market screen;
 * price/turnover structure is a hard candidate gate;
 * fundamentals and official announcements can veto, never boost ranking;
-* every 3-, 4-, and 5-stock set is evaluated with the same downside-risk
-  engine; a bounded beam is a documented computational approximation;
+* legacy horizons evaluate 3--5 names; the current continuous path evaluates
+  every feasible 1--8-name set with the same downside-risk engine;
+* a bounded beam is a documented computational approximation;
 * only risk-budget-passing sets with a positive historical holding-period lower
   bound may be returned, and the result remains ``RESEARCH_ONLY`` until genuine
   point-in-time walk-forward validation exists.
@@ -32,6 +33,7 @@ import pandas as pd
 
 from ashare_lab.analytics.adaptive_portfolio import (
     FIVE_DAY_SESSIONS,
+    LEGACY_COUNT_POLICY_VERSION,
     MINIMUM_FIVE_DAY_SAMPLES,
     MINIMUM_ROLLING_DRAWDOWN_WINDOWS,
     ROLLING_DRAWDOWN_SESSIONS,
@@ -80,6 +82,12 @@ from ashare_lab.analytics.multi_timeframe import (
     build_completed_timeframes,
     horizon_contract,
 )
+from ashare_lab.analytics.portfolio_count_policy import (
+    CONTINUOUS_COUNT_POLICY_VERSION,
+    MAX_CONTINUOUS_HOLDINGS,
+    MAX_NEW_ACCOUNT_WEIGHT,
+    continuous_count_preference,
+)
 from ashare_lab.services.review_active_holdings import HOLDING_TREE_METHOD_VERSION, _candidate_stop
 
 RESEARCH_DISCLAIMER = (
@@ -87,7 +95,7 @@ RESEARCH_DISCLAIMER = (
     "point-in-time walk-forward、费用、滑点和不可成交验证，不是未来收益预测、上涨概率、"
     "投资建议或最大回撤保证。"
 )
-MIDTERM_METHOD_VERSION = "midterm-maintrend-multitimeframe-v0.8.0"
+MIDTERM_METHOD_VERSION = "midterm-maintrend-multitimeframe-v0.9.0"
 CENTRAL_MULTI_TIMEFRAME_IMPLEMENTATION_STATUS = "partial_multiframe"
 MAX_INITIAL_ENTRY_RISK = 0.08
 
@@ -392,7 +400,7 @@ def build_midterm_portfolio(
     minimum_historical_return_lcb: float = 0.0,
     continuous_entry_policy: bool = False,
 ) -> MidtermPortfolioResult:
-    """Return one risk-budget-passing 3--5 stock research portfolio.
+    """Return one risk-budget-passing research portfolio.
 
     Optional metadata keys ``fundamental_gate`` and ``announcement_gate`` use
     ``pass``, ``veto`` or ``unknown``.  The boolean aliases
@@ -415,6 +423,10 @@ def build_midterm_portfolio(
         raise ValueError("minimum_balance_sheet_strength must be in [0, 1]")
     if not math.isfinite(minimum_historical_return_lcb):
         raise ValueError("minimum_historical_return_lcb must be finite")
+
+    minimum_candidate_count = 1 if continuous_entry_policy else 3
+    shortlist_default_count = 6 if continuous_entry_policy else 4
+    shortlist_maximum_count = MAX_CONTINUOUS_HOLDINGS if continuous_entry_policy else 5
 
     cutoff = _normalize_cutoff(as_of)
     if cutoff is None:
@@ -640,9 +652,11 @@ def build_midterm_portfolio(
         holding_weeks=holding_weeks,
         histories=normalized_histories,
         cutoff=cutoff,
+        default_candidate_count=shortlist_default_count,
+        maximum_candidates=shortlist_maximum_count,
     )
 
-    if len(candidates) < 3:
+    if len(candidates) < minimum_candidate_count:
         return MidtermPortfolioResult(
             status=MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO,
             data_cutoff=cutoff,
@@ -661,10 +675,12 @@ def build_midterm_portfolio(
             market_regime=market_regime,
             index_regime=index_regime,
             price_cycle=price_cycle,
-            reasons=(f"only_{len(candidates)}_horizon_candidates;minimum_three",),
+            reasons=(
+                f"only_{len(candidates)}_horizon_candidates;minimum_{minimum_candidate_count}",
+            ),
         )
 
-    if len(risk_eligible_candidates) < 3:
+    if len(risk_eligible_candidates) < minimum_candidate_count:
         return MidtermPortfolioResult(
             status=MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO,
             data_cutoff=cutoff,
@@ -682,10 +698,10 @@ def build_midterm_portfolio(
             price_cycle=price_cycle,
             reasons=(
                 f"only_{risk_history_eligible_candidate_count}_risk_history_eligible_candidates;"
-                "minimum_three",
+                f"minimum_{minimum_candidate_count}",
             ),
             warnings=(
-                "结构候选已经生成，但具备完整持有期风险与LCB历史的股票不足3只；"
+                "结构候选已经生成，但具备完整持有期风险与LCB历史的股票不足最低数量；"
                 "历史不足者仅保留研究观察，不进入组合搜索或权重计算。",
             ),
         )
@@ -708,7 +724,11 @@ def build_midterm_portfolio(
     if any(research_viable.values()):
         for rows in research_viable.values():
             rows.sort(key=_viable_sort_key)
-        _, research_best, research_selected = _select_stock_count(research_viable)
+        _, research_best, research_selected = _select_stock_count(
+            research_viable,
+            continuous_policy=continuous_entry_policy,
+            maximum_stock_exposure=budget.maximum_stock_exposure,
+        )
         research_candidates = _build_research_shortlist(
             candidates,
             candidate_actions,
@@ -723,9 +743,15 @@ def build_midterm_portfolio(
                 )
             ),
             evaluation=research_best,
+            default_candidate_count=shortlist_default_count,
+            maximum_candidates=shortlist_maximum_count,
         )
     elif any(research_rejected.values()):
-        rejected = _select_observation_portfolio(research_rejected)
+        rejected = _select_observation_portfolio(
+            research_rejected,
+            continuous_policy=continuous_entry_policy,
+            maximum_stock_exposure=budget.maximum_stock_exposure,
+        )
         observation_best = rejected.evaluation
         observation_rejection_reasons = rejected.rejection_reasons
         research_candidates = _build_research_shortlist(
@@ -742,6 +768,8 @@ def build_midterm_portfolio(
                 )
             ),
             observation_evaluation=observation_best,
+            default_candidate_count=shortlist_default_count,
+            maximum_candidates=shortlist_maximum_count,
         )
 
     actionable_candidates = [
@@ -750,7 +778,7 @@ def build_midterm_portfolio(
         if candidate_actions[candidate.symbol][0] is CandidateAction.CONDITIONAL_ENTRY
     ]
     search_pool = actionable_candidates[:candidate_pool_size]
-    if len(search_pool) < 3:
+    if len(search_pool) < minimum_candidate_count:
         evidence_blocks_action = any(
             candidate.evidence_unknown for candidate in research_candidates
         )
@@ -783,13 +811,13 @@ def build_midterm_portfolio(
             observation_evaluation=observation_best,
             observation_rejection_reasons=observation_rejection_reasons,
             reasons=(
-                "research_candidates_generated_but_fewer_than_three_pass_current_entry_policy",
+                "research_candidates_generated_but_fewer_than_minimum_pass_current_entry_policy",
             ),
             warnings=(
                 (
                     "研究候选的财务、公告或可买性证据尚未接齐，行动层保持现金。"
                     if evidence_blocks_action
-                    else "研究候选不等于当前可以买；本轮周期介入门后不足3只，行动层保持现金。"
+                    else "研究候选不等于当前可以买；本轮周期介入门后不足最低数量，行动层保持现金。"
                 ),
             ),
             evidence_review_required=evidence_blocks_action,
@@ -828,16 +856,27 @@ def build_midterm_portfolio(
             research_cash_weight=(1.0 if research_best is None else research_best.cash_weight),
             observation_evaluation=observation_best,
             observation_rejection_reasons=observation_rejection_reasons,
-            reasons=("no_3_to_5_stock_set_passed_grid_industry_and_risk_budgets",),
+            reasons=(
+                "no_1_to_8_stock_set_passed_grid_industry_and_risk_budgets"
+                if continuous_entry_policy
+                else "no_3_to_5_stock_set_passed_grid_industry_and_risk_budgets",
+            ),
             warnings=(
-                "研究候选已经生成，但没有3至5股组合同时通过10%操作档、"
+                "研究候选已经生成，但没有1至8股组合同时通过10%操作档、"
+                "单股上限、行业集中度与当前周期的下行风险预算。"
+                if continuous_entry_policy
+                else "研究候选已经生成，但没有3至5股组合同时通过10%操作档、"
                 "行业集中度与当前周期的下行风险预算。"
             ),
         )
 
     for rows in viable_by_count.values():
         rows.sort(key=_viable_sort_key)
-    _, best, selected = _select_stock_count(viable_by_count)
+    _, best, selected = _select_stock_count(
+        viable_by_count,
+        continuous_policy=continuous_entry_policy,
+        maximum_stock_exposure=budget.maximum_stock_exposure,
+    )
     selected_by_symbol = {item.symbol: item for item in selected}
     ordered_positions = sorted(
         best.positions,
@@ -852,6 +891,8 @@ def build_midterm_portfolio(
         cutoff=cutoff,
         preferred_symbols=tuple(position.symbol for position in ordered_positions),
         evaluation=best,
+        default_candidate_count=shortlist_default_count,
+        maximum_candidates=shortlist_maximum_count,
     )
     entry_plan_by_symbol = {
         candidate.symbol: candidate.conditional_entry_plan for candidate in research_candidates
@@ -1461,22 +1502,30 @@ def _build_research_shortlist(
     preferred_symbols: tuple[str, ...] | None = None,
     evaluation: AdaptivePortfolioEvaluation | None = None,
     observation_evaluation: AdaptivePortfolioEvaluation | None = None,
+    default_candidate_count: int = 4,
+    maximum_candidates: int = 5,
 ) -> tuple[MidtermResearchCandidate, ...]:
+    if not 1 <= default_candidate_count <= maximum_candidates:
+        raise ValueError("default_candidate_count must be within maximum_candidates")
     if preferred_symbols:
         by_symbol = {candidate.symbol: candidate for candidate in candidates}
-        selected = [by_symbol[symbol] for symbol in preferred_symbols if symbol in by_symbol]
+        selected = [
+            by_symbol[symbol]
+            for symbol in preferred_symbols[:maximum_candidates]
+            if symbol in by_symbol
+        ]
     else:
-        selected = candidates[: min(4, len(candidates))]
+        selected = candidates[: min(default_candidate_count, len(candidates))]
     # Keep a bounded sample of structural candidates whose deep risk history
     # is unavailable visible even though they can never receive a portfolio
-    # weight.  The user-facing shortlist must remain a genuine 3--5 name list;
-    # aggregate result counts expose the complete structural set.
+    # weight.  The user-facing shortlist remains bounded by its versioned
+    # strategy policy; aggregate result counts expose the complete set.
     selected_symbols = {candidate.symbol for candidate in selected}
     risk_history_audit = [
         candidate for candidate in candidates if not candidate.risk_history_available
     ][:4]
     for candidate in risk_history_audit:
-        if candidate.symbol not in selected_symbols and len(selected) < 5:
+        if candidate.symbol not in selected_symbols and len(selected) < maximum_candidates:
             selected.append(candidate)
             selected_symbols.add(candidate.symbol)
     evaluation_by_symbol = (
@@ -2025,6 +2074,8 @@ def _partial_set_score(
 def _evaluate_candidate_set(
     selected: tuple[MidtermCandidate, ...],
     budget: AdaptiveRiskBudget,
+    *,
+    continuous_policy: bool = False,
 ) -> AdaptivePortfolioEvaluation:
     aligned = pd.concat(
         {candidate.symbol: candidate.returns for candidate in selected},
@@ -2040,7 +2091,13 @@ def _evaluate_candidate_set(
         )
         for candidate in selected
     )
-    return optimize_adaptive_portfolio(adaptive, budget=budget)
+    return optimize_adaptive_portfolio(
+        adaptive,
+        budget=budget,
+        count_policy=(
+            CONTINUOUS_COUNT_POLICY_VERSION if continuous_policy else LEGACY_COUNT_POLICY_VERSION
+        ),
+    )
 
 
 def _search_candidate_portfolios(
@@ -2058,23 +2115,22 @@ def _search_candidate_portfolios(
     dict[int, list[_RejectedPortfolioEvaluation]],
     int,
 ]:
-    """Evaluate bounded 3/4/5-name searches under one immutable budget.
+    """Evaluate bounded count searches under one immutable budget.
 
     Structurally evaluable failures are retained only for an explicitly
     non-actionable observation layer.  They never enter ``viable_by_count``.
     """
 
+    stock_counts = tuple(range(1, MAX_CONTINUOUS_HOLDINGS + 1)) if continuous_policy else (3, 4, 5)
     viable_by_count: dict[
         int,
         list[tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]]],
-    ] = {3: [], 4: [], 5: []}
+    ] = {count: [] for count in stock_counts}
     rejected_by_count: dict[int, list[_RejectedPortfolioEvaluation]] = {
-        3: [],
-        4: [],
-        5: [],
+        count: [] for count in stock_counts
     }
     evaluated = 0
-    for stock_count in (3, 4, 5):
+    for stock_count in stock_counts:
         if len(search_pool) < stock_count:
             continue
         for indices in _beam_candidate_sets(
@@ -2082,16 +2138,23 @@ def _search_candidate_portfolios(
         ):
             selected = tuple(search_pool[index] for index in indices)
             try:
-                adaptive = _evaluate_candidate_set(selected, budget)
+                adaptive = _evaluate_candidate_set(
+                    selected,
+                    budget,
+                    continuous_policy=continuous_policy,
+                )
             except AdaptivePortfolioDataError:
                 continue
             evaluated += 1
             rejection_reasons = list(adaptive.risk_budget.violations)
             if continuous_policy and any(
-                position.weight > 0.30 + 1e-9 for position in adaptive.positions
+                position.weight > MAX_NEW_ACCOUNT_WEIGHT + 1e-9 for position in adaptive.positions
             ):
-                rejection_reasons.append("single_account_position_above_30pct")
-            if adaptive.metrics.holding_period_return_lcb < minimum_historical_return_lcb:
+                rejection_reasons.append("single_account_position_above_20pct")
+            if adaptive.metrics.holding_period_return_lcb < minimum_historical_return_lcb or (
+                continuous_policy
+                and adaptive.metrics.holding_period_return_lcb <= 0.0 + 1e-12
+            ):
                 rejection_reasons.append("holding_period_return_lcb_below_minimum")
             if rejection_reasons:
                 rejected_by_count[stock_count].append(
@@ -2115,6 +2178,9 @@ def _search_candidate_portfolios(
 
 def _select_observation_portfolio(
     rejected_by_count: Mapping[int, list[_RejectedPortfolioEvaluation]],
+    *,
+    continuous_policy: bool = False,
+    maximum_stock_exposure: float | None = None,
 ) -> _RejectedPortfolioEvaluation:
     """Select one deterministic rejected allocation for observation only.
 
@@ -2124,7 +2190,10 @@ def _select_observation_portfolio(
     and finally the lexicographically smaller symbol tuple.
     """
 
-    for stock_count in (4, 5, 3):
+    count_order = (
+        continuous_count_preference(maximum_stock_exposure) if continuous_policy else (4, 5, 3)
+    )
+    for stock_count in count_order:
         rows = rejected_by_count.get(stock_count, [])
         if rows:
             return min(rows, key=_observation_sort_key)
@@ -2172,14 +2241,22 @@ def _normalized_rejection_overrun(
             horizon_drawdown_limit,
         )
         + positive_ratio(metrics.es95_5d, budget.max_es95_5d)
-        + max(
-            0.0,
-            (metrics.max_down_period_correlation - budget.max_down_period_correlation)
-            / correlation_scale,
+        + (
+            max(
+                0.0,
+                (metrics.max_down_period_correlation - budget.max_down_period_correlation)
+                / correlation_scale,
+            )
+            if getattr(metrics, "correlation_applicable", True)
+            else 0.0
         )
-        + positive_ratio(
-            metrics.max_position_downside_risk_contribution,
-            budget.max_position_downside_risk_contribution,
+        + (
+            positive_ratio(
+                metrics.max_position_downside_risk_contribution,
+                budget.max_position_downside_risk_contribution,
+            )
+            if getattr(metrics, "position_risk_contribution_applicable", True)
+            else 0.0
         )
         + positive_ratio(industry_max, budget.industry_weight_limit)
         + max(
@@ -2200,8 +2277,16 @@ def _viable_sort_key(
         metrics.annual_downside_volatility,
         metrics.horizon_rolling_max_drawdown_p90,
         metrics.es95_5d,
-        metrics.max_down_period_correlation,
-        metrics.max_position_downside_risk_contribution,
+        (
+            metrics.max_down_period_correlation
+            if getattr(metrics, "correlation_applicable", True)
+            else 0.0
+        ),
+        (
+            metrics.max_position_downside_risk_contribution
+            if getattr(metrics, "position_risk_contribution_applicable", True)
+            else 0.0
+        ),
         tuple(sorted(item.symbol for item in selected)),
     )
 
@@ -2211,8 +2296,11 @@ def _select_stock_count(
         int,
         list[tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]]],
     ],
+    *,
+    continuous_policy: bool = False,
+    maximum_stock_exposure: float | None = None,
 ) -> tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]]:
-    """Choose four normally; use three for scarcity and five for real diversification.
+    """Choose one count under the applicable versioned policy.
 
     A viable four-stock set is the baseline.  A five-stock set may replace it
     only when it has a higher conservative return lower bound, does not worsen
@@ -2223,6 +2311,23 @@ def _select_stock_count(
     only diversified feasible construction, it remains preferable to a
     concentrated three-stock fallback.
     """
+
+    if continuous_policy:
+        count_rank = {
+            count: rank
+            for rank, count in enumerate(continuous_count_preference(maximum_stock_exposure))
+        }
+        rows = [row for count_rows in viable_by_count.values() for row in count_rows]
+        if not rows:
+            raise RuntimeError("at least one viable 1-to-8 stock set is required")
+
+        def continuous_key(
+            row: tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]],
+        ) -> tuple[float, float, float, float, int, float, float, tuple[str, ...]]:
+            base = _viable_sort_key(row)
+            return (*base[:4], count_rank[len(row[2])], *base[4:])
+
+        return min(rows, key=continuous_key)
 
     best_three = viable_by_count.get(3, [])[:1]
     best_four = viable_by_count.get(4, [])[:1]

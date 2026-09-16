@@ -16,6 +16,10 @@ from pathlib import Path
 import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import (
+    CONTINUOUS_METHOD_VERSION,
+    CONTINUOUS_SIGNAL_CONTRACT,
+)
 from ashare_lab.cli.evening_digest import _archive_original_digest
 from ashare_lab.services.archive_recommendation_report import build_recommendation_archive_bundle
 from ashare_lab.services.build_evening_digest import (
@@ -116,10 +120,12 @@ def _legacy_digest():
 def _continuous_digest(*, holding_based=False):
     plan = {
         "mode": "continuous",
-        "method_version": "continuous-signal-v1",
+        "method_version": CONTINUOUS_METHOD_VERSION,
         "planned_exit_date": None,
-        "signal_profile": "daily_weekly_v1",
+        "signal_profile": CONTINUOUS_SIGNAL_CONTRACT.label,
         "risk_observation_sessions": 20,
+        "holding_count": 4,
+        "count_state": "formed",
         "holding_based": holding_based,
         "holding_identity": ["synthetic-private-ledger-id", 5] if holding_based else None,
         "entries": [
@@ -140,7 +146,7 @@ def _continuous_digest(*, holding_based=False):
     }
     # The transport may still carry its legacy analytical window. It must not
     # escape into a six-group display or a new fixed-maturity cohort.
-    return replace(_legacy_digest(), method_version="continuous-signal-v1", continuous_plan=plan)
+    return replace(_legacy_digest(), method_version=CONTINUOUS_METHOD_VERSION, continuous_plan=plan)
 
 
 def _holding_review():
@@ -191,8 +197,34 @@ def test_real_evening_renderer_outputs_one_account_weighted_plan_with_price_boun
     assert "计划现金：总资金70%" in body
     assert body.count("买≤10.30+量｜保护9.4812") == 4
     assert "仅信号退出，不设到期卖出" in body
+    assert "4只·成型组合" in body
     for forbidden in ("六期限", "1个月", "3个月", "旧观察样本", "股票仓内", "NOT_FOR_DELIVERY"):
         assert forbidden not in body
+
+
+def test_continuous_renderer_keeps_all_eight_qualified_names_without_legacy_truncation():
+    digest = _continuous_digest()
+    entries = tuple(
+        {
+            **digest.continuous_plan["entries"][0],
+            "symbol": f"6000{index:02d}",
+            "name": f"八只合成{index}",
+            "account_weight": 0.10,
+        }
+        for index in range(8)
+    )
+    plan = {
+        **digest.continuous_plan,
+        "entries": entries,
+        "cash_weight": 0.20,
+        "holding_count": 8,
+        "count_state": "formed",
+    }
+    body = render_evening_digest_markdown(
+        replace(digest, max_stock_exposure=0.80, minimum_cash_weight=0.20, continuous_plan=plan)
+    )
+    assert body.count("总资金10%") == 8
+    assert "8只·成型组合" in body
 
 
 def test_holding_based_details_cannot_escape_without_holding_authorization():

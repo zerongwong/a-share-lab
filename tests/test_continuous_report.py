@@ -150,9 +150,23 @@ def test_duplicate_stocks_and_past_plan_dates_fail_closed():
         _render(plan_date=date(2026, 9, 4))
 
 
-def test_more_than_five_qualified_entries_fail_closed():
-    with pytest.raises(ValueError, match="at most five"):
-        _render(entries=[_entry(symbol=f"60000{index}", account_weight=0.05) for index in range(6)])
+def test_eight_qualified_entries_are_supported_and_nine_fail_closed():
+    body = _render(
+        entries=[_entry(symbol=f"60000{index}", account_weight=0.05) for index in range(8)],
+        cash_weight=0.6,
+    )
+    assert body.count("总资金5%") == 8
+    with pytest.raises(ValueError, match="at most eight"):
+        _render(
+            entries=[_entry(symbol=f"6000{index:02}", account_weight=0.05) for index in range(9)],
+            cash_weight=0.55,
+        )
+
+
+def test_new_entry_account_weight_has_twenty_percent_hard_cap():
+    assert "总资金20%" in _render(entries=[_entry(account_weight=0.20)], cash_weight=0.8)
+    with pytest.raises(ValueError, match="20%"):
+        _render(entries=[_entry(account_weight=0.2001)], cash_weight=0.7999)
 
 
 def test_caller_formatted_holding_bullet_is_not_duplicated():

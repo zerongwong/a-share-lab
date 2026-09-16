@@ -77,7 +77,26 @@ class SQLiteRepository:
 
         with self.connection() as connection:
             for migration_file in migration_files:
+                version = int(migration_file.name.split("_", 1)[0])
+                try:
+                    already_applied = connection.execute(
+                        "SELECT 1 FROM schema_migrations WHERE version = ?",
+                        (version,),
+                    ).fetchone()
+                except sqlite3.OperationalError as exc:
+                    if "no such table: schema_migrations" not in str(exc):
+                        raise
+                    already_applied = None
+                if already_applied is not None:
+                    continue
                 connection.executescript(migration_file.read_text(encoding="utf-8"))
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO schema_migrations(version, applied_at)
+                    VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """,
+                    (version,),
+                )
 
     def archive_run(
         self,

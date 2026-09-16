@@ -1,4 +1,4 @@
-"""Deterministic 3--5 stock allocation and downside-risk evaluation.
+"""Deterministic stock allocation and downside-risk evaluation.
 
 This module is deliberately independent from the existing weekly portfolio
 builder.  It consumes an already screened candidate set and never fetches data,
@@ -22,10 +22,16 @@ remain the audit target.  Their limits are:
 * 4 stocks: 80% stock exposure, 10%--30% per stock;
 * 5 stocks: 85% stock exposure, 8%--25% per stock.
 
+Those limits remain the legacy fixed-horizon contract.  The explicitly selected
+``continuous-count-policy-v2.0.0`` instead admits one through eight names, caps
+normal count-state stock exposure at 15%, 30%, 45%, 60%, 75%, 80%, 80% and 80%,
+and independently enforces a 20% total-account hard cap per new position.
+
 The operational stock sleeve is then selected by exhaustive search on a 10%
-integer grid.  Three-stock sleeves permit 20%--50% per name, four-stock sleeves
-10%--40%, and five-stock sleeves 10%--30%.  The grid must sum to 100% of the
-stock sleeve and must still respect the total-account industry cap.  All risk
+integer grid.  Legacy three-stock sleeves permit 20%--50% per name, four-stock
+sleeves 10%--40%, and five-stock sleeves 10%--30%; continuous v2 supplies its
+own count-specific sleeve box.  The grid must sum to 100% of the stock sleeve
+and must still respect the total-account industry cap.  All risk
 and return metrics use these operational weights, not the continuous target.
 The nearest structurally feasible grid is chosen before risk evaluation; if
 that grid breaches a risk budget, the candidate group fails.  The optimizer
@@ -72,6 +78,12 @@ from statistics import NormalDist
 import numpy as np
 import pandas as pd
 
+from ashare_lab.analytics.portfolio_count_policy import (
+    CONTINUOUS_COUNT_POLICY_VERSION,
+    CONTINUOUS_OPERATION_STOCK_SLEEVE_LIMITS,
+    CONTINUOUS_POSITION_LIMITS,
+    MAX_NEW_ACCOUNT_WEIGHT,
+)
 from ashare_lab.analytics.weight_quantization import (
     WEIGHT_QUANTIZATION_METHOD_VERSION,
     quantize_stock_sleeve_weights,
@@ -113,6 +125,7 @@ DIRECT_OPERATION_METHOD = (
     "direct historical risk evaluation without quantization"
 )
 OPERATIONAL_WEIGHT_VALIDATION_METHOD_VERSION = "direct-operational-stock-sleeve-validation-v1.0.0"
+LEGACY_COUNT_POLICY_VERSION = "legacy-three-to-five-count-policy-v1.0.0"
 
 
 class AdaptivePortfolioDataError(ValueError):
@@ -302,6 +315,8 @@ class AdaptivePortfolioMetrics:
     horizon_rolling_drawdown_window_count: int = 0
     horizon_rolling_max_drawdown_p90: float = 0.0
     path_method_version: str = "fixed-shares-plus-cash-per-window-v1.0.0"
+    correlation_applicable: bool = True
+    position_risk_contribution_applicable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,6 +335,8 @@ class AdaptiveRiskBudgetResult:
     horizon_rolling_drawdown_passed: bool = True
     horizon_rolling_drawdown_window_sessions: int = ROLLING_DRAWDOWN_SESSIONS
     horizon_rolling_drawdown_limit: float = 0.12
+    correlation_applicable: bool = True
+    position_risk_contribution_applicable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,21 +359,37 @@ class AdaptivePortfolioEvaluation:
 DEFAULT_RISK_BUDGET = AdaptiveRiskBudget()
 
 
+def _count_policy_limits(
+    count_policy: str,
+) -> tuple[
+    Mapping[int, tuple[float, float, float]],
+    Mapping[int, tuple[float, float]],
+]:
+    """Return the allocation boxes for one explicit, versioned count policy."""
+
+    if count_policy == LEGACY_COUNT_POLICY_VERSION:
+        return POSITION_LIMITS, OPERATION_STOCK_SLEEVE_LIMITS
+    if count_policy == CONTINUOUS_COUNT_POLICY_VERSION:
+        return CONTINUOUS_POSITION_LIMITS, CONTINUOUS_OPERATION_STOCK_SLEEVE_LIMITS
+    raise AdaptivePortfolioDataError(f"unsupported count policy: {count_policy!r}")
+
+
 def optimize_adaptive_portfolio(
     candidates: Sequence[AdaptiveCandidate],
     *,
     budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> AdaptivePortfolioEvaluation:
-    """Allocate and evaluate one 3--5 stock candidate set without side effects.
+    """Allocate and evaluate one policy-valid candidate set without side effects.
 
     The nearest structurally and industry-feasible grid is fixed before risk
     metrics are evaluated.  A risk-budget failure rejects this candidate set;
     no farther grid point is searched as a risk-aware rescue.
     """
 
-    prepared, returns = _prepare_candidates(candidates, budget)
+    prepared, returns = _prepare_candidates(candidates, budget, count_policy=count_policy)
     stock_count = len(prepared)
-    exposure, lower, upper = _position_limits(stock_count, budget)
+    exposure, lower, upper = _position_limits(stock_count, budget, count_policy=count_policy)
     individual_downside = _individual_downside_volatility(returns)
     priorities = np.asarray(
         [
@@ -382,6 +415,7 @@ def optimize_adaptive_portfolio(
         exact_target_weights,
         exposure=exposure,
         industry_cap=budget.industry_weight_limit,
+        count_policy=count_policy,
     )
     return _evaluate_prepared(
         prepared,
@@ -390,6 +424,8 @@ def optimize_adaptive_portfolio(
         individual_downside,
         budget,
         exact_target_weights=exact_target_weights,
+        exposure=exposure,
+        count_policy=count_policy,
     )
 
 
@@ -398,6 +434,7 @@ def evaluate_adaptive_portfolio(
     weights: Mapping[str, float],
     *,
     budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> AdaptivePortfolioEvaluation:
     """Evaluate a caller-supplied continuous target with the same pure risk engine.
 
@@ -409,8 +446,8 @@ def evaluate_adaptive_portfolio(
     operational grid weights rather than the caller's continuous target.
     """
 
-    prepared, returns = _prepare_candidates(candidates, budget)
-    exposure, lower, upper = _position_limits(len(prepared), budget)
+    prepared, returns = _prepare_candidates(candidates, budget, count_policy=count_policy)
+    exposure, lower, upper = _position_limits(len(prepared), budget, count_policy=count_policy)
     ordered = _ordered_total_account_weights(prepared, weights)
     if bool((ordered < lower - 1e-12).any()) or bool((ordered > upper + 1e-12).any()):
         raise AdaptivePortfolioDataError(
@@ -425,6 +462,7 @@ def evaluate_adaptive_portfolio(
         ordered,
         exposure=exposure,
         industry_cap=budget.industry_weight_limit,
+        count_policy=count_policy,
     )
     individual_downside = _individual_downside_volatility(returns)
     return _evaluate_prepared(
@@ -434,6 +472,8 @@ def evaluate_adaptive_portfolio(
         individual_downside,
         budget,
         exact_target_weights=ordered,
+        exposure=exposure,
+        count_policy=count_policy,
     )
 
 
@@ -442,6 +482,7 @@ def evaluate_operational_adaptive_portfolio(
     weights: Mapping[str, float],
     *,
     budget: AdaptiveRiskBudget = DEFAULT_RISK_BUDGET,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> AdaptivePortfolioEvaluation:
     """Validate and directly evaluate caller-supplied operational weights.
 
@@ -452,14 +493,15 @@ def evaluate_operational_adaptive_portfolio(
     another grid point.
     """
 
-    prepared, returns = _prepare_candidates(candidates, budget)
-    exposure = _position_limits(len(prepared), budget)[0]
+    prepared, returns = _prepare_candidates(candidates, budget, count_policy=count_policy)
+    exposure = _position_limits(len(prepared), budget, count_policy=count_policy)[0]
     ordered = _ordered_total_account_weights(prepared, weights)
     _validate_operational_weights(
         prepared,
         ordered,
         exposure=exposure,
         industry_cap=budget.industry_weight_limit,
+        count_policy=count_policy,
     )
     individual_downside = _individual_downside_volatility(returns)
     return _evaluate_prepared(
@@ -471,19 +513,30 @@ def evaluate_operational_adaptive_portfolio(
         exact_target_weights=ordered,
         evaluation_method=DIRECT_OPERATION_METHOD,
         weight_method_version=OPERATIONAL_WEIGHT_VALIDATION_METHOD_VERSION,
+        exposure=exposure,
+        count_policy=count_policy,
     )
 
 
 def _position_limits(
     stock_count: int,
     budget: AdaptiveRiskBudget,
+    *,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> tuple[float, float, float]:
     """Return exposure and a proportionally scaled per-name allocation box."""
 
-    base_exposure, base_lower, base_upper = POSITION_LIMITS[stock_count]
-    if budget.maximum_stock_exposure is None:
-        return base_exposure, base_lower, base_upper
-    exposure = min(base_exposure, budget.maximum_stock_exposure)
+    limits, _sleeve_limits = _count_policy_limits(count_policy)
+    base_exposure, base_lower, base_upper = limits[stock_count]
+    exposure = base_exposure
+    if budget.maximum_stock_exposure is not None:
+        exposure = min(exposure, budget.maximum_stock_exposure)
+    if count_policy == CONTINUOUS_COUNT_POLICY_VERSION:
+        # The continuous search admits at most one name per industry.  Lower
+        # the deployed exposure when the cycle layer's per-industry ceiling is
+        # tighter than the normal count-state ceiling instead of manufacturing
+        # an infeasible portfolio (for example one 15% name under a 10% cap).
+        exposure = min(exposure, budget.industry_weight_limit * stock_count)
     scale = exposure / base_exposure
     return exposure, base_lower * scale, base_upper * scale
 
@@ -522,6 +575,8 @@ def _ordered_total_account_weights(
 def _prepare_candidates(
     candidates: Sequence[AdaptiveCandidate],
     budget: AdaptiveRiskBudget,
+    *,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> tuple[tuple[AdaptiveCandidate, ...], np.ndarray]:
     if not isinstance(budget, AdaptiveRiskBudget):
         raise TypeError("budget must be an AdaptiveRiskBudget")
@@ -531,7 +586,10 @@ def _prepare_candidates(
     if any(not isinstance(item, AdaptiveCandidate) for item in raw_candidates):
         raise AdaptivePortfolioDataError("every candidate must be an AdaptiveCandidate")
     prepared = tuple(sorted(raw_candidates, key=lambda item: item.symbol))
-    if len(prepared) not in POSITION_LIMITS:
+    limits, _sleeve_limits = _count_policy_limits(count_policy)
+    if len(prepared) not in limits:
+        if count_policy == CONTINUOUS_COUNT_POLICY_VERSION:
+            raise AdaptivePortfolioDataError("between one and eight candidates are required")
         raise AdaptivePortfolioDataError("exactly three, four, or five candidates are required")
     symbols = [item.symbol for item in prepared]
     if len(set(symbols)) != len(symbols):
@@ -699,11 +757,13 @@ def _operationalize_weights(
     *,
     exposure: float,
     industry_cap: float,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> np.ndarray:
     """Return the nearest structurally and industry-feasible 10% sleeve grid."""
 
     stock_count = len(candidates)
-    minimum_sleeve, maximum_sleeve = OPERATION_STOCK_SLEEVE_LIMITS[stock_count]
+    _position_limits_by_count, sleeve_limits = _count_policy_limits(count_policy)
+    minimum_sleeve, maximum_sleeve = sleeve_limits[stock_count]
     if not math.isclose(float(exact_target_weights.sum()), exposure, abs_tol=1e-10):
         raise AdaptivePortfolioDataError("continuous target does not preserve stock exposure")
     exact_sleeve = exact_target_weights / exposure
@@ -728,6 +788,7 @@ def _operationalize_weights(
         operational,
         exposure=exposure,
         industry_cap=industry_cap,
+        count_policy=count_policy,
     )
     return operational
 
@@ -738,6 +799,7 @@ def _validate_operational_weights(
     *,
     exposure: float,
     industry_cap: float,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> None:
     """Fail closed unless weights already form the exact operational grid."""
 
@@ -748,7 +810,8 @@ def _validate_operational_weights(
             f"{len(candidates)}-stock operational weights must sum to exposure {exposure:.2f}"
         )
 
-    minimum_sleeve, maximum_sleeve = OPERATION_STOCK_SLEEVE_LIMITS[len(candidates)]
+    _position_limits_by_count, sleeve_limits = _count_policy_limits(count_policy)
+    minimum_sleeve, maximum_sleeve = sleeve_limits[len(candidates)]
     sleeve = weights / exposure
     if not math.isclose(float(sleeve.sum()), 1.0, abs_tol=1e-10):
         raise AdaptivePortfolioDataError("operational stock-sleeve weights must sum to 1.0")
@@ -772,6 +835,12 @@ def _validate_operational_weights(
         )
     if max(industry_totals.values()) > industry_cap + 1e-12:
         raise AdaptivePortfolioDataError("operational weights breached the industry cap")
+    if count_policy == CONTINUOUS_COUNT_POLICY_VERSION and bool(
+        (weights > MAX_NEW_ACCOUNT_WEIGHT + 1e-12).any()
+    ):
+        raise AdaptivePortfolioDataError(
+            "continuous-policy operational position breached the 20% account hard cap"
+        )
 
 
 def _non_overlapping_portfolio_returns(
@@ -877,6 +946,8 @@ def _evaluate_prepared(
     exact_target_weights: np.ndarray,
     evaluation_method: str = CONTINUOUS_TARGET_OPERATION_METHOD,
     weight_method_version: str = WEIGHT_QUANTIZATION_METHOD_VERSION,
+    exposure: float,
+    count_policy: str = LEGACY_COUNT_POLICY_VERSION,
 ) -> AdaptivePortfolioEvaluation:
     portfolio_returns = _fixed_share_daily_returns(returns, weights, budget.holding_period_sessions)
     portfolio_downside = np.minimum(portfolio_returns, 0.0)
@@ -905,11 +976,24 @@ def _evaluate_prepared(
     five_day_tail = five_day_returns[five_day_returns <= five_day_cutoff + 1e-15]
     es95_5d = max(0.0, -float(five_day_tail.mean()))
 
-    max_down_correlation, down_period_count = _down_period_max_correlation(
-        returns, budget.minimum_down_periods
-    )
+    correlation_applicable = len(candidates) > 1
+    if correlation_applicable:
+        max_down_correlation, down_period_count = _down_period_max_correlation(
+            returns, budget.minimum_down_periods
+        )
+    else:
+        down_period_count = int((returns[:, 0] < 0.0).sum())
+        if down_period_count < budget.minimum_down_periods:
+            raise AdaptivePortfolioDataError(
+                f"only {down_period_count} down periods; "
+                f"at least {budget.minimum_down_periods} required"
+            )
+        max_down_correlation = 0.0
     contributions = _downside_risk_contributions(returns, weights)
     max_contribution = float(contributions.max())
+    contribution_applicable = not (
+        count_policy == CONTINUOUS_COUNT_POLICY_VERSION and len(candidates) < 4
+    )
 
     holding_returns = _non_overlapping_portfolio_returns(
         returns, weights, budget.holding_period_sessions
@@ -960,6 +1044,8 @@ def _evaluate_prepared(
         horizon_rolling_drawdown_window_sessions=budget.holding_period_sessions,
         horizon_rolling_drawdown_window_count=len(horizon_drawdown_magnitudes),
         horizon_rolling_max_drawdown_p90=horizon_drawdown_p90,
+        correlation_applicable=correlation_applicable,
+        position_risk_contribution_applicable=contribution_applicable,
     )
     risk_result = _risk_budget_result(metrics, industry_totals, budget)
     positions = tuple(
@@ -973,7 +1059,6 @@ def _evaluate_prepared(
         )
         for index, (candidate, weight) in enumerate(zip(candidates, weights, strict=True))
     )
-    exposure = _position_limits(len(candidates), budget)[0]
     return AdaptivePortfolioEvaluation(
         positions=positions,
         stock_exposure=exposure,
@@ -1011,10 +1096,12 @@ def _risk_budget_result(
         ),
         "es95_5d": metrics.es95_5d <= budget.max_es95_5d + 1e-12,
         "down_period_correlation": (
-            metrics.max_down_period_correlation <= budget.max_down_period_correlation + 1e-12
+            not metrics.correlation_applicable
+            or metrics.max_down_period_correlation <= budget.max_down_period_correlation + 1e-12
         ),
         "position_downside_risk_contribution": (
-            metrics.max_position_downside_risk_contribution
+            not metrics.position_risk_contribution_applicable
+            or metrics.max_position_downside_risk_contribution
             <= budget.max_position_downside_risk_contribution + 1e-12
         ),
         "industry_concentration": (
@@ -1034,4 +1121,6 @@ def _risk_budget_result(
         horizon_rolling_drawdown_passed=checks["horizon_rolling_drawdown_p90"],
         horizon_rolling_drawdown_window_sessions=(metrics.horizon_rolling_drawdown_window_sessions),
         horizon_rolling_drawdown_limit=horizon_drawdown_limit,
+        correlation_applicable=metrics.correlation_applicable,
+        position_risk_contribution_applicable=(metrics.position_risk_contribution_applicable),
     )
