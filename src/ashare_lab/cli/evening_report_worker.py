@@ -1,4 +1,4 @@
-"""Bound one automatic evening attempt without exposing child output or secrets.
+"""Bound one automatic pre-open attempt without exposing child output or secrets.
 
 The report runs in its own process group. Only that group may be terminated;
 kernel-owned data locks are then released. Timeout notices have a separate
@@ -16,14 +16,14 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ashare_lab.bootstrap import application_data_dir
 
-WORKER_TIMEOUT_SECONDS = 12 * 60
+WORKER_TIMEOUT_SECONDS = 8 * 60
 WORKER_TERMINATE_GRACE_SECONDS = 5
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -92,9 +92,9 @@ def notify_incomplete_once(
     """A plain public notice, independent from recommendation deduplication."""
     try:
         plan_state = _read_state(state_root / "evening-digest-state.json")
-        if plan_state.get("plan_for_date") == (
-            now.date() + timedelta(days=1)
-        ).isoformat() and "serverchan" in plan_state.get("accepted_channels", []):
+        if plan_state.get(
+            "plan_for_date"
+        ) == now.date().isoformat() and "serverchan" in plan_state.get("accepted_channels", []):
             return "plan_already_provider_accepted"
         path = state_root / "evening-failure-notice-state.json"
         if _read_state(path).get("accepted_date") == now.date().isoformat():
@@ -103,13 +103,13 @@ def notify_incomplete_once(
 
         accepted = (notifier or _send_serverchan_notice)(
             NotificationMessage(
-                title="A股晚报暂未完成｜暂停新买",
+                title="A股盘前计划暂未完成｜暂停新买",
                 body=(
-                    "今晚研究计划计算或提交尚未完成确认。"
+                    "今日盘前研究计划计算或提交尚未完成确认。"
                     "暂不依据旧报告新买；请以随后完整计划为准。"
                     "本条未确认任何持仓的买卖信号。"
                 ),
-                group="A股研究室·晚间日报",
+                group="A股研究室·盘前计划",
             )
         )
         if accepted is True:
@@ -145,7 +145,7 @@ def supervise_evening_report(
     _clock: Callable[[], datetime] | None = None,
     _notifier: Callable | None = None,
 ) -> tuple[int, dict]:
-    """Run one regular 21:00 attempt with a finite wall-clock lifetime."""
+    """Run one regular 09:00–09:29 attempt with a finite wall-clock lifetime."""
     if not 0 < timeout_seconds <= WORKER_TIMEOUT_SECONDS:
         raise ValueError("worker timeout must be within the automatic attempt budget")
     parser = argparse.ArgumentParser(add_help=False)
@@ -163,8 +163,8 @@ def supervise_evening_report(
         _safe_log(log_root, event)
         return code, event
 
-    if now.weekday() in {4, 5} or now.hour != 21:
-        return finish(0, "noop_outside_evening_window")
+    if now.weekday() in {5, 6} or now.hour != 9 or now.minute >= 30:
+        return finish(0, "noop_outside_preopen_window")
     process = None
     try:
         _safe_log(log_root, {"job": "ashare-evening-worker", "status": "worker_started"})
@@ -183,11 +183,12 @@ def supervise_evening_report(
         except Exception:
             return finish(2, "error", reason="evening_worker_termination_unconfirmed")
         outcome = finish(2, "error", reason="evening_worker_deadline_exceeded")
-        notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
-        _safe_log(
-            log_root,
-            {"job": "ashare-evening-worker", "status": notice, "delivery_confirmed": False},
-        )
+        if now.minute >= 20:
+            notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
+            _safe_log(
+                log_root,
+                {"job": "ashare-evening-worker", "status": notice, "delivery_confirmed": False},
+            )
         return outcome
     except Exception:
         if process is not None:
@@ -196,7 +197,7 @@ def supervise_evening_report(
         return finish(2, "error", reason="evening_worker_start_or_wait_failed")
     if code == 0:
         return finish(0, "worker_completed")
-    if code != 0:
+    if code != 0 and now.minute >= 20:
         notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
         _safe_log(
             log_root,

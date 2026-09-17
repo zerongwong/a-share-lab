@@ -506,6 +506,67 @@ def test_upstream_error_text_is_sanitized_in_report_and_all_components_close(
     assert TOKEN not in repr(report)
     assert TOKEN not in report.quarantined_failures[0].reason
     assert "原始错误已脱敏" in report.quarantined_failures[0].reason
+    failure_result = report.range_report.results[0]
+    assert failure_result.failure_stage == "stock_daily"
+    assert failure_result.failure_provider == "tushare_daily"
+    assert failure_result.failure_status == "unavailable"
+    assert failure_result.reason_code == "stock_daily_unavailable"
+    assert all(component.close_calls == 1 for component in created.values())
+    _assert_secret_absent_from_tree(tmp_path / "overlay")
+
+
+def test_stock_master_failure_becomes_structured_incomplete_report_not_entrypoint_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_baseline(monkeypatch)
+    created: dict[str, CloseableComponent] = {}
+
+    def component_factory(name: str):
+        def factory(*_args: object, **_kwargs: object) -> CloseableComponent:
+            value = CloseableComponent(name)
+            created[name] = value
+            return value
+
+        return factory
+
+    class FailingStockMasterProvider(FakeCompositeProvider):
+        def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+            raise DataUnavailableError(f"all metadata failed token={TOKEN}")
+
+    def provider_factory(**_kwargs: object) -> FailingStockMasterProvider:
+        value = FailingStockMasterProvider()
+        created["provider"] = value
+        return value
+
+    report = update_module.run_zero_budget_daily_update(
+        csmar_root=tmp_path / "csmar",
+        overlay_root=tmp_path / "overlay",
+        now=NOW,
+        core_index_symbols=CORE_INDICES,
+        _token_loader=lambda: TOKEN,
+        _baostock_factory=component_factory("baostock"),
+        _tushare_factory=component_factory("tushare"),
+        _verifier_factory=component_factory("verifier"),
+        _provider_factory=provider_factory,
+        _rights_policy=RecordingRightsPolicy(),
+    )
+
+    assert report.current_through_latest_complete_session is False
+    assert report.common_cutoff == BASELINE
+    assert report.latest_complete_session == DAY_26
+    assert len(report.quarantined_failures) == 1
+    failure = report.quarantined_failures[0]
+    assert failure.trade_date == DAY_25
+    assert failure.path is None
+    assert "reason_code=stock_master_unavailable" in failure.reason
+    assert "provider=free_stock_master_chain" in failure.reason
+    assert TOKEN not in failure.reason
+    result = report.range_report.results[0]
+    assert result.failure_stage == "stock_master"
+    assert result.failure_provider == "free_stock_master_chain"
+    assert result.failure_status == "unavailable"
+    assert result.reason_code == "stock_master_unavailable"
     assert all(component.close_calls == 1 for component in created.values())
     _assert_secret_absent_from_tree(tmp_path / "overlay")
 

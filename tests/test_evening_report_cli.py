@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
-from ashare_lab.cli import evening_report
+from ashare_lab.cli import evening_report, scheduled_sync
 from ashare_lab.cli.evening_digest import _message_for_channel
 from ashare_lab.domain.errors import NotificationDeliveryError
 from ashare_lab.ports.notifications import NotificationReceipt
@@ -62,7 +62,7 @@ def _paths(tmp_path: Path) -> dict[str, object]:
         "reference_root": tmp_path / "reference",
         "state_root": tmp_path / "state",
         "log_root": tmp_path / "logs",
-        "_clock": lambda: datetime.now(UTC).replace(hour=13, minute=0, second=0),
+        "_clock": lambda: datetime(2026, 8, 28, 1, 0, tzinfo=UTC),
     }
 
 
@@ -630,16 +630,20 @@ def test_image_rejected_after_text_acceptance_is_revoked_and_republished_with_ne
     assert "六期限计划" not in messages[1].body
 
 
-def test_evening_window_and_plan_date_block_daytime_past_and_non_eve_reports(tmp_path):
-    for hour in (12, 22, 23):
-        options = _paths(tmp_path / str(hour))
-        options["_clock"] = lambda hour=hour: datetime(2026, 8, 27, hour - 8, tzinfo=UTC)
+def test_morning_window_and_plan_date_block_daytime_and_non_report_runs(tmp_path):
+    for label, instant in (
+        ("07", datetime(2026, 8, 27, 23, tzinfo=UTC)),
+        ("12", datetime(2026, 8, 28, 4, tzinfo=UTC)),
+        ("22", datetime(2026, 8, 28, 14, tzinfo=UTC)),
+    ):
+        options = _paths(tmp_path / label)
+        options["_clock"] = lambda instant=instant: instant
         result = evening_report.run_evening_digest(
             **options,
             decision_date=CUTOFF,
             _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not send")),
         )
-        assert result.event["status"] == "noop_outside_evening_window"
+        assert result.event["status"] == "noop_outside_morning_window"
     result = evening_report.run_evening_digest(
         **_paths(tmp_path / "past"),
         decision_date=date(2026, 8, 31),
@@ -649,14 +653,14 @@ def test_evening_window_and_plan_date_block_daytime_past_and_non_eve_reports(tmp
         _notifier=lambda _message: (_ for _ in ()).throw(AssertionError("must not send")),
     )
     assert result.event["status"] == "error"
-    assert result.event["reason"] == "verified_market_data_stale_for_tomorrow"
+    assert result.event["reason"] == "decision_date_not_latest_verified_cutoff"
 
 
-@pytest.mark.parametrize("hour", [20, 22, 23])
-def test_manual_evening_send_preserves_next_session_date_and_deduplication(tmp_path, hour):
+@pytest.mark.parametrize("hour", [8, 9])
+def test_manual_preopen_send_preserves_session_date_and_deduplication(tmp_path, hour):
     messages = []
     options = _paths(tmp_path)
-    options["_clock"] = lambda: datetime(2026, 8, 27, hour - 8, tzinfo=UTC)
+    options["_clock"] = lambda: datetime(2026, 8, 28, hour - 8, tzinfo=UTC)
     options.update(
         send_now=True,
         _latest_cutoff=lambda _root: CUTOFF,
@@ -696,12 +700,12 @@ def test_manual_send_rejects_daytime_midnight_and_historical_decision_dates(
         _notifier=lambda _message: pytest.fail("invalid manual time must not send"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
-    assert outcome.event["reason"] == "manual_send_requires_current_evening_after_20"
+    assert outcome.event["reason"] == "manual_send_requires_current_preopen_window"
 
 
-def test_manual_send_never_relabels_stale_data_as_tomorrows_plan(tmp_path):
+def test_manual_send_never_relabels_stale_data_as_todays_plan(tmp_path):
     options = _paths(tmp_path)
-    options["_clock"] = lambda: datetime(2026, 8, 31, 14, tzinfo=UTC)
+    options["_clock"] = lambda: datetime(2026, 8, 31, 1, tzinfo=UTC)
     outcome = evening_report.run_evening_digest(
         **options,
         send_now=True,
@@ -713,14 +717,13 @@ def test_manual_send_never_relabels_stale_data_as_tomorrows_plan(tmp_path):
         _notifier=lambda _message: pytest.fail("stale plan must not send"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
-    assert outcome.event["reason"] == "verified_market_data_stale_for_tomorrow"
+    assert outcome.event["reason"] == "verified_market_data_stale_for_today"
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
 
 
 def test_future_verified_cutoff_fails_closed_before_calendar_or_build(tmp_path):
     outcome = evening_report.run_evening_digest(
         **_paths(tmp_path),
-        decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF + timedelta(days=1),
         _next_trading_day=lambda _cutoff: pytest.fail("future cutoff must stop before calendar"),
         _build_digest=lambda **_kwargs: pytest.fail("future cutoff must stop before build"),
@@ -728,19 +731,42 @@ def test_future_verified_cutoff_fails_closed_before_calendar_or_build(tmp_path):
     )
 
     assert outcome.exit_code == evening_report.EXIT_ERROR
-    assert outcome.event["reason"] == "verified_market_data_cutoff_after_decision_date"
+    assert outcome.event["reason"] == "verified_market_data_cutoff_not_prior_session"
+
+
+def test_weekday_without_calendar_session_is_noop_not_an_invented_plan(tmp_path):
+    next_verified_session = date(2026, 8, 31)
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: next_verified_session,
+        _build_digest=lambda **_kwargs: pytest.fail("a weekday holiday must not build"),
+        _notifier=lambda _message: pytest.fail("a weekday holiday must not send"),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert outcome.event == {
+        "job": "ashare-evening-digest",
+        "status": "noop_not_trading_day",
+        "common_cutoff": CUTOFF.isoformat(),
+        "plan_for_date": next_verified_session.isoformat(),
+    }
 
 
 @pytest.mark.parametrize(
     ("send_now", "end_time"),
     [
-        (False, datetime(2026, 8, 27, 14, tzinfo=UTC)),
-        (False, datetime(2026, 8, 27, 17, 25, tzinfo=UTC)),
-        (True, datetime(2026, 8, 27, 17, 25, tzinfo=UTC)),
+        (False, datetime(2026, 8, 28, 1, 30, tzinfo=UTC)),
+        (False, datetime(2026, 8, 28, 2, 0, tzinfo=UTC)),
+        (True, datetime(2026, 8, 28, 1, 30, tzinfo=UTC)),
     ],
 )
 def test_long_build_crossing_submission_window_is_a_visible_failure(tmp_path, send_now, end_time):
-    current = [datetime(2026, 8, 27, 13, tzinfo=UTC)]
+    current = [
+        datetime(2026, 8, 28, 0, 30, tzinfo=UTC)
+        if send_now
+        else datetime(2026, 8, 28, 1, 0, tzinfo=UTC)
+    ]
     options = _paths(tmp_path)
     options["_clock"] = lambda: current[0]
 
@@ -757,7 +783,7 @@ def test_long_build_crossing_submission_window_is_a_visible_failure(tmp_path, se
         _notifier=lambda _message: pytest.fail("expired plan must not send"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
-    assert outcome.event["reason"] == "evening_window_ended_before_submission"
+    assert outcome.event["reason"] == "morning_window_ended_before_submission"
     logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text())
     assert logged["exit_code"] == evening_report.EXIT_ERROR
     assert logged["status"] == "error"
@@ -798,12 +824,12 @@ def test_default_text_only_ignores_old_chart_grants_and_pending_image_retry(tmp_
 
 
 def test_window_is_checked_again_after_archiving_before_actual_send(tmp_path):
-    current = [datetime(2026, 8, 27, 13, tzinfo=UTC)]
+    current = [datetime(2026, 8, 28, 1, tzinfo=UTC)]
     options = _paths(tmp_path)
     options["_clock"] = lambda: current[0]
 
     def archive(*_args):
-        current[0] = datetime(2026, 8, 27, 14, tzinfo=UTC)
+        current[0] = datetime(2026, 8, 28, 1, 30, tzinfo=UTC)
         return SimpleNamespace(report_id="synthetic-expired-report")
 
     outcome = evening_report.run_evening_digest(
@@ -815,7 +841,7 @@ def test_window_is_checked_again_after_archiving_before_actual_send(tmp_path):
         _notifier=lambda _message: pytest.fail("late submission must not reach provider"),
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
-    assert outcome.event["reason"] == "evening_window_ended_before_submission"
+    assert outcome.event["reason"] == "morning_window_ended_before_submission"
     assert outcome.event["plan_for_date"] == FRIDAY.isoformat()
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
 
@@ -1809,7 +1835,7 @@ def test_oversize_body_without_compact_fails_closed_for_bark_only(monkeypatch) -
     assert summary.failed_channels == ("bark",)
 
 
-def test_friday_and_saturday_are_hard_noop_before_state_or_data_reads(
+def test_saturday_and_sunday_are_hard_noop_before_state_or_data_reads(
     tmp_path: Path, monkeypatch
 ) -> None:
     from ashare_lab.cli import evening_digest
@@ -1830,10 +1856,16 @@ def test_friday_and_saturday_are_hard_noop_before_state_or_data_reads(
         ),
     )
 
-    for blocked_date in (FRIDAY, SATURDAY):
+    for blocked_date in (SATURDAY, SUNDAY):
+        blocked_paths = dict(paths)
+        blocked_paths["_clock"] = lambda blocked_date=blocked_date: datetime.combine(
+            blocked_date,
+            datetime.min.time(),
+            tzinfo=UTC,
+        ).replace(hour=1)
         outcome = evening_report.run_evening_digest(
-            **paths,
-            decision_date=blocked_date,
+            **blocked_paths,
+            decision_date=CUTOFF,
             _latest_cutoff=lambda _root: (_ for _ in ()).throw(
                 AssertionError("weekend NOOP must not inspect market data")
             ),
@@ -1848,7 +1880,7 @@ def test_friday_and_saturday_are_hard_noop_before_state_or_data_reads(
         assert outcome.exit_code == evening_report.EXIT_OK
         assert outcome.event == {
             "job": "ashare-evening-digest",
-            "status": "noop_weekend_send_window_closed",
+            "status": "noop_weekend_report_window_closed",
         }
         assert json.loads(state_path.read_text(encoding="utf-8")) == original_state
 
@@ -1859,14 +1891,15 @@ def test_friday_and_saturday_are_hard_noop_before_state_or_data_reads(
         .splitlines()
     ]
     assert [entry["status"] for entry in entries] == [
-        "noop_weekend_send_window_closed",
-        "noop_weekend_send_window_closed",
+        "noop_weekend_report_window_closed",
+        "noop_weekend_report_window_closed",
     ]
     assert all(entry["exit_code"] == evening_report.EXIT_OK for entry in entries)
 
 
-def test_sunday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Path) -> None:
+def test_monday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
+    paths["_clock"] = lambda: datetime(2026, 8, 31, 1, tzinfo=UTC)
     state_path = paths["state_root"] / "evening-digest-state.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_text(
@@ -1881,7 +1914,7 @@ def test_sunday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Pat
 
     outcome = evening_report.run_evening_digest(
         **paths,
-        decision_date=SUNDAY,
+        decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
         _build_digest=lambda **_kwargs: _digest(),
         _next_trading_day=lambda _cutoff: FRIDAY,
@@ -1892,7 +1925,7 @@ def test_sunday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Pat
 
     assert outcome.exit_code == evening_report.EXIT_ERROR
     assert outcome.event["status"] == "error"
-    assert outcome.event["reason"] == "verified_market_data_stale_for_tomorrow"
+    assert outcome.event["reason"] == "verified_market_data_stale_for_today"
 
 
 def test_busy_lock_is_logged_without_building_or_sending(tmp_path: Path) -> None:
@@ -1920,6 +1953,33 @@ def test_busy_lock_is_logged_without_building_or_sending(tmp_path: Path) -> None
     logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8"))
     assert logged["status"] == "already_running"
     assert logged["reason"] == "daily_data_lock_busy"
+
+
+def test_0850_sync_deferral_leaves_0900_report_lock_available(tmp_path: Path) -> None:
+    deferred = scheduled_sync.run_scheduled_sync(
+        csmar_root=tmp_path / "csmar",
+        overlay_root=tmp_path / "overlay",
+        scheduler_root=tmp_path / "state",
+        log_root=tmp_path / "logs",
+        clock=lambda: datetime(2026, 8, 28, 0, 50, tzinfo=UTC),
+        _run_update=lambda **_kwargs: pytest.fail(
+            "a delayed morning sync must defer before provider work"
+        ),
+    )
+    assert deferred.event["status"] == "deferred_for_morning_report"
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _notifier=lambda _message: _accepted_summary(),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert outcome.event["status"] == "provider_accepted"
+    assert outcome.event["plan_for_date"] == FRIDAY.isoformat()
 
 
 def test_unexpected_failure_never_copies_exception_or_secret(tmp_path: Path) -> None:

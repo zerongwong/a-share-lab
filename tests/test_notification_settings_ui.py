@@ -36,6 +36,7 @@ def test_notification_page_keeps_credentials_masked_and_local() -> None:
     assert "存储桶必须保持私有" in source
     assert "1日自动删除" in source
     assert "两项都未确认时，晚报会自动退回纯文字" in source
+    assert "交易日上午09:00盘前报告" in source
     assert "R2对象目录（固定）" in source
     assert "对象目录固定为holding-charts" in source
     assert "持仓文字摘要授权 ≠ 持仓K线图授权" in source

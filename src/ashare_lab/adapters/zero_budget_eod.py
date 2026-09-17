@@ -35,6 +35,13 @@ _CN_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _CN_CLOSE = time(15, 0)
 _STOCK_SYMBOL = re.compile(r"^(?P<code>\d{6})\.(?P<exchange>SH|SZ)$")
 _TRACE_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+_SAFE_STOCK_MASTER_CONSENSUS = re.compile(
+    r"^证券主表共识未通过（reason=[a-z0-9_]+;"
+    r"available=(?:none|(?:baostock|official_exchange|tushare)"
+    r"(?:,(?:baostock|official_exchange|tushare))*);"
+    r"unavailable=(?:none|(?:baostock|official_exchange|tushare)"
+    r"(?:,(?:baostock|official_exchange|tushare))*)）。$"
+)
 
 
 class ZeroBudgetEodMarketData:
@@ -71,8 +78,8 @@ class ZeroBudgetEodMarketData:
             raise TypeError("start and end must be date values")
         if start > end:
             raise ValueError("start cannot be after end")
-        method = _required_method(self._baostock, "fetch_cn_trading_days", "BaoStock交易日历")
-        raw = _dependency_call("BaoStock交易日历", lambda: method(start, end))
+        method = _required_method(self._baostock, "fetch_cn_trading_days", "免费交易日历")
+        raw = _dependency_call("免费交易日历", lambda: method(start, end))
         if not isinstance(raw, tuple) or any(not _exact_date(value) for value in raw):
             raise DataQualityError("BaoStock交易日历没有返回严格的date元组。")
         if len(raw) != len(set(raw)) or tuple(sorted(raw)) != raw:
@@ -82,9 +89,9 @@ class ZeroBudgetEodMarketData:
         return raw
 
     def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
-        method = _required_method(self._baostock, "fetch_cn_stock_symbols", "BaoStock股票清单")
-        raw = _dependency_call("BaoStock股票清单", method)
-        return _normalize_stock_symbols(raw, label="BaoStock股票清单", sort=True)
+        method = _required_method(self._baostock, "fetch_cn_stock_symbols", "免费证券主表")
+        raw = _dependency_call("免费证券主表", method)
+        return _normalize_stock_symbols(raw, label="免费证券主表", sort=True)
 
     def fetch_daily_increment(
         self,
@@ -173,11 +180,11 @@ class ZeroBudgetEodMarketData:
             raise DataQualityError("零预算组合只接受已验证的六核心指数集合。")
         cutoff = _resolve_cutoff_timestamp(target_date, cutoff_timestamp)
         batch = _dependency_call(
-            "BaoStock核心指数",
+            "免费核心指数",
             lambda: _required_method(
                 self._baostock,
                 "fetch_core_index_daily",
-                "BaoStock核心指数",
+                "免费核心指数",
             )(target_date, cutoff_timestamp=cutoff),
         )
         if not isinstance(batch, DailyIncrementBatch):
@@ -389,9 +396,13 @@ def _required_method(component: object, name: str, label: str) -> Callable[..., 
 def _dependency_call[T](label: str, operation: Callable[[], T]) -> T:
     try:
         return operation()
-    except DataQualityError:
+    except DataQualityError as exc:
+        if _SAFE_STOCK_MASTER_CONSENSUS.fullmatch(str(exc)):
+            raise DataQualityError(str(exc)) from None
         raise DataQualityError(f"{label}质量校验失败，原始错误已脱敏。") from None
-    except DataUnavailableError:
+    except DataUnavailableError as exc:
+        if _SAFE_STOCK_MASTER_CONSENSUS.fullmatch(str(exc)):
+            raise DataUnavailableError(str(exc)) from None
         raise DataUnavailableError(f"{label}不可用，原始错误已脱敏。") from None
     except Exception:
         raise DataUnavailableError(f"{label}调用失败，原始错误已脱敏。") from None

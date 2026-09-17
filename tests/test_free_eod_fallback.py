@@ -96,9 +96,18 @@ def test_stock_master_reports_all_free_sources_unavailable_without_falling_throu
         adapter = FreeEodMetadataFallback(
             primary(), backup(), stock_master_backup=unavailable_official(), client=client
         )
-        with pytest.raises(DataUnavailableError, match="所有免费来源") as caught:
+        with pytest.raises(
+            DataUnavailableError, match="reason=all_configured_sources_unavailable"
+        ) as caught:
             adapter.fetch_cn_stock_symbols()
     assert "private upstream" not in str(caught.value)
+    assert adapter.metadata_diagnostics["fetch_cn_stock_symbols"] == {
+        "version": "stock-master-consensus-v2",
+        "status": "unavailable",
+        "reason": "all_configured_sources_unavailable",
+        "available_sources": (),
+        "unavailable_sources": ("baostock", "official_exchange"),
+    }
 
 
 def complete_stock_master() -> tuple[str, ...]:
@@ -123,10 +132,12 @@ class StaticStockMaster:
         return self.value
 
 
-def completeness_adapter(primary_master, official_master, *, expected=None):
+def completeness_adapter(primary_master, official_master, *, expected=None, metadata_master=None):
+    if metadata_master is None:
+        metadata_master = StaticStockMaster(error=DataUnavailableError)
     return FreeEodMetadataFallback(
         primary_master,
-        backup(),
+        metadata_master,
         stock_master_backup=official_master,
         expected_stock_symbols=expected,
         require_stock_master_completeness_evidence=True,
@@ -134,21 +145,27 @@ def completeness_adapter(primary_master, official_master, *, expected=None):
     )
 
 
-def test_well_formed_baostock_truncation_is_rejected_against_current_official_master():
+def test_bounded_one_source_timing_lag_is_resolved_by_two_of_three_vote():
     complete = complete_stock_master()
-    truncated = complete[:-1]
-    baostock = StaticStockMaster(truncated)
+    lagging = complete[:-1]
+    baostock = StaticStockMaster(lagging)
     official = StaticStockMaster(complete)
     adapter = completeness_adapter(baostock, official, expected=complete)
 
-    with pytest.raises(DataQualityError, match="不一致"):
-        adapter.fetch_cn_stock_symbols()
+    assert adapter.fetch_cn_stock_symbols() == complete
 
     assert baostock.calls == official.calls == 1
-    assert "fetch_cn_stock_symbols" not in adapter.metadata_sources
+    assert adapter.metadata_diagnostics["fetch_cn_stock_symbols"]["decision"] == (
+        "membership_vote_two_of_three"
+    )
+    assert adapter.metadata_diagnostics["fetch_cn_stock_symbols"]["pairwise_drift"] == {
+        "baostock__official_exchange": 1,
+        "baostock__last_verified": 1,
+        "official_exchange__last_verified": 0,
+    }
 
 
-def test_quality_mismatch_does_not_switch_to_the_official_result():
+def test_anchor_breaks_a_bounded_current_source_membership_tie_deterministically():
     complete = complete_stock_master()
     candidate = tuple(sorted((*complete[:-1], "603000.SH")))
     adapter = completeness_adapter(
@@ -157,8 +174,8 @@ def test_quality_mismatch_does_not_switch_to_the_official_result():
         expected=complete,
     )
 
-    with pytest.raises(DataQualityError):
-        adapter.fetch_cn_stock_symbols()
+    assert adapter.fetch_cn_stock_symbols() == complete
+    assert "private" not in adapter.metadata_sources["fetch_cn_stock_symbols"]
 
 
 def test_recent_anchor_can_cover_temporary_official_unavailability_without_allowing_shrink():
@@ -167,8 +184,13 @@ def test_recent_anchor_can_cover_temporary_official_unavailability_without_allow
     accepted = completeness_adapter(StaticStockMaster(complete), official, expected=complete)
 
     assert accepted.fetch_cn_stock_symbols() == complete
-    assert accepted.metadata_sources["fetch_cn_stock_symbols"] == (
-        "baostock:checked_against_last_verified_master"
+    assert (
+        "decision=unanimous_current_and_anchor"
+        in accepted.metadata_sources["fetch_cn_stock_symbols"]
+    )
+    assert accepted.metadata_diagnostics["fetch_cn_stock_symbols"]["unavailable_sources"] == (
+        "official_exchange",
+        "tushare",
     )
 
     rejected = completeness_adapter(
@@ -176,7 +198,7 @@ def test_recent_anchor_can_cover_temporary_official_unavailability_without_allow
         StaticStockMaster(error=DataUnavailableError),
         expected=complete,
     )
-    with pytest.raises(DataQualityError, match="未经独立确认的缩减"):
+    with pytest.raises(DataUnavailableError, match="single_current_source_ambiguous"):
         rejected.fetch_cn_stock_symbols()
 
 
@@ -186,12 +208,10 @@ def test_first_master_requires_exact_baostock_and_official_agreement():
     adapter = completeness_adapter(StaticStockMaster(complete), official)
 
     assert adapter.fetch_cn_stock_symbols() == complete
-    assert adapter.metadata_sources["fetch_cn_stock_symbols"] == (
-        "baostock:crosschecked:synthetic-independent-evidence"
-    )
+    assert "decision=unanimous_two_current" in adapter.metadata_sources["fetch_cn_stock_symbols"]
 
     mismatch = completeness_adapter(StaticStockMaster(complete[:-1]), StaticStockMaster(complete))
-    with pytest.raises(DataQualityError, match="不一致"):
+    with pytest.raises(DataUnavailableError, match="initial_current_sources_ambiguous"):
         mismatch.fetch_cn_stock_symbols()
 
 
@@ -199,10 +219,10 @@ def test_first_master_never_publishes_a_single_official_list():
     official = StaticStockMaster(complete_stock_master())
     adapter = completeness_adapter(StaticStockMaster(error=DataUnavailableError), official)
 
-    with pytest.raises(DataUnavailableError, match="单一官方名单"):
+    with pytest.raises(DataUnavailableError, match="initial_sync_needs_two_current_sources"):
         adapter.fetch_cn_stock_symbols()
 
-    assert official.calls == 0
+    assert official.calls == 1
 
 
 def test_official_quality_failure_is_not_downgraded_to_anchor_only_success():
@@ -213,8 +233,9 @@ def test_official_quality_failure_is_not_downgraded_to_anchor_only_success():
         expected=complete,
     )
 
-    with pytest.raises(DataQualityError, match="private provider details"):
+    with pytest.raises(DataQualityError, match="official_exchange_quality_failure") as caught:
         adapter.fetch_cn_stock_symbols()
+    assert "private provider details" not in str(caught.value)
 
 
 def test_two_current_sources_can_confirm_a_small_real_membership_change():
@@ -227,11 +248,84 @@ def test_two_current_sources_can_confirm_a_small_real_membership_change():
     assert adapter.fetch_cn_stock_symbols() == current
 
 
+def test_tushare_replaces_unavailable_baostock_in_three_evidence_vote():
+    old = complete_stock_master()
+    current = tuple(sorted((*old[:-1], "603000.SH")))
+    baostock = StaticStockMaster(error=DataUnavailableError)
+    official = StaticStockMaster(current)
+    tushare = StaticStockMaster(current)
+    adapter = completeness_adapter(
+        baostock,
+        official,
+        expected=old,
+        metadata_master=tushare,
+    )
+
+    assert adapter.fetch_cn_stock_symbols() == current
+    diagnostic = adapter.metadata_diagnostics["fetch_cn_stock_symbols"]
+    assert diagnostic["decision"] == "membership_vote_two_of_three"
+    assert diagnostic["available_sources"] == ("official_exchange", "tushare")
+    assert diagnostic["unavailable_sources"] == ("baostock",)
+    assert baostock.calls == official.calls == tushare.calls == 1
+
+
+def test_large_drift_is_rejected_even_when_other_evidence_could_outvote_it():
+    complete = complete_stock_master()
+    drifted = tuple(
+        sorted((*complete[100:], *(f"{603_000 + value:06d}.SH" for value in range(100))))
+    )
+    adapter = completeness_adapter(
+        StaticStockMaster(drifted),
+        StaticStockMaster(complete),
+        expected=complete,
+    )
+
+    with pytest.raises(DataQualityError, match="baostock_large_drift") as caught:
+        adapter.fetch_cn_stock_symbols()
+
+    assert "603000.SH" not in str(caught.value)
+    assert adapter.metadata_diagnostics["fetch_cn_stock_symbols"]["status"] == ("quality_rejected")
+
+
+def test_two_individually_bounded_but_mutually_divergent_sources_are_rejected():
+    complete = complete_stock_master()
+    first = tuple(sorted((*complete[25:], *(f"{603_000 + value:06d}.SH" for value in range(25)))))
+    second = tuple(sorted((*complete[:-25], *(f"{603_100 + value:06d}.SH" for value in range(25)))))
+    adapter = completeness_adapter(
+        StaticStockMaster(first),
+        StaticStockMaster(second),
+        expected=complete,
+    )
+
+    with pytest.raises(DataQualityError, match="current_sources_large_drift"):
+        adapter.fetch_cn_stock_symbols()
+
+
+def test_primary_quality_failure_is_sanitized_and_never_falls_through():
+    complete = complete_stock_master()
+    baostock = StaticStockMaster(error=DataQualityError)
+    official = StaticStockMaster(complete)
+    tushare = StaticStockMaster(complete)
+    adapter = completeness_adapter(
+        baostock,
+        official,
+        expected=complete,
+        metadata_master=tushare,
+    )
+
+    with pytest.raises(DataQualityError, match="baostock_quality_failure") as caught:
+        adapter.fetch_cn_stock_symbols()
+
+    assert "private provider details" not in str(caught.value)
+    assert baostock.calls == 1
+    assert official.calls == tushare.calls == 0
+
+
 def test_two_matching_but_obviously_short_lists_are_not_complete_evidence():
     short = complete_stock_master()[:4_999]
     adapter = completeness_adapter(StaticStockMaster(short), StaticStockMaster(short))
 
-    with pytest.raises(DataQualityError, match="数量不足"):
+    with pytest.raises(DataQualityError, match="baostock_truncated_or_invalid"):
         adapter.fetch_cn_stock_symbols()
 
 

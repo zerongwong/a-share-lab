@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections import Counter
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -65,20 +66,22 @@ def _require_bounded_stock_master_drift(candidate, reference):
     return candidate_symbols, reference_symbols
 
 
-def _require_exact_stock_master_agreement(candidate, reference):
-    candidate_symbols = _validated_stock_master(candidate)
-    reference_symbols = _validated_stock_master(reference)
-    _require_current_master_size(candidate_symbols, reference_symbols)
-    if candidate_symbols != reference_symbols:
-        raise DataQualityError("BaoStock与交易所当前证券主表不一致，禁止发布。")
-    return candidate_symbols
-
-
-def _require_no_uncorroborated_contraction(candidate, reference):
+def _stock_master_drift(candidate, reference):
     candidate_symbols, reference_symbols = _require_bounded_stock_master_drift(candidate, reference)
-    if set(reference_symbols) - set(candidate_symbols):
-        raise DataQualityError("证券主表相对最近已验证名单出现未经独立确认的缩减。")
-    return candidate_symbols
+    return len(set(candidate_symbols).symmetric_difference(reference_symbols))
+
+
+def _stock_master_consensus(*masters):
+    """Return the deterministic per-symbol two-of-three membership vote."""
+
+    if len(masters) != 3:
+        raise ValueError("stock-master consensus requires exactly three evidence sets")
+    normalized = tuple(_validated_stock_master(master) for master in masters)
+    _require_current_master_size(*normalized)
+    votes = Counter(symbol for master in normalized for symbol in master)
+    result = tuple(sorted(symbol for symbol, count in votes.items() if count >= 2))
+    _require_current_master_size(result)
+    return result
 
 
 class FreeEodMetadataFallback:
@@ -109,6 +112,7 @@ class FreeEodMetadataFallback:
         self.client = client or httpx.Client(timeout=10.0, follow_redirects=False)
         self.owns_client = client is None
         self.metadata_sources = {}
+        self.metadata_diagnostics = {}
 
     def close(self):
         if self.owns_client:
@@ -128,61 +132,203 @@ class FreeEodMetadataFallback:
         return self._metadata("fetch_cn_trading_days", start, end)
 
     def fetch_cn_stock_symbols(self):
+        if self.require_stock_master_completeness_evidence:
+            result, source, diagnostic = self._consensus_stock_master()
+            self.metadata_sources["fetch_cn_stock_symbols"] = source
+            self.metadata_diagnostics["fetch_cn_stock_symbols"] = diagnostic
+            return result
         try:
             result = self.primary.fetch_cn_stock_symbols()
         except DataUnavailableError:
-            result, source = self._stock_master_after_primary_unavailable()
+            try:
+                result = self.stock_master_backup.fetch_cn_stock_symbols()
+            except DataUnavailableError:
+                diagnostic = self._failed_stock_master_diagnostic(
+                    status="unavailable",
+                    reason="all_configured_sources_unavailable",
+                    live={},
+                    unavailable=("baostock", self._stock_master_role_name()),
+                )
+                self.metadata_diagnostics["fetch_cn_stock_symbols"] = diagnostic
+                raise DataUnavailableError(self._stock_master_failure_text(diagnostic)) from None
+            source = self._stock_master_source_name()
         else:
-            result, source = self._validated_primary_stock_master(result)
+            source = "baostock"
         self.metadata_sources["fetch_cn_stock_symbols"] = source
         return result
 
-    def _stock_master_after_primary_unavailable(self):
-        if self.require_stock_master_completeness_evidence and self.expected_stock_symbols is None:
-            raise DataUnavailableError(
-                "首次证券主表同步缺少历史锚点，且BaoStock不可用；禁止用单一官方名单发布。"
-            ) from None
-        try:
-            result = self.stock_master_backup.fetch_cn_stock_symbols()
-        except DataUnavailableError:
-            raise DataUnavailableError("证券主表所有免费来源均不可用。") from None
-        if self.require_stock_master_completeness_evidence:
-            # With BaoStock unavailable, the current official list still needs
-            # the recent verified anchor.  Any contraction is ambiguous between
-            # a real delisting and a truncated response, so fail closed until a
-            # second current source can corroborate it.
-            result = _require_no_uncorroborated_contraction(result, self.expected_stock_symbols)
-        if self.stock_master_backup is self.backup:
-            source = "tushare"
+    def _consensus_stock_master(self):
+        """Resolve bounded source timing differences without hiding corruption.
+
+        BaoStock and the official exchange reader are the two preferred current
+        sources.  Tushare metadata fills a missing current-source slot only; the
+        most recent verified master is the third vote.  Thus a transient source
+        outage or a one-source listing-date lag cannot silently shrink or expand
+        the research universe.
+        """
+
+        live = {}
+        unavailable = []
+        self._read_stock_master_evidence("baostock", self.primary, live, unavailable)
+        official_role = (
+            "tushare" if self.stock_master_backup is self.backup else "official_exchange"
+        )
+        if self.stock_master_backup is not self.primary:
+            self._read_stock_master_evidence(
+                official_role, self.stock_master_backup, live, unavailable
+            )
+        if (
+            len(live) < 2
+            and self.backup is not self.primary
+            and self.backup is not self.stock_master_backup
+        ):
+            self._read_stock_master_evidence("tushare", self.backup, live, unavailable)
+
+        anchor = self.expected_stock_symbols
+        if anchor is not None:
+            try:
+                _require_current_master_size(anchor)
+            except DataQualityError:
+                self._raise_stock_master_quality(
+                    "last_verified_master_truncated", live, unavailable
+                )
+            for role, master in live.items():
+                try:
+                    _require_bounded_stock_master_drift(master, anchor)
+                except DataQualityError:
+                    self._raise_stock_master_quality(f"{role}_large_drift", live, unavailable)
+
+        roles = tuple(live)
+        if anchor is None:
+            if len(roles) < 2:
+                self._raise_stock_master_unavailable(
+                    "initial_sync_needs_two_current_sources", live, unavailable
+                )
+            first, second = (live[roles[0]], live[roles[1]])
+            try:
+                drift = _stock_master_drift(first, second)
+            except DataQualityError:
+                self._raise_stock_master_quality(
+                    "initial_current_sources_large_drift", live, unavailable
+                )
+            if first != second:
+                self._raise_stock_master_unavailable(
+                    "initial_current_sources_ambiguous", live, unavailable
+                )
+            result = first
+            decision = "unanimous_two_current"
+            pairwise_drift = {f"{roles[0]}__{roles[1]}": drift}
+        elif len(roles) >= 2:
+            first_role, second_role = roles[:2]
+            first, second = live[first_role], live[second_role]
+            try:
+                current_drift = _stock_master_drift(first, second)
+            except DataQualityError:
+                self._raise_stock_master_quality("current_sources_large_drift", live, unavailable)
+            result = _stock_master_consensus(first, second, anchor)
+            pairwise_drift = {
+                f"{first_role}__{second_role}": current_drift,
+                f"{first_role}__last_verified": len(set(first).symmetric_difference(anchor)),
+                f"{second_role}__last_verified": len(set(second).symmetric_difference(anchor)),
+            }
+            decision = "membership_vote_two_of_three"
+        elif len(roles) == 1:
+            role = roles[0]
+            candidate = live[role]
+            if candidate != anchor:
+                self._raise_stock_master_unavailable(
+                    "single_current_source_ambiguous", live, unavailable
+                )
+            result = candidate
+            decision = "unanimous_current_and_anchor"
+            pairwise_drift = {f"{role}__last_verified": 0}
         else:
-            source = getattr(self.stock_master_backup, "last_evidence", "") or getattr(
-                self.stock_master_backup, "provider", "stock_master_backup"
-            )
-        return result, source
+            self._raise_stock_master_unavailable("no_current_source_available", live, unavailable)
 
-    def _validated_primary_stock_master(self, result):
-        if not self.require_stock_master_completeness_evidence:
-            return result, "baostock"
-        candidate = _validated_stock_master(result)
+        diagnostic = {
+            "version": "stock-master-consensus-v2",
+            "status": "verified",
+            "decision": decision,
+            "available_sources": roles,
+            "unavailable_sources": tuple(unavailable),
+            "selected_count": len(result),
+            "pairwise_drift": pairwise_drift,
+        }
+        source = self._stock_master_source_receipt(diagnostic)
+        return result, source, diagnostic
+
+    def _read_stock_master_evidence(self, role, component, live, unavailable):
         try:
-            independent = self.stock_master_backup.fetch_cn_stock_symbols()
+            raw = component.fetch_cn_stock_symbols()
         except DataUnavailableError:
-            if self.expected_stock_symbols is None:
-                raise DataUnavailableError("首次证券主表同步缺少可用的独立完整性证据。") from None
-            candidate = _require_no_uncorroborated_contraction(
-                candidate, self.expected_stock_symbols
-            )
-            return candidate, "baostock:checked_against_last_verified_master"
+            unavailable.append(role)
+            return
+        except DataQualityError:
+            self._raise_stock_master_quality(f"{role}_quality_failure", live, unavailable)
+        try:
+            master = _validated_stock_master(raw)
+            _require_current_master_size(master)
+        except DataQualityError:
+            self._raise_stock_master_quality(f"{role}_truncated_or_invalid", live, unavailable)
+        live[role] = master
 
-        # A quality failure from the independent source intentionally escapes;
-        # it must never be downgraded into an availability fallback.
-        candidate = _require_exact_stock_master_agreement(candidate, independent)
-        if self.expected_stock_symbols is not None:
-            _require_bounded_stock_master_drift(independent, self.expected_stock_symbols)
-        evidence = getattr(self.stock_master_backup, "last_evidence", "") or getattr(
+    def _raise_stock_master_unavailable(self, reason, live, unavailable):
+        diagnostic = self._failed_stock_master_diagnostic(
+            status="unavailable", reason=reason, live=live, unavailable=unavailable
+        )
+        self.metadata_diagnostics["fetch_cn_stock_symbols"] = diagnostic
+        raise DataUnavailableError(self._stock_master_failure_text(diagnostic)) from None
+
+    def _raise_stock_master_quality(self, reason, live, unavailable):
+        diagnostic = self._failed_stock_master_diagnostic(
+            status="quality_rejected", reason=reason, live=live, unavailable=unavailable
+        )
+        self.metadata_diagnostics["fetch_cn_stock_symbols"] = diagnostic
+        raise DataQualityError(self._stock_master_failure_text(diagnostic)) from None
+
+    @staticmethod
+    def _failed_stock_master_diagnostic(*, status, reason, live, unavailable):
+        return {
+            "version": "stock-master-consensus-v2",
+            "status": status,
+            "reason": reason,
+            "available_sources": tuple(live),
+            "unavailable_sources": tuple(unavailable),
+        }
+
+    @staticmethod
+    def _stock_master_failure_text(diagnostic):
+        available = ",".join(diagnostic["available_sources"]) or "none"
+        unavailable = ",".join(diagnostic["unavailable_sources"]) or "none"
+        return (
+            "证券主表共识未通过（"
+            f"reason={diagnostic['reason']};available={available};"
+            f"unavailable={unavailable}）。"
+        )
+
+    @staticmethod
+    def _stock_master_source_receipt(diagnostic):
+        available = ",".join(diagnostic["available_sources"])
+        unavailable = ",".join(diagnostic["unavailable_sources"]) or "none"
+        drift = ",".join(
+            f"{key}:{value}" for key, value in sorted(diagnostic["pairwise_drift"].items())
+        )
+        return (
+            "stock_master_consensus:v2;"
+            f"decision={diagnostic['decision']};available={available};"
+            f"unavailable={unavailable};selected={diagnostic['selected_count']};"
+            f"drift={drift}"
+        )
+
+    def _stock_master_source_name(self):
+        if self.stock_master_backup is self.backup:
+            return "tushare"
+        return getattr(self.stock_master_backup, "last_evidence", "") or getattr(
             self.stock_master_backup, "provider", "stock_master_backup"
         )
-        return candidate, f"baostock:crosschecked:{evidence}"
+
+    def _stock_master_role_name(self):
+        return "tushare" if self.stock_master_backup is self.backup else "official_exchange"
 
     def fetch_core_index_daily(self, target_date, *, cutoff_timestamp=None):
         try:

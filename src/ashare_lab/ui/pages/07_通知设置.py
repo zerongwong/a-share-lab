@@ -158,7 +158,7 @@ def render() -> None:
 
     st.info(
         "本页负责保存凭据和测试服务商是否受理。测试成功不代表微信或iPhone终端已经送达；"
-        "周日至周四21:00晚报需要另行安装本机定时任务，系统不会自动下单。"
+        "交易日上午09:00盘前报告需要另行安装本机定时任务，系统不会自动下单。"
     )
 
     serverchan_configured = _configured_status(serverchan_key_is_configured)

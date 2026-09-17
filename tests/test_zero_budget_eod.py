@@ -340,6 +340,36 @@ def test_provider_exception_text_and_token_never_escape() -> None:
     assert captured.value.__suppress_context__ is True
 
 
+def test_sanitized_stock_master_consensus_reason_survives_composite_boundary() -> None:
+    diagnostic = (
+        "证券主表共识未通过（reason=no_current_source_available;"
+        "available=none;unavailable=baostock,official_exchange,tushare）。"
+    )
+
+    class FailedMaster(FakeBaoStock):
+        def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+            raise DataUnavailableError(diagnostic)
+
+    with pytest.raises(DataUnavailableError, match="no_current_source_available") as caught:
+        _adapter(baostock=FailedMaster()).fetch_cn_stock_symbols()
+
+    assert str(caught.value) == diagnostic
+
+
+def test_unknown_stock_master_failure_is_still_redacted() -> None:
+    secret = "private-stock-master-token"
+
+    class FailedMaster(FakeBaoStock):
+        def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+            raise DataUnavailableError(f"request token={secret}")
+
+    with pytest.raises(DataUnavailableError) as caught:
+        _adapter(baostock=FailedMaster()).fetch_cn_stock_symbols()
+
+    assert secret not in str(caught.value)
+    assert "免费证券主表不可用" in str(caught.value)
+
+
 def test_core_indices_reject_wrong_set_and_wrong_baostock_date_or_source() -> None:
     bao = FakeBaoStock()
     with pytest.raises(DataQualityError, match="未验证代码|六核心"):

@@ -43,12 +43,12 @@ def test_update_page_masks_key_and_explains_all_fail_closed_boundaries() -> None
     assert "隔离失败" in source
     assert "不含北交所" in source
     assert "盘中不会把今天" in source
-    assert "不完整数据会被隔离，16:30起有限重试，20:50做晚报前末次预检" in source
+    assert "不完整数据会被隔离，收盘后有限重试，次日06:30至08:40再补齐" in source
     assert "三源字段、单位或交叉核验合同可能发生变化" in source
     assert "没有猜测单位，也没有用AKShare替换Tushare数据" in source
     assert "只有使用者主动运行安装脚本后" in source
-    assert "每日15:30首次同步，并于16:30、" in source
-    assert '"18:30、19:30、20:20、20:50有限重试。"' in source
+    assert "每日15:30首次同步，收盘后继续复核" in source
+    assert '"并于次日06:30、07:30、08:20、08:40有限重试。"' in source
     assert "不依赖本网页" in source
     assert "daily_update_lock" in source
     assert "正在另一个进程中运行" in source

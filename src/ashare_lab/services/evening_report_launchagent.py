@@ -1,4 +1,4 @@
-"""Render the independent Sunday-to-Thursday 21:00 evening-report task."""
+"""Render the independent Monday-to-Friday 09:00 pre-open report task."""
 
 from __future__ import annotations
 
@@ -8,15 +8,13 @@ from pathlib import Path
 
 EVENING_REPORT_LAUNCHAGENT_LABEL = "com.zerong.asharelab.evening-report"
 EVENING_REPORT_MODULE = "ashare_lab.cli.evening_report"
-# macOS ``launchd`` follows the cron weekday numbering used by
-# ``StartCalendarInterval``: 0 (or 7) is Sunday, 1 is Monday, and 6 is
-# Saturday. Use 0..4 for Sunday through Thursday. Friday and Saturday are
-# intentionally absent; the CLI also enforces this calendar-day boundary
-# because RunAtLoad is independent of StartCalendarInterval.
+# macOS ``launchd`` follows cron weekday numbering: 1 is Monday and 5 is
+# Friday.  The CLI still verifies that today is the next official trading
+# session; weekday scheduling alone is never treated as market-calendar proof.
 EVENING_REPORT_SCHEDULE = [
-    {"Weekday": weekday, "Hour": 21, "Minute": minute}
-    for weekday in range(0, 5)
-    for minute in (0, 15, 30, 45)
+    {"Weekday": weekday, "Hour": 9, "Minute": minute}
+    for weekday in range(1, 6)
+    for minute in (0, 10, 20)
 ]
 
 
@@ -43,9 +41,7 @@ def render_evening_report_launchagent_plist(
     if "KeepAlive" in document:
         raise ValueError("evening report LaunchAgent must not contain KeepAlive")
     if document.get("StartCalendarInterval") != EVENING_REPORT_SCHEDULE:
-        raise ValueError(
-            "evening report must retry four times between 21:00 and 22:00 Sunday-to-Thursday"
-        )
+        raise ValueError("pre-open report must retry at 09:00, 09:10 and 09:20 Monday-to-Friday")
     document["ProgramArguments"] = [
         "/usr/bin/caffeinate",
         "-i",

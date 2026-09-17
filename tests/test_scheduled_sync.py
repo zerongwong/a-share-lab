@@ -616,6 +616,30 @@ def test_expected_error_exits_two_and_redacts_url_and_assigned_secret(tmp_path: 
     assert outcome.event["reason"] == "update_entrypoint_error"
 
 
+def test_quarantined_failure_never_copies_stock_identity_to_log_or_notification(
+    tmp_path: Path,
+) -> None:
+    symbol = "600999.SH"
+    messages = []
+
+    outcome = scheduled_sync.run_scheduled_sync(
+        **_paths(tmp_path),
+        clock=lambda: NOW,
+        _run_update=lambda **_kwargs: _report(
+            current=False,
+            reason=f"stock increment returned unrequested symbols: {symbol}",
+        ),
+        _notifier=lambda message: messages.append(message) or _NotificationResult(),
+    )
+
+    serialized = json.dumps(outcome.event, ensure_ascii=False)
+    log = (tmp_path / "logs" / "daily-sync.jsonl").read_text(encoding="utf-8")
+    assert outcome.exit_code == scheduled_sync.EXIT_INCOMPLETE
+    assert symbol not in serialized
+    assert symbol not in log
+    assert symbol not in messages[0].body
+
+
 def test_unexpected_error_never_copies_exception_message(tmp_path: Path) -> None:
     secret = "unexpected-secret"
 
@@ -710,6 +734,39 @@ def test_second_process_lock_owner_is_harmless_noop(tmp_path: Path) -> None:
     assert called is False
 
 
+def test_delayed_0840_sync_defers_before_lock_and_can_resume_after_report(
+    tmp_path: Path,
+) -> None:
+    calls = []
+    paths = _paths(tmp_path)
+    lock_path = paths["scheduler_root"] / "daily-sync.lock"
+
+    deferred = scheduled_sync.run_scheduled_sync(
+        **paths,
+        clock=lambda: datetime(2026, 8, 28, 0, 50, tzinfo=UTC),
+        _run_update=lambda **kwargs: calls.append(kwargs) or _report(current=True),
+        _notifier=lambda _message: _NotificationResult(),
+    )
+
+    assert deferred.exit_code == scheduled_sync.EXIT_CURRENT
+    assert deferred.event["status"] == "deferred_for_morning_report"
+    assert deferred.event["reason"] == "morning_report_lock_reservation"
+    assert calls == []
+    with daily_update_lock(lock_path) as report_lock_acquired:
+        assert report_lock_acquired is True
+
+    resumed = scheduled_sync.run_scheduled_sync(
+        **paths,
+        clock=lambda: datetime(2026, 8, 28, 1, 30, tzinfo=UTC),
+        _run_update=lambda **kwargs: calls.append(kwargs) or _report(current=True),
+        _notifier=lambda _message: _NotificationResult(),
+    )
+
+    assert resumed.exit_code == scheduled_sync.EXIT_CURRENT
+    assert resumed.event["status"] == "noop_current"
+    assert len(calls) == 1
+
+
 def test_shared_lock_is_really_exclusive_across_processes(tmp_path: Path) -> None:
     lock_path = tmp_path / "scheduler" / "daily-sync.lock"
     program = (
@@ -769,12 +826,14 @@ def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
     ]
     assert document["RunAtLoad"] is True
     assert document["StartCalendarInterval"] == [
+        {"Hour": 6, "Minute": 30},
+        {"Hour": 7, "Minute": 30},
+        {"Hour": 8, "Minute": 20},
+        {"Hour": 8, "Minute": 40},
         {"Hour": 15, "Minute": 30},
         {"Hour": 16, "Minute": 30},
         {"Hour": 18, "Minute": 30},
-        {"Hour": 19, "Minute": 30},
         {"Hour": 20, "Minute": 20},
-        {"Hour": 20, "Minute": 50},
     ]
     assert "KeepAlive" not in document
     assert document["ProcessType"] == "Background"
@@ -816,12 +875,14 @@ def test_launchagent_renderer_replaces_placeholders_without_inserting_arguments(
     ]
     assert document["WorkingDirectory"] == str(project_root.resolve())
     assert document["StartCalendarInterval"] == [
+        {"Hour": 6, "Minute": 30},
+        {"Hour": 7, "Minute": 30},
+        {"Hour": 8, "Minute": 20},
+        {"Hour": 8, "Minute": 40},
         {"Hour": 15, "Minute": 30},
         {"Hour": 16, "Minute": 30},
         {"Hour": 18, "Minute": 30},
-        {"Hour": 19, "Minute": 30},
         {"Hour": 20, "Minute": 20},
-        {"Hour": 20, "Minute": 50},
     ]
     assert "__PYTHON_BIN__" not in document["ProgramArguments"]
     assert output.stat().st_mode & 0o777 == 0o600
@@ -840,7 +901,7 @@ def test_installers_only_manage_daily_label_and_preserve_data_and_keys() -> None
     assert "import ashare_lab.cli.scheduled_sync" in install
     assert "render_launchagent_plist" in install
     assert "plutil -replace ProgramArguments.0" not in install
-    assert "15:30首次同步，16:30、18:30、19:30复核，20:20、20:50晚报前预检" in install
+    assert "次日06:30、07:30、08:20、08:40盘前补齐" in install
     assert "BACKUP_PLIST" in install
     assert "正在恢复安装前状态" in install
     assert "research.db" not in uninstall

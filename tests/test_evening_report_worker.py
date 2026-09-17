@@ -16,7 +16,7 @@ from ashare_lab.services.daily_update_lock import daily_update_lock
 def _options(tmp_path):
     return {
         "argv": ["--state-root", str(tmp_path / "state"), "--log-root", str(tmp_path / "logs")],
-        "_clock": lambda: datetime(2026, 9, 8, 21, tzinfo=worker._SHANGHAI),
+        "_clock": lambda: datetime(2026, 9, 8, 9, 20, tzinfo=worker._SHANGHAI),
     }
 
 
@@ -50,7 +50,7 @@ def test_automatic_worker_is_isolated_and_bounded_without_forwarding_output(tmp_
     )
     assert code == 0
     assert event["status"] == "worker_completed"
-    assert process.timeouts == [720]
+    assert process.timeouts == [480]
     command, options = commands[0]
     assert command[:3] == [sys.executable, "-m", "ashare_lab.cli.evening_digest"]
     assert options == {
@@ -78,7 +78,7 @@ def test_timeout_terminates_only_owned_group_and_deduplicates_failure_notice(tmp
         )
         assert code == 2
         assert event["reason"] == "evening_worker_deadline_exceeded"
-        assert process.timeouts == [720, 5, 5]
+        assert process.timeouts == [480, 5, 5]
     assert signals == [(45678, signal.SIGTERM), (45678, signal.SIGKILL)] * 2
     assert len(messages) == 1
     assert "暂停新买" in messages[0].title
@@ -115,7 +115,7 @@ def test_provider_rejection_does_not_suppress_later_timeout_notice(tmp_path):
 def test_known_plan_receipt_prevents_misleading_failure_notice(tmp_path):
     state = tmp_path / "state"
     state.mkdir()
-    original = {"plan_for_date": "2026-09-09", "accepted_channels": ["serverchan"]}
+    original = {"plan_for_date": "2026-09-08", "accepted_channels": ["serverchan"]}
     (state / "evening-digest-state.json").write_text(json.dumps(original))
     status = worker.notify_incomplete_once(
         state_root=state,
@@ -149,7 +149,7 @@ def test_spawn_failure_is_logged_without_unsafe_exception_details(tmp_path):
     assert "SCT-secret" not in (tmp_path / "logs" / "evening-report.jsonl").read_text()
 
 
-@pytest.mark.parametrize("date_hour", [(5, 21), (8, 20), (8, 22)])
+@pytest.mark.parametrize("date_hour", [(6, 9), (8, 8), (8, 10)])
 def test_unscheduled_invocation_never_starts_worker_or_notifies(tmp_path, date_hour):
     options = _options(tmp_path)
     day, hour = date_hour
@@ -160,7 +160,7 @@ def test_unscheduled_invocation_never_starts_worker_or_notifies(tmp_path, date_h
         _notifier=lambda _message: pytest.fail("outside window must not notify"),
     )
     assert result == 0
-    assert event["status"] == "noop_outside_evening_window"
+    assert event["status"] == "noop_outside_preopen_window"
 
 
 def test_timeout_releases_real_child_advisory_lock(tmp_path):

@@ -14,7 +14,7 @@ import os
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -92,6 +92,10 @@ _TRADING_CALENDAR_LOOKAHEAD_DAYS = 14
 _HOLDING_CHART_CHANNELS = frozenset({"serverchan"})
 _HOLDING_CHART_MAX_URL_TTL_SECONDS = 3_600
 _MAX_CHART_ATTEMPTS = 4
+_AUTOMATIC_REPORT_START = time(9, 0)
+_AUTOMATIC_REPORT_END = time(9, 30)
+_FINAL_AUTOMATIC_RETRY = time(9, 20)
+_MANUAL_REPORT_START = time(8, 0)
 _NOTIFICATION_CHANNELS_ENV = "ASHARE_EVENING_NOTIFICATION_CHANNELS"
 _SUPPORTED_NOTIFICATION_CHANNELS = ("serverchan", "bark")
 _LOG_EVENT_KEYS = (
@@ -184,10 +188,10 @@ def run_evening_digest(
     enable_holding_chart_delivery: bool = False,
     _clock: Callable[[], datetime] | None = None,
 ) -> EveningDigestOutcome:
-    """Submit a deduplicated next-session plan in its authorized evening window.
+    """Submit a deduplicated same-day plan in its authorized pre-open window.
 
-    ``send_now`` is an explicit manual catch-up after 20:00 on the current
-    calendar day. It preserves the verified next-session and stale-data gates.
+    ``send_now`` is an explicit manual catch-up from 08:00 until 09:30 on the
+    report date.  It preserves the verified prior-session and stale-data gates.
     """
 
     try:
@@ -218,8 +222,9 @@ def run_evening_digest(
         if now.tzinfo is None:
             raise ValueError("evening clock must be timezone aware")
         now = now.astimezone(_SHANGHAI)
-        target_date = decision_date or now.date()
-        if not isinstance(target_date, date):
+        report_date = now.date()
+        requested_decision_date = decision_date
+        if requested_decision_date is not None and not isinstance(requested_decision_date, date):
             raise TypeError("decision_date must be a date")
     except (OSError, TypeError, ValueError):
         outcome = _error("digest_initialization_error")
@@ -239,7 +244,11 @@ def run_evening_digest(
     archiver = _archive_digest or _archive_original_digest
 
     def finish(outcome: EveningDigestOutcome) -> EveningDigestOutcome:
-        if outcome.exit_code != EXIT_OK and now.hour == 21 and now.minute >= 45:
+        local_time = now.timetz().replace(tzinfo=None)
+        if (
+            outcome.exit_code != EXIT_OK
+            and _FINAL_AUTOMATIC_RETRY <= local_time < _AUTOMATIC_REPORT_END
+        ):
             _send_final_failure_notice(
                 repository=repository,
                 notifier=notifier,
@@ -253,26 +262,29 @@ def run_evening_digest(
         return outcome
 
     # ``RunAtLoad`` is independent of launchd's StartCalendarInterval and can
-    # invoke this command after a login on any calendar day.  Keep the send
-    # boundary in the real execution path as well: Python uses Monday=0, so
-    # 4 and 5 are Friday and Saturday.  Return before locks, state or market
-    # data are read and before the digest builder/notifier can be reached.
-    if target_date.weekday() in {4, 5}:
+    # invoke this command after a login on any calendar day.  Saturday and
+    # Sunday can be rejected without guessing whether a weekday is an exchange
+    # session.  Weekday holidays are still confirmed by the provider calendar.
+    if report_date.weekday() in {5, 6}:
         return finish(
             EveningDigestOutcome(
                 EXIT_OK,
-                _event("noop_weekend_send_window_closed"),
+                _event("noop_weekend_report_window_closed"),
             )
         )
-    if send_now and (target_date != now.date() or now.hour < 20):
-        return finish(_error("manual_send_requires_current_evening_after_20"))
-    if not send_now and now.hour != 21:
-        return finish(EveningDigestOutcome(EXIT_OK, _event("noop_outside_evening_window")))
+    initial_local_time = now.timetz().replace(tzinfo=None)
+    if send_now and not (_MANUAL_REPORT_START <= initial_local_time < _AUTOMATIC_REPORT_END):
+        return finish(_error("manual_send_requires_current_preopen_window"))
+    if not send_now and not (_AUTOMATIC_REPORT_START <= initial_local_time < _AUTOMATIC_REPORT_END):
+        return finish(EveningDigestOutcome(EXIT_OK, _event("noop_outside_morning_window")))
 
     def submission_window_open() -> bool:
         checked_at = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
-        return checked_at.date() == now.date() and (
-            checked_at.hour >= 20 if send_now else checked_at.hour == 21
+        checked_time = checked_at.timetz().replace(tzinfo=None)
+        window_start = _MANUAL_REPORT_START if send_now else _AUTOMATIC_REPORT_START
+        return (
+            checked_at.date() == report_date
+            and window_start <= checked_time < _AUTOMATIC_REPORT_END
         )
 
     try:
@@ -292,12 +304,21 @@ def run_evening_digest(
                 or prior_state.get("method_version") == CONTINUOUS_METHOD_VERSION
             )
             latest = latest_reader(resolved_overlay)
+            if latest is None:
+                return finish(_error("verified_market_data_unavailable"))
+            target_date = requested_decision_date or latest
+            if requested_decision_date is not None and requested_decision_date != latest:
+                return finish(
+                    _error(
+                        "decision_date_not_latest_verified_cutoff",
+                        common_cutoff=latest.isoformat(),
+                    )
+                )
             retry_chart = (
                 enable_holding_chart_delivery
                 and prior_state.get("chart_status") == "pending"
                 and int(prior_state.get("chart_attempts", 0)) < _MAX_CHART_ATTEMPTS
-                and _state_plan_for_date(prior_state)
-                == (target_date + timedelta(days=1)).isoformat()
+                and _state_plan_for_date(prior_state) == report_date.isoformat()
             )
             if (
                 latest is not None
@@ -305,8 +326,7 @@ def run_evening_digest(
                 and latest <= last_sent
                 and not retry_chart
                 and current_method_matches
-                and _state_plan_for_date(prior_state)
-                == (target_date + timedelta(days=1)).isoformat()
+                and _state_plan_for_date(prior_state) == report_date.isoformat()
             ):
                 return finish(
                     EveningDigestOutcome(
@@ -323,46 +343,44 @@ def run_evening_digest(
             # market.  A provider outage must not occupy the shared daily-data
             # lock for tens of minutes only to reach the same fail-closed
             # decision after the expensive build.
-            preflight_plan_for_date: date | None = None
-            if latest is not None:
-                if latest > target_date:
+            if latest >= report_date:
+                return finish(
+                    _error(
+                        "verified_market_data_cutoff_not_prior_session",
+                        common_cutoff=latest.isoformat(),
+                    )
+                )
+            try:
+                preflight_plan_for_date = _validate_next_trading_day(
+                    latest,
+                    next_trading_day(latest),
+                )
+            except Exception:  # noqa: BLE001 - provider details stay private
+                return finish(
+                    _error(
+                        "next_trading_day_not_verified",
+                        common_cutoff=latest.isoformat(),
+                        plan_for_date=None,
+                    )
+                )
+            if preflight_plan_for_date != report_date:
+                if preflight_plan_for_date < report_date:
                     return finish(
                         _error(
-                            "verified_market_data_cutoff_after_decision_date",
+                            "verified_market_data_stale_for_today",
                             common_cutoff=latest.isoformat(),
                         )
                     )
-                try:
-                    preflight_plan_for_date = _validate_next_trading_day(
-                        latest,
-                        next_trading_day(latest),
-                    )
-                except Exception:  # noqa: BLE001 - provider details stay private
-                    return finish(
-                        _error(
-                            "next_trading_day_not_verified",
+                return finish(
+                    EveningDigestOutcome(
+                        EXIT_OK,
+                        _event(
+                            "noop_not_trading_day",
                             common_cutoff=latest.isoformat(),
-                            plan_for_date=None,
-                        )
+                            plan_for_date=preflight_plan_for_date.isoformat(),
+                        ),
                     )
-                if preflight_plan_for_date != target_date + timedelta(days=1):
-                    if preflight_plan_for_date <= target_date:
-                        return finish(
-                            _error(
-                                "verified_market_data_stale_for_tomorrow",
-                                common_cutoff=latest.isoformat(),
-                            )
-                        )
-                    return finish(
-                        EveningDigestOutcome(
-                            EXIT_OK,
-                            _event(
-                                "noop_not_next_session_eve",
-                                common_cutoff=latest.isoformat(),
-                                plan_for_date=preflight_plan_for_date.isoformat(),
-                            ),
-                        )
-                    )
+                )
 
             if _build_digest is None:
                 from ashare_lab.services.build_continuous_digest import (
@@ -384,23 +402,21 @@ def run_evening_digest(
             if not submission_window_open():
                 return finish(
                     _error(
-                        "evening_window_ended_before_submission",
+                        "morning_window_ended_before_submission",
                         common_cutoff=digest.common_cutoff.isoformat(),
                     )
                 )
             text_already_accepted = (
                 last_sent == digest.common_cutoff
                 and current_method_matches
-                and _state_plan_for_date(prior_state)
-                == (target_date + timedelta(days=1)).isoformat()
+                and _state_plan_for_date(prior_state) == report_date.isoformat()
             )
             if (
                 last_sent is not None
                 and digest.common_cutoff <= last_sent
                 and not retry_chart
                 and current_method_matches
-                and _state_plan_for_date(prior_state)
-                == (target_date + timedelta(days=1)).isoformat()
+                and _state_plan_for_date(prior_state) == report_date.isoformat()
             ):
                 return finish(
                     EveningDigestOutcome(
@@ -431,16 +447,16 @@ def run_evening_digest(
                         )
                     )
             digest = replace(digest, plan_for_date=plan_for_date)
-            if plan_for_date != target_date + timedelta(days=1):
-                if plan_for_date <= target_date:
+            if plan_for_date != report_date:
+                if plan_for_date < report_date:
                     return finish(
-                        _error("verified_market_data_stale_for_tomorrow", common_cutoff=cutoff)
+                        _error("verified_market_data_stale_for_today", common_cutoff=cutoff)
                     )
                 return finish(
                     EveningDigestOutcome(
                         EXIT_OK,
                         _event(
-                            "noop_not_next_session_eve",
+                            "noop_not_trading_day",
                             common_cutoff=cutoff,
                             plan_for_date=plan_for_date.isoformat(),
                         ),
@@ -643,7 +659,7 @@ def run_evening_digest(
                 )
 
             if chart_requested and publication is None:
-                body += "\n\n🩷 持仓日/周图暂缺，今晚稍后自动补图。"
+                body += "\n\n🩷 持仓日/周图暂缺，稍后自动补图。"
             if text_already_accepted:
                 body = (
                     f"# 🩵 {format_cn_plan_date(plan_for_date)} 持仓日/周图补充\n"
@@ -683,7 +699,7 @@ def run_evening_digest(
             message = NotificationMessage(
                 title=f"A股{'补图' if text_already_accepted else '日报'}｜{plan_label}计划",
                 body=body,
-                group="A股研究室·晚间日报",
+                group="A股研究室·晨间日报",
                 compact_body=compact_body,
                 image_url=(None if publication is None else publication.receipt.image_url),
                 image_authorized_channels=(
@@ -700,7 +716,7 @@ def run_evening_digest(
                     publication.revoke_once()
                 return finish(
                     _error(
-                        "evening_window_ended_before_submission",
+                        "morning_window_ended_before_submission",
                         common_cutoff=cutoff,
                         plan_for_date=plan_for_date.isoformat(),
                     )
@@ -800,7 +816,7 @@ def _send_final_failure_notice(
         state = _read_state(path)
         if state.get("accepted_date") == now.date().isoformat():
             return
-        public = "今晚完整研究计划未能生成或提交。请勿把旧报告当作明日买入依据；没有自动下单。"
+        public = "今晨完整研究计划未能生成或提交。请勿把旧报告当作今日买入依据；没有自动下单。"
         body, guard = public, None
         try:
             portfolio = get_active_holding_portfolio(repository)
@@ -828,7 +844,7 @@ def _send_final_failure_notice(
                         from ashare_lab.services.build_evening_digest import _holding_review_lines
 
                         lines = _holding_review_lines(review, name_bytes=36, reason_bytes=90)
-                        body += f"\n\n持仓单独核验（数据{cutoff}，非明日新买计划）：\n" + "\n".join(
+                        body += f"\n\n持仓单独核验（数据{cutoff}，非今日新买计划）：\n" + "\n".join(
                             lines
                         )
 
@@ -841,7 +857,7 @@ def _send_final_failure_notice(
         message = NotificationMessage(
             title="A股计划未完成｜请勿沿用旧买入建议",
             body=body,
-            group="A股研究室·晚间日报",
+            group="A股研究室·晨间日报",
             holding_authorization_guard=guard,
             unauthorized_body=public if guard else None,
         )
@@ -1282,7 +1298,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--send-now",
         action="store_true",
-        help="当晚20:00后人工补发下一交易日计划；保留数据新鲜度、交易日和去重检查",
+        help="当日08:00至09:30前人工补发开盘前计划；保留数据新鲜度、交易日和去重检查",
     )
     return parser
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -26,6 +27,30 @@ class DailyOverlaySyncStatus(StrEnum):
     FAILED = "failed"
 
 
+class DailyOverlayFailureStage(StrEnum):
+    """Stable, non-secret stage identifiers for failed daily synchronizations."""
+
+    CALENDAR = "calendar"
+    STOCK_MASTER = "stock_master"
+    STOCK_DAILY = "stock_daily"
+    STOCK_VALIDATION = "stock_validation"
+    INDEPENDENT_VERIFICATION = "independent_verification"
+    INDEX_DAILY = "index_daily"
+    INDEX_VALIDATION = "index_validation"
+    UNIT_VALIDATION = "unit_validation"
+    PERSISTENCE = "persistence"
+    UNKNOWN = "unknown"
+
+
+_STOCK_UNEXPECTED_COUNT = re.compile(
+    r"^stock increment returned unrequested symbol count: (?P<count>\d+)$"
+)
+_INDEX_MISSING_COUNT = re.compile(r"^core index increment missing symbol count: (?P<count>\d+)$")
+_INDEX_UNEXPECTED_COUNT = re.compile(
+    r"^core index increment returned unrequested symbol count: (?P<count>\d+)$"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DailyOverlaySyncResult:
     source_id: str
@@ -42,6 +67,10 @@ class DailyOverlaySyncResult:
     run_id: str = ""
     quarantine_path: str | None = None
     reason: str = ""
+    failure_stage: str = ""
+    failure_provider: str = ""
+    failure_status: str = ""
+    reason_code: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,26 +117,47 @@ def sync_daily_overlay(
         rights_policy.require(source_id, DataAction.MARKET_DATA_READ)
         rights_policy.require(source_id, DataAction.MARKET_DATA_CACHE)
     now = clock or (lambda: datetime.now(UTC))
-    stocks_requested = tuple(stock_symbols or provider.fetch_cn_stock_symbols())
-    if not stocks_requested:
-        raise DataUnavailableError("provider stock universe is empty")
+    try:
+        stocks_requested = tuple(stock_symbols or provider.fetch_cn_stock_symbols())
+        if not stocks_requested:
+            raise DataUnavailableError("provider stock universe is empty")
+    except Exception as exc:  # noqa: BLE001 - fail closed at metadata boundary
+        return _failed_result(
+            source_id=source_id,
+            trade_date=target_date,
+            previous_cutoff=previous_trade_date,
+            expected_stock_count=0,
+            stage=DailyOverlayFailureStage.STOCK_MASTER,
+            exc=exc,
+        )
     core_requested = tuple(core_index_symbols)
-    run = store.begin_staging(
-        source_id=source_id,
-        trade_date=target_date,
-        receipt={
-            "provider": source_id,
-            "target_date": target_date,
-            "previous_trade_date": previous_trade_date,
-            "state": "started",
-        },
-    )
+    try:
+        run = store.begin_staging(
+            source_id=source_id,
+            trade_date=target_date,
+            receipt={
+                "provider": source_id,
+                "target_date": target_date,
+                "previous_trade_date": previous_trade_date,
+                "state": "started",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed at local persistence boundary
+        return _failed_result(
+            source_id=source_id,
+            trade_date=target_date,
+            previous_cutoff=previous_trade_date,
+            expected_stock_count=len(stocks_requested),
+            stage=DailyOverlayFailureStage.PERSISTENCE,
+            exc=exc,
+        )
     receipt: dict[str, Any] = {
         "provider": source_id,
         "target_date": target_date,
         "previous_trade_date": previous_trade_date,
         "adjustment": "none",
     }
+    stage = DailyOverlayFailureStage.STOCK_DAILY
     try:
         stock_batch = provider.fetch_daily_increment(
             stocks_requested,
@@ -115,7 +165,9 @@ def sync_daily_overlay(
             cutoff_timestamp=cutoff_timestamp,
             asset_kind="stocks",
         )
+        stage = DailyOverlayFailureStage.PERSISTENCE
         store.stage_asset(run, "stocks", stock_batch.frame)
+        stage = DailyOverlayFailureStage.STOCK_VALIDATION
         stocks = _validate_batch(
             stock_batch,
             requested_symbols=stocks_requested,
@@ -127,8 +179,7 @@ def sync_daily_overlay(
         unexpected_stocks = set(stocks["symbol"]) - set(stock_expected)
         if unexpected_stocks:
             raise DataQualityError(
-                "stock increment returned unrequested symbols: "
-                + ", ".join(sorted(unexpected_stocks)[:10])
+                f"stock increment returned unrequested symbol count: {len(unexpected_stocks)}"
             )
         stock_coverage = len(set(stocks["symbol"])) / len(stock_expected)
         if stock_coverage + 1e-12 < required_stock_coverage_ratio:
@@ -136,15 +187,19 @@ def sync_daily_overlay(
                 f"stock coverage {stock_coverage:.4f} is below {required_stock_coverage_ratio:.4f}"
             )
         receipt["stocks"] = _batch_receipt(stock_batch, asset_kind="stocks")
+        stage = DailyOverlayFailureStage.PERSISTENCE
         store.update_staging_receipt(run, receipt)
 
+        stage = DailyOverlayFailureStage.INDEX_DAILY
         index_batch = provider.fetch_daily_increment(
             core_requested,
             target_date,
             cutoff_timestamp=cutoff_timestamp,
             asset_kind="indices",
         )
+        stage = DailyOverlayFailureStage.PERSISTENCE
         store.stage_asset(run, "indices", index_batch.frame)
+        stage = DailyOverlayFailureStage.INDEX_VALIDATION
         indices = _validate_batch(
             index_batch,
             requested_symbols=core_requested,
@@ -152,23 +207,26 @@ def sync_daily_overlay(
             source_id=source_id,
             asset_kind="indices",
         )
+        stage = DailyOverlayFailureStage.UNIT_VALIDATION
         _validate_unit_audit_pair(stock_batch, index_batch)
+        stage = DailyOverlayFailureStage.INDEX_VALIDATION
         core_normalized = _normalize_configured_symbols(core_requested)
         actual_indices = set(indices["symbol"])
         missing_indices = set(core_normalized) - actual_indices
         unexpected_indices = actual_indices - set(core_normalized)
         if missing_indices:
             raise DataQualityError(
-                "core index increment is incomplete: " + ", ".join(sorted(missing_indices))
+                f"core index increment missing symbol count: {len(missing_indices)}"
             )
         if unexpected_indices:
             raise DataQualityError(
-                "core index increment returned unrequested symbols: "
-                + ", ".join(sorted(unexpected_indices))
+                f"core index increment returned unrequested symbol count: {len(unexpected_indices)}"
             )
         receipt["indices"] = _batch_receipt(index_batch, asset_kind="indices")
+        stage = DailyOverlayFailureStage.PERSISTENCE
         store.update_staging_receipt(run, receipt)
 
+        stage = DailyOverlayFailureStage.PERSISTENCE
         summary = store.commit_verified(
             run,
             stocks=stocks,
@@ -200,24 +258,26 @@ def sync_daily_overlay(
             run_id=summary.run_id,
         )
     except Exception as exc:  # noqa: BLE001 - fail closed at provider boundary
+        stage = _refine_failure_stage(stage, exc)
+        diagnostic = _failure_diagnostic(source_id=source_id, stage=stage, exc=exc)
         quarantine_path: str | None = None
         if run.path.is_dir():
             quarantine_path = str(
                 store.quarantine(
                     run,
-                    reason=_safe_reason(exc),
+                    reason=diagnostic["reason"],
                     failed_at=_aware_utc(now(), "clock"),
                 )
             )
-        return DailyOverlaySyncResult(
+        return _failed_result(
             source_id=source_id,
             trade_date=target_date,
             previous_cutoff=previous_trade_date,
-            verified_cutoff=previous_trade_date,
-            status=DailyOverlaySyncStatus.FAILED,
             expected_stock_count=len(stocks_requested),
             quarantine_path=quarantine_path,
-            reason=_safe_reason(exc),
+            stage=stage,
+            exc=exc,
+            diagnostic=diagnostic,
         )
 
 
@@ -266,11 +326,32 @@ def sync_daily_overlay_range(
             results=(),
             ready_through_requested_date=True,
         )
-    calendar = _normalize_calendar(
-        provider.fetch_cn_trading_days(started_cutoff + timedelta(days=1), through_date),
-        start=started_cutoff + timedelta(days=1),
-        end=through_date,
-    )
+    try:
+        calendar = _normalize_calendar(
+            provider.fetch_cn_trading_days(started_cutoff + timedelta(days=1), through_date),
+            start=started_cutoff + timedelta(days=1),
+            end=through_date,
+        )
+    except Exception as exc:  # noqa: BLE001 - fail closed at metadata boundary
+        failure = _failed_result(
+            source_id=source_id,
+            trade_date=through_date,
+            previous_cutoff=started_cutoff,
+            expected_stock_count=0,
+            stage=DailyOverlayFailureStage.CALENDAR,
+            exc=exc,
+        )
+        return DailyOverlayRangeReport(
+            source_id=source_id,
+            baseline_cutoff=baseline_cutoff,
+            requested_through=through_date,
+            started_cutoff=started_cutoff,
+            verified_cutoff=started_cutoff,
+            expected_sessions=(),
+            completed_sessions=(),
+            results=(failure,),
+            ready_through_requested_date=False,
+        )
     if not calendar:
         return DailyOverlayRangeReport(
             source_id=source_id,
@@ -283,9 +364,30 @@ def sync_daily_overlay_range(
             results=(),
             ready_through_requested_date=True,
         )
-    stocks_requested = tuple(stock_symbols or provider.fetch_cn_stock_symbols())
-    if not stocks_requested:
-        raise DataUnavailableError("provider stock universe is empty")
+    try:
+        stocks_requested = tuple(stock_symbols or provider.fetch_cn_stock_symbols())
+        if not stocks_requested:
+            raise DataUnavailableError("provider stock universe is empty")
+    except Exception as exc:  # noqa: BLE001 - fail closed at metadata boundary
+        failure = _failed_result(
+            source_id=source_id,
+            trade_date=calendar[0],
+            previous_cutoff=started_cutoff,
+            expected_stock_count=0,
+            stage=DailyOverlayFailureStage.STOCK_MASTER,
+            exc=exc,
+        )
+        return DailyOverlayRangeReport(
+            source_id=source_id,
+            baseline_cutoff=baseline_cutoff,
+            requested_through=through_date,
+            started_cutoff=started_cutoff,
+            verified_cutoff=started_cutoff,
+            expected_sessions=calendar,
+            completed_sessions=(),
+            results=(failure,),
+            ready_through_requested_date=False,
+        )
     results: list[DailyOverlaySyncResult] = []
     completed: list[date] = []
     current_cutoff = started_cutoff
@@ -482,6 +584,208 @@ def _aware_utc(value: datetime, name: str) -> datetime:
     return value.astimezone(UTC)
 
 
+_SAFE_COVERAGE = re.compile(
+    r"^stock coverage (?P<actual>\d+(?:\.\d+)?) is below (?P<required>\d+(?:\.\d+)?)$"
+)
+_PRE_SANITIZED_DEPENDENCY = re.compile(
+    r"^(?:免费交易日历|免费证券主表|Tushare股票日线|独立日线核验|"
+    r"免费核心指数)(?:质量校验失败|不可用|调用失败)，原始错误已脱敏。$"
+)
+_STOCK_MASTER_CONSENSUS_FAILURE = re.compile(
+    r"^证券主表共识未通过（reason=(?P<reason>[a-z0-9_]+);"
+    r"available=(?:none|(?:baostock|official_exchange|tushare)"
+    r"(?:,(?:baostock|official_exchange|tushare))*);"
+    r"unavailable=(?:none|(?:baostock|official_exchange|tushare)"
+    r"(?:,(?:baostock|official_exchange|tushare))*)）。$"
+)
+
+
+def _failed_result(
+    *,
+    source_id: str,
+    trade_date: date,
+    previous_cutoff: date,
+    expected_stock_count: int,
+    stage: DailyOverlayFailureStage,
+    exc: Exception,
+    quarantine_path: str | None = None,
+    diagnostic: dict[str, str] | None = None,
+) -> DailyOverlaySyncResult:
+    values = diagnostic or _failure_diagnostic(source_id=source_id, stage=stage, exc=exc)
+    return DailyOverlaySyncResult(
+        source_id=source_id,
+        trade_date=trade_date,
+        previous_cutoff=previous_cutoff,
+        verified_cutoff=previous_cutoff,
+        status=DailyOverlaySyncStatus.FAILED,
+        expected_stock_count=expected_stock_count,
+        quarantine_path=quarantine_path,
+        reason=values["reason"],
+        failure_stage=values["stage"],
+        failure_provider=values["provider"],
+        failure_status=values["status"],
+        reason_code=values["reason_code"],
+    )
+
+
+def _failure_diagnostic(
+    *,
+    source_id: str,
+    stage: DailyOverlayFailureStage,
+    exc: Exception,
+) -> dict[str, str]:
+    status = _failure_status(exc)
+    reason_code = _reason_code(stage, status, exc)
+    provider = _failure_provider(source_id, stage)
+    detail = _safe_failure_detail(stage, exc)
+    reason = (
+        f"reason_code={reason_code};stage={stage.value};provider={provider};"
+        f"status={status};detail={detail}"
+    )
+    return {
+        "reason": reason,
+        "stage": stage.value,
+        "provider": provider,
+        "status": status,
+        "reason_code": reason_code,
+    }
+
+
+def _failure_status(exc: Exception) -> str:
+    if isinstance(exc, DataQualityError):
+        return "quality_rejected"
+    if isinstance(exc, DataUnavailableError):
+        return "unavailable"
+    return "call_failed"
+
+
+def _refine_failure_stage(
+    stage: DailyOverlayFailureStage,
+    exc: Exception,
+) -> DailyOverlayFailureStage:
+    message = str(exc)
+    if "独立日线核验" in message:
+        return DailyOverlayFailureStage.INDEPENDENT_VERIFICATION
+    return stage
+
+
+def _failure_provider(source_id: str, stage: DailyOverlayFailureStage) -> str:
+    if source_id != "zero_budget_eod":
+        return source_id if source_id in {"infoway"} else "configured_provider"
+    return {
+        DailyOverlayFailureStage.CALENDAR: "free_calendar_chain",
+        DailyOverlayFailureStage.STOCK_MASTER: "free_stock_master_chain",
+        DailyOverlayFailureStage.STOCK_DAILY: "tushare_daily",
+        DailyOverlayFailureStage.STOCK_VALIDATION: "tushare_daily",
+        DailyOverlayFailureStage.INDEPENDENT_VERIFICATION: "independent_verifier_chain",
+        DailyOverlayFailureStage.INDEX_DAILY: "free_index_chain",
+        DailyOverlayFailureStage.INDEX_VALIDATION: "free_index_chain",
+        DailyOverlayFailureStage.UNIT_VALIDATION: "composite_unit_contract",
+        DailyOverlayFailureStage.PERSISTENCE: "local_overlay_store",
+        DailyOverlayFailureStage.UNKNOWN: "zero_budget_eod",
+    }[stage]
+
+
+def _reason_code(
+    stage: DailyOverlayFailureStage,
+    status: str,
+    exc: Exception,
+) -> str:
+    message = " ".join(str(exc).split())
+    consensus = _STOCK_MASTER_CONSENSUS_FAILURE.fullmatch(message)
+    if stage is DailyOverlayFailureStage.STOCK_MASTER and consensus:
+        return f"stock_master_{consensus.group('reason')}"
+    lowered = message.lower()
+    if status == "quality_rejected" and any(
+        marker in lowered
+        for marker in (
+            "单位合同",
+            "成交额字段",
+            "amount_volume",
+            "amount/volume",
+            "成交额与成交量",
+        )
+    ):
+        return f"{stage.value}_provider_unit_contract_changed"
+    if stage is DailyOverlayFailureStage.STOCK_VALIDATION:
+        if _SAFE_COVERAGE.fullmatch(message):
+            return "stock_coverage_below_threshold"
+        if _STOCK_UNEXPECTED_COUNT.fullmatch(message):
+            return "stock_identity_unrequested"
+        if "duplicate" in lowered or "重复" in message:
+            return "stock_identity_duplicate"
+    if stage is DailyOverlayFailureStage.INDEX_VALIDATION:
+        if _INDEX_MISSING_COUNT.fullmatch(message):
+            return "core_index_incomplete"
+        if _INDEX_UNEXPECTED_COUNT.fullmatch(message):
+            return "core_index_unrequested"
+    if stage is DailyOverlayFailureStage.UNIT_VALIDATION:
+        return "unit_contract_mismatch"
+    if stage is DailyOverlayFailureStage.INDEPENDENT_VERIFICATION:
+        return (
+            "independent_verification_mismatch"
+            if status == "quality_rejected"
+            else "independent_verification_unavailable"
+        )
+    suffix = {
+        "quality_rejected": "quality_rejected",
+        "unavailable": "unavailable",
+        "call_failed": "call_failed",
+    }[status]
+    return f"{stage.value}_{suffix}"
+
+
+def _safe_failure_detail(stage: DailyOverlayFailureStage, exc: Exception) -> str:
+    """Return only repository-owned or explicitly pre-sanitized diagnostic text."""
+
+    message = " ".join(str(exc).split())
+    if stage is DailyOverlayFailureStage.STOCK_MASTER and _STOCK_MASTER_CONSENSUS_FAILURE.fullmatch(
+        message
+    ):
+        return message
+    coverage = _SAFE_COVERAGE.fullmatch(message)
+    if coverage:
+        return f"stock coverage {coverage.group('actual')} is below {coverage.group('required')}"
+    if _PRE_SANITIZED_DEPENDENCY.fullmatch(message):
+        return message[:240]
+    lowered = message.lower()
+    stock_unexpected = _STOCK_UNEXPECTED_COUNT.fullmatch(message)
+    if stage is DailyOverlayFailureStage.STOCK_VALIDATION:
+        if stock_unexpected:
+            return f"stock increment rejected unexpected symbol count={stock_unexpected.group('count')}"
+        if "duplicate" in lowered or "重复" in message:
+            return "stock increment identity contains duplicates"
+    index_missing = _INDEX_MISSING_COUNT.fullmatch(message)
+    index_unexpected = _INDEX_UNEXPECTED_COUNT.fullmatch(message)
+    if stage is DailyOverlayFailureStage.INDEX_VALIDATION:
+        if index_missing:
+            return f"core index increment missing symbol count={index_missing.group('count')}"
+        if index_unexpected:
+            return f"core index increment rejected unexpected symbol count={index_unexpected.group('count')}"
+        if "duplicate" in lowered or "重复" in message:
+            return "core index increment identity contains duplicates"
+    if stage is DailyOverlayFailureStage.UNIT_VALIDATION and "unit audit metadata" in lowered:
+        return message[:240]
+    labels = {
+        DailyOverlayFailureStage.CALENDAR: "交易日历暂未取得；保留原有已验证数据并停止更新。",
+        DailyOverlayFailureStage.STOCK_MASTER: "证券主表暂未取得；保留原有已验证数据并停止更新。",
+        DailyOverlayFailureStage.STOCK_DAILY: "股票日线暂未取得；该交易日未登记。",
+        DailyOverlayFailureStage.STOCK_VALIDATION: "股票日线未通过完整性校验；该交易日未登记。",
+        DailyOverlayFailureStage.INDEPENDENT_VERIFICATION: "独立日线核验未通过；该交易日未登记。",
+        DailyOverlayFailureStage.INDEX_DAILY: "核心指数日线暂未取得；该交易日未登记。",
+        DailyOverlayFailureStage.INDEX_VALIDATION: "核心指数日线未通过完整性校验；该交易日未登记。",
+        DailyOverlayFailureStage.UNIT_VALIDATION: "行情单位合同未通过一致性校验；该交易日未登记。",
+        DailyOverlayFailureStage.PERSISTENCE: "本地增量写入或核验提交失败；原有已验证数据保持不变。",
+        DailyOverlayFailureStage.UNKNOWN: "每日数据同步未完成；原有已验证数据保持不变。",
+    }
+    return labels[stage]
+
+
 def _safe_reason(exc: Exception) -> str:
-    message = " ".join(str(exc).split())[:1200]
-    return f"{type(exc).__name__}: {message or 'overlay verification failed'}"
+    """Compatibility helper for callers outside this module's staged path."""
+
+    return _failure_diagnostic(
+        source_id="unknown",
+        stage=DailyOverlayFailureStage.UNKNOWN,
+        exc=exc,
+    )["reason"]

@@ -24,7 +24,7 @@ from ashare_lab.services.review_active_holdings import (
 )
 
 CUTOFF = date(2026, 8, 27)
-TODAY = date(2026, 8, 30)
+TODAY = date(2026, 8, 31)
 UNSAFE_DETAIL = "PRIVATE_PROVIDER_TOKEN_MUST_NOT_ESCAPE"
 
 
@@ -126,14 +126,14 @@ def _accepted(*channels):
     )
 
 
-def _paths(tmp_path: Path, *, minute=45):
+def _paths(tmp_path: Path, *, minute=20):
     return {
         "csmar_root": tmp_path / "csmar",
         "overlay_root": tmp_path / "overlay",
         "reference_root": tmp_path / "reference",
         "state_root": tmp_path / "state",
         "log_root": tmp_path / "logs",
-        "_clock": lambda: datetime(2026, 8, 30, 13, minute, tzinfo=UTC),
+        "_clock": lambda: datetime(2026, 8, 31, 1, minute, tzinfo=UTC),
     }
 
 
@@ -143,7 +143,7 @@ def _run(
     repository=None,
     notifier=None,
     reviewer=_broken_builder,
-    minute=45,
+    minute=20,
     builder=_broken_builder,
     latest=CUTOFF,
     next_day=date(2026, 8, 31),
@@ -172,7 +172,7 @@ def no_real_io(monkeypatch):
     monkeypatch.setattr(cli, "latest_verified_overlay_cutoff", lambda _root: CUTOFF)
 
 
-@pytest.mark.parametrize("minute", [0, 15, 30, 44])
+@pytest.mark.parametrize("minute", [0, 10, 19])
 def test_earlier_error_slots_do_not_send_failure_notice(tmp_path, minute):
     messages = []
     result = _run(tmp_path, minute=minute, notifier=lambda msg: messages.append(msg))
@@ -193,7 +193,7 @@ def test_final_build_error_sends_generic_once_and_records_only_acceptance(tmp_pa
     assert first.exit_code == second.exit_code == cli.EXIT_ERROR
     assert len(messages) == 1
     assert "未能生成或提交" in messages[0].body
-    assert "请勿把旧报告当作明日买入依据" in messages[0].body
+    assert "请勿把旧报告当作今日买入依据" in messages[0].body
     assert "已送达" not in messages[0].body
     state = json.loads((tmp_path / "state" / "evening-failure-notice-state.json").read_text())
     assert state == {"accepted_date": TODAY.isoformat(), "delivery_confirmed": False}
@@ -234,7 +234,7 @@ def test_full_market_failure_preserves_authorized_independent_risk_review(tmp_pa
     assert calls[0]["decision_date"] == CUTOFF
     assert calls[0]["holding_context"].version == 1
     assert "持仓单独核验" in messages[0].body
-    assert "非明日新买计划" in messages[0].body
+    assert "非今日新买计划" in messages[0].body
     assert "合成风险股(600919)" in messages[0].body
     assert "🔴 卖出建议" in messages[0].body
     assert "保护线10.10" in messages[0].body
@@ -417,7 +417,7 @@ def test_stale_plan_is_error_even_when_old_cutoff_was_already_accepted(tmp_path,
     )
     assert builds == []
     assert result.exit_code == cli.EXIT_ERROR
-    assert result.event["reason"] == "verified_market_data_stale_for_tomorrow"
+    assert result.event["reason"] == "verified_market_data_stale_for_today"
     assert len(messages) == 1
     assert "请勿把旧报告" in messages[0].body
 

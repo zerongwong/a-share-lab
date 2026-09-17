@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
+from ashare_lab.domain.errors import DataUnavailableError
 from ashare_lab.ports.daily_increment import AssetKind, DailyIncrementBatch, DailyIncrementPort
 from ashare_lab.ports.market_data import CANONICAL_DAILY_COLUMNS, normalize_symbol
 from ashare_lab.services.sync_daily_overlay import (
@@ -209,6 +210,10 @@ def test_partial_index_fetch_failure_is_quarantined_and_cutoff_does_not_advance(
     assert (quarantine / "stocks.parquet").is_file()
     assert not (quarantine / "indices.parquet").exists()
     assert store.read_verified_manifest().empty
+    assert result.failure_stage == "index_daily"
+    assert result.failure_provider == "infoway"
+    assert result.failure_status == "call_failed"
+    assert result.reason_code == "index_daily_call_failed"
 
 
 def test_stock_and_index_unit_audit_mismatch_is_quarantined(tmp_path: Path) -> None:
@@ -243,6 +248,8 @@ def test_stock_and_index_unit_audit_mismatch_is_quarantined(tmp_path: Path) -> N
 
     assert result.status is DailyOverlaySyncStatus.FAILED
     assert "unit audit metadata do not match" in result.reason
+    assert result.failure_stage == "unit_validation"
+    assert result.reason_code == "unit_contract_mismatch"
     assert store.read_verified_manifest().empty
 
 
@@ -297,7 +304,10 @@ def test_98_percent_stock_coverage_passes_but_97_percent_does_not(tmp_path: Path
     )
 
     assert failing.status is DailyOverlaySyncStatus.FAILED
-    assert "coverage" in failing.reason
+    assert "stock coverage 0.9700 is below 0.9800" in failing.reason
+    assert failing.failure_stage == "stock_validation"
+    assert failing.failure_status == "quality_rejected"
+    assert failing.reason_code == "stock_coverage_below_threshold"
     assert failing.verified_cutoff == BASELINE
     assert failing_store.read_verified_manifest().empty
 
@@ -318,7 +328,72 @@ def test_duplicate_stock_rows_are_quarantined(tmp_path: Path) -> None:
 
     assert result.status is DailyOverlaySyncStatus.FAILED
     assert "duplicate" in result.reason
+    assert result.reason_code == "stock_identity_duplicate"
     assert store.read_verified_manifest().empty
+
+
+def test_unrequested_stock_identity_reports_only_count_and_never_symbol(
+    tmp_path: Path,
+) -> None:
+    unexpected = "600999.SH"
+
+    class UnexpectedStockProvider(FakeDailyIncrementProvider):
+        def fetch_daily_increment(self, *args, **kwargs):
+            batch = super().fetch_daily_increment(*args, **kwargs)
+            if kwargs.get("asset_kind") == "indices":
+                return batch
+            frame = pd.concat((batch.frame, _frame((unexpected,), batch.target_date)))
+            return DailyIncrementBatch(
+                frame=frame,
+                target_date=batch.target_date,
+                requested_symbols=batch.requested_symbols,
+                received_symbols=batch.received_symbols,
+                fetched_at=batch.fetched_at,
+                trace_ids=batch.trace_ids,
+                provider=batch.provider,
+                cutoff_timestamp=batch.cutoff_timestamp,
+                unit_contract_version=batch.unit_contract_version,
+                unit_resolution_method_version=batch.unit_resolution_method_version,
+                amount_multiplier_to_cny=batch.amount_multiplier_to_cny,
+            )
+
+    result = sync_daily_overlay(
+        UnexpectedStockProvider(),
+        MarketOverlayStore(tmp_path / "overlay"),
+        target_date=DAY_25,
+        previous_trade_date=BASELINE,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert result.status is DailyOverlaySyncStatus.FAILED
+    assert result.reason_code == "stock_identity_unrequested"
+    assert "unexpected symbol count=1" in result.reason
+    assert unexpected not in result.reason
+
+
+def test_unknown_provider_identifier_is_not_copied_to_failure_diagnostic(
+    tmp_path: Path,
+) -> None:
+    secret = "private-source-id-must-not-escape"
+
+    class UnknownProvider(FakeDailyIncrementProvider):
+        provider = secret
+
+        def fetch_daily_increment(self, *args, **kwargs):
+            raise RuntimeError("unavailable")
+
+    result = sync_daily_overlay(
+        UnknownProvider(),
+        MarketOverlayStore(tmp_path / "overlay"),
+        target_date=DAY_25,
+        previous_trade_date=BASELINE,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert result.failure_provider == "configured_provider"
+    assert secret not in result.reason
 
 
 def test_same_session_rerun_is_unchanged_and_keeps_one_manifest_row(tmp_path: Path) -> None:
@@ -359,3 +434,92 @@ def test_range_stops_at_first_failure_and_never_fetches_later_session(tmp_path: 
     assert report.ready_through_requested_date is False
     assert all(target != DAY_26 for _, target, _ in provider.calls)
     assert store.read_verified_manifest().empty
+
+
+def test_calendar_failure_returns_structured_fail_closed_report_without_leaking_text(
+    tmp_path: Path,
+) -> None:
+    secret = "provider-secret-must-not-escape"
+
+    class FailingCalendarProvider(FakeDailyIncrementProvider):
+        def fetch_cn_trading_days(self, start: date, end: date) -> tuple[date, ...]:
+            raise RuntimeError(f"calendar transport token={secret}")
+
+    report = sync_daily_overlay_range(
+        FailingCalendarProvider(),
+        MarketOverlayStore(tmp_path / "overlay"),
+        baseline_cutoff=BASELINE,
+        through_date=DAY_26,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert report.ready_through_requested_date is False
+    assert report.verified_cutoff == BASELINE
+    assert report.completed_sessions == ()
+    assert len(report.results) == 1
+    failure = report.results[0]
+    assert failure.status is DailyOverlaySyncStatus.FAILED
+    assert failure.failure_stage == "calendar"
+    assert failure.failure_provider == "infoway"
+    assert failure.failure_status == "call_failed"
+    assert failure.reason_code == "calendar_call_failed"
+    assert "交易日历暂未取得" in failure.reason
+    assert secret not in failure.reason
+
+
+def test_direct_provider_failure_is_sanitized_and_preserves_stage_code(tmp_path: Path) -> None:
+    secret = "raw-provider-key-must-not-escape"
+
+    class FailingStockDailyProvider(FakeDailyIncrementProvider):
+        def fetch_daily_increment(self, *args, **kwargs):
+            if kwargs.get("asset_kind") == "stocks":
+                raise RuntimeError(f"request failed api_key={secret}")
+            return super().fetch_daily_increment(*args, **kwargs)
+
+    result = sync_daily_overlay(
+        FailingStockDailyProvider(),
+        MarketOverlayStore(tmp_path / "overlay"),
+        target_date=DAY_25,
+        previous_trade_date=BASELINE,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    assert result.status is DailyOverlaySyncStatus.FAILED
+    assert result.failure_stage == "stock_daily"
+    assert result.failure_status == "call_failed"
+    assert result.reason_code == "stock_daily_call_failed"
+    assert "股票日线暂未取得" in result.reason
+    assert secret not in result.reason
+
+
+def test_stock_master_consensus_reason_code_is_preserved_without_raw_provider_text(
+    tmp_path: Path,
+) -> None:
+    diagnostic = (
+        "证券主表共识未通过（reason=no_current_source_available;"
+        "available=none;unavailable=baostock,official_exchange,tushare）。"
+    )
+
+    class ConsensusFailureProvider(FakeDailyIncrementProvider):
+        provider = "zero_budget_eod"
+
+        def fetch_cn_stock_symbols(self) -> tuple[str, ...]:
+            raise DataUnavailableError(diagnostic)
+
+    report = sync_daily_overlay_range(
+        ConsensusFailureProvider(),
+        MarketOverlayStore(tmp_path / "overlay"),
+        baseline_cutoff=BASELINE,
+        through_date=DAY_26,
+        core_index_symbols=INDICES,
+        clock=lambda: NOW,
+    )
+
+    failure = report.results[0]
+    assert report.ready_through_requested_date is False
+    assert failure.failure_provider == "free_stock_master_chain"
+    assert failure.failure_status == "unavailable"
+    assert failure.reason_code == "stock_master_no_current_source_available"
+    assert diagnostic in failure.reason

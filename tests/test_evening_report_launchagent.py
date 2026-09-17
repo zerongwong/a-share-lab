@@ -18,7 +18,7 @@ INSTALL_SCRIPT = PROJECT_ROOT / "scripts" / "install_evening_report_launchagent.
 UNINSTALL_SCRIPT = PROJECT_ROOT / "scripts" / "uninstall_evening_report_launchagent.sh"
 
 
-def test_evening_report_template_is_independent_secret_free_and_sun_thu_21_only() -> None:
+def test_report_template_is_independent_secret_free_and_weekday_preopen_only() -> None:
     document = plistlib.loads(PLIST_TEMPLATE.read_bytes())
 
     assert document["Label"] == EVENING_REPORT_LAUNCHAGENT_LABEL
@@ -36,11 +36,11 @@ def test_evening_report_template_is_independent_secret_free_and_sun_thu_21_only(
     assert document["RunAtLoad"] is True
     assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
     assert [item["Weekday"] for item in document["StartCalendarInterval"]] == [
-        day for day in range(5) for _ in range(4)
+        day for day in range(1, 6) for _ in range(3)
     ]
-    assert all(item["Hour"] == 21 for item in document["StartCalendarInterval"])
-    assert {item["Minute"] for item in document["StartCalendarInterval"]} == {0, 15, 30, 45}
-    assert 5 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
+    assert all(item["Hour"] == 9 for item in document["StartCalendarInterval"])
+    assert {item["Minute"] for item in document["StartCalendarInterval"]} == {0, 10, 20}
+    assert 0 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert 6 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert "KeepAlive" not in document
     assert document["StandardOutPath"] == "/dev/null"
@@ -112,5 +112,5 @@ def test_readme_documents_manual_run_and_explicit_installation() -> None:
     assert ".venv/bin/python -m ashare_lab.cli.evening_report" in readme
     assert "./scripts/install_evening_report_launchagent.sh" in readme
     assert "./scripts/uninstall_evening_report_launchagent.sh" in readme
-    assert "周日至周四21:00" in readme
-    assert "周五、周六" in readme
+    assert "周一至周五09:00" in readme
+    assert "当天是否交易日" in readme

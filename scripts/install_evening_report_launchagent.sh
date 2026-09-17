@@ -26,7 +26,7 @@ if [[ ! -f "$TEMPLATE" ]]; then
     exit 2
 fi
 if ! "$PYTHON_BIN" -c "import ashare_lab.cli.evening_report"; then
-    echo "晚间报告模块无法从当前虚拟环境导入，请先完成项目更新与依赖安装。" >&2
+    echo "盘前报告模块无法从当前虚拟环境导入，请先完成项目更新与依赖安装。" >&2
     exit 2
 fi
 
@@ -71,12 +71,12 @@ if ! /usr/bin/install -m 600 "$TEMP_PLIST" "$TARGET" \
     || ! /bin/launchctl enable "$SERVICE" \
     || ! /bin/launchctl bootstrap "$DOMAIN" "$TARGET" \
     || ! /bin/launchctl print "$SERVICE" >/dev/null 2>&1; then
-    echo "新晚间报告任务未能完成登记，正在恢复安装前状态。" >&2
+    echo "新盘前报告任务未能完成登记，正在恢复安装前状态。" >&2
     restore_previous
     exit 2
 fi
 
-echo "周日至周四21:00晚间报告任务已安装并登记；周五、周六不做计划推送。"
+echo "周一至周五09:00盘前报告任务已安装并登记；程序仍会核验当天是否交易日。"
 echo "它与本地网页及每日数据同步任务使用不同label，不会重启或修改它们。"
-echo "RunAtLoad可能立即唤起一次；报告服务还会执行周五/周六发送门、交易日链和输入版本去重。"
+echo "RunAtLoad可能立即唤起一次；报告服务还会执行09:00–09:29发送门、交易日链和输入版本去重。"
 echo "查看状态：launchctl print $SERVICE"

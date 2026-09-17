@@ -260,6 +260,7 @@ def run_daily_update(
 def _looks_like_unit_contract_change(reason: str) -> bool:
     normalized = str(reason).lower()
     markers = (
+        "provider_unit_contract_changed",
         "单位合同",
         "成交额字段",
         "vw",

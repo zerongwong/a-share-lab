@@ -202,7 +202,11 @@ def run_zero_budget_daily_update(
     automatic_cutoff = chain[-1] if chain else None
     common_cutoff = automatic_cutoff or baseline_cutoff
     latest_session = (
-        range_report.expected_sessions[-1] if range_report.expected_sessions else common_cutoff
+        range_report.expected_sessions[-1]
+        if range_report.expected_sessions
+        else requested_date
+        if not range_report.ready_through_requested_date
+        else common_cutoff
     )
     updated = tuple(
         item.trade_date
@@ -236,13 +240,16 @@ def run_zero_budget_daily_update(
         provider_contract_changed=any(
             _looks_like_contract_change(item.reason) for item in failures
         ),
-        current_through_latest_complete_session=(common_cutoff == latest_session),
+        current_through_latest_complete_session=(
+            range_report.ready_through_requested_date and common_cutoff == latest_session
+        ),
         unit_contract_version=ZERO_BUDGET_UNIT_CONTRACT_VERSION,
         unit_resolution_method_version=ZERO_BUDGET_UNIT_RESOLUTION_METHOD_VERSION,
         market_scope=(
             "沪深A股：Tushare未复权日线；AKShare抽样核验不可用时由BaoStock同规则"
-            "独立抽样核验；BaoStock日历/六指数，证券主表不可用时读取上交所/深交所"
-            "官方清单；指数备用东财并由腾讯逐一核验；不含北交所"
+            "独立抽样核验；免费交易日历/六指数；证券主表由BaoStock、上交所/深交所"
+            "官方清单、Tushare主表与最近已验证清单按严格共识生成；指数备用东财并由"
+            "腾讯逐一核验；不含北交所"
         ),
         csmar_mutated=False,
         range_report=range_report,
@@ -255,6 +262,7 @@ def _looks_like_contract_change(reason: str) -> bool:
         marker in normalized
         for marker in (
             "dataqualityerror",
+            "quality_rejected",
             "质量校验失败",
             "单位",
             "unit",

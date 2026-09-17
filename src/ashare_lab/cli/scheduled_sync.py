@@ -19,10 +19,11 @@ from collections import Counter
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from ashare_lab.adapters.macos_keychain import load_serverchan_sendkey
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
@@ -71,16 +72,26 @@ _QUOTED_CREDENTIAL = re.compile(
 _AUTHORIZATION = re.compile(r"(?i)\b(authorization\s*:\s*)(?:bearer\s+)?\S+")
 _SERVERCHAN_SECRET = re.compile(r"\bSCT[A-Za-z0-9_-]{8,192}\b")
 _INFOWAY_SECRET = re.compile(r"(?i)\b[a-f0-9]{24,64}-infoway\b")
+_PUBLIC_STOCK_SYMBOL = re.compile(r"\b(?:6\d{5}\.SH|(?:00|30)\d{4}\.SZ)\b", re.IGNORECASE)
 _LAUNCHAGENT_LABEL = "com.zerong.asharelab.daily-sync"
 _LAUNCHAGENT_MODULE = "ashare_lab.cli.scheduled_sync_worker"
 _DAILY_SYNC_SCHEDULE = [
+    {"Hour": 6, "Minute": 30},
+    {"Hour": 7, "Minute": 30},
+    {"Hour": 8, "Minute": 20},
+    {"Hour": 8, "Minute": 40},
     {"Hour": 15, "Minute": 30},
     {"Hour": 16, "Minute": 30},
     {"Hour": 18, "Minute": 30},
-    {"Hour": 19, "Minute": 30},
     {"Hour": 20, "Minute": 20},
-    {"Hour": 20, "Minute": 50},
 ]
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+# The supervised sync has a twelve-minute wall-clock limit.  A job that has
+# not started by 08:45 cannot safely own the shared data lock before the
+# formal 09:00 report.  Reserve the lock through the complete automatic
+# report retry window; a later scheduled/manual run can resume normally.
+_MORNING_REPORT_RESERVATION_START = time(8, 45)
+_MORNING_REPORT_RESERVATION_END = time(9, 30)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +253,16 @@ def run_scheduled_sync(
     lock_path = resolved_scheduler_root / "daily-sync.lock"
     state_path = resolved_scheduler_root / "daily-sync-state.json"
     log_path = resolved_log_root / "daily-sync.jsonl"
+
+    if _inside_morning_report_reservation(now):
+        event = _base_event(
+            now,
+            status="deferred_for_morning_report",
+            exit_code=EXIT_CURRENT,
+        )
+        event["reason"] = "morning_report_lock_reservation"
+        _write_log_event(log_path, event)
+        return ScheduledSyncOutcome(EXIT_CURRENT, event)
 
     try:
         with daily_update_lock(lock_path) as acquired:
@@ -799,6 +820,7 @@ def _sanitize_text(value: str, *, limit: int = 500) -> str:
     text = _AUTHORIZATION.sub(r"\1[redacted]", text)
     text = _SERVERCHAN_SECRET.sub("[redacted-serverchan-key]", text)
     text = _INFOWAY_SECRET.sub("[redacted-infoway-key]", text)
+    text = _PUBLIC_STOCK_SYMBOL.sub("[redacted-stock-symbol]", text)
     return text[:limit] or "unspecified_failure"
 
 
@@ -886,6 +908,21 @@ def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("scheduler clock must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _inside_morning_report_reservation(value: datetime) -> bool:
+    """Return whether a new sync must yield to the 09:00 report.
+
+    This is only a lock-scheduling rule.  It does not infer that a weekday is
+    an exchange session; the report still requires the verified trading
+    calendar before it can publish a plan.
+    """
+
+    local = _aware_utc(value).astimezone(_SHANGHAI)
+    if local.weekday() >= 5:
+        return False
+    local_time = local.timetz().replace(tzinfo=None)
+    return _MORNING_REPORT_RESERVATION_START <= local_time < _MORNING_REPORT_RESERVATION_END
 
 
 if __name__ == "__main__":
