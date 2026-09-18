@@ -1,10 +1,12 @@
-"""Local CLI for recommendation maturity settlement and explicit reconstruction.
+"""Compatibility-only CLI for retired fixed-horizon recommendation archives.
 
-``settle`` reads only the local SQLite audit log and provider-verified overlay,
-then uses the already configured scheduled notification channels.  ``reconstruct``
-is deliberately offline: it requires explicit historical dates, verifies them
-against the local overlay, and can archive only a visibly reconstructed cohort.
-Neither command accepts credentials or has brokerage/order capability.
+Bare invocation is deliberately a no-op: the legacy weekly/monthly/quarterly
+cohorts are no longer an active workflow and must not be settled or notified by
+accident.  ``settle`` remains an explicit local audit operation for historical
+records, but never sends a notification.  ``reconstruct`` is deliberately
+offline: it requires explicit historical dates, verifies them against the local
+overlay, and can archive only a visibly reconstructed cohort.  No command
+accepts credentials or has brokerage/order capability.
 """
 
 from __future__ import annotations
@@ -19,7 +21,6 @@ from typing import Any
 
 from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.bootstrap import application_data_dir, build_repository
-from ashare_lab.cli.scheduled_sync import send_scheduled_notification
 from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
 from ashare_lab.services.archive_recommendation_report import (
     archive_recommendation_report,
@@ -34,19 +35,29 @@ EXIT_OK = 0
 EXIT_INCOMPLETE = 1
 EXIT_ERROR = 2
 
+LEGACY_RETIRED_PAYLOAD: dict[str, object] = {
+    "status": "legacy_fixed_horizon_retired",
+    "active_tracking": False,
+    "historical_records_preserved": True,
+    "notification_sent": False,
+    "orders_enabled": False,
+}
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "使用本机不可变推荐档案和已验证收盘数据进行到期复盘；"
-            "也可离线重建明确标记的历史观察档案。不会连接券商或自动下单。"
+            "旧版按周、月、季度、半年和一年推荐已经退出正式流程。"
+            "不带子命令时只报告退役状态；明确调用settle时可在本机审计旧档案，"
+            "但不会发送通知。也可离线重建明确标记的历史观察档案。"
+            "不会连接券商或自动下单。"
         )
     )
     commands = parser.add_subparsers(dest="command")
 
     settle = commands.add_parser(
         "settle",
-        help="结算所有已到期批次，并通过本机已配置通知通道发送新增复盘（默认）",
+        help="明确执行旧档案的本机审计结算；不发送任何通知",
     )
     settle.add_argument(
         "--overlay-root",
@@ -96,6 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.command is None:
+            print(json.dumps(LEGACY_RETIRED_PAYLOAD, ensure_ascii=False, sort_keys=True))
+            return EXIT_OK
         if args.command == "reconstruct":
             payload = _run_reconstruct(args)
             print(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=_json_default))
@@ -131,7 +145,7 @@ def _run_settle(args: argparse.Namespace):
     return run_recommendation_performance(
         repository=repository,
         overlay_store=store,
-        notifier=send_scheduled_notification,
+        notifier=None,
         as_of=getattr(args, "as_of", None),
         corporate_action_loader=load_available_local_corporate_action_evidence,
     )

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
 from ashare_lab.cli import evening_report, scheduled_sync
 from ashare_lab.cli.evening_digest import _message_for_channel
 from ashare_lab.domain.errors import NotificationDeliveryError
@@ -52,6 +53,26 @@ def _digest() -> EveningResearchDigest:
         minimum_cash_weight=0.70,
         cycle_rule_agreement=0.875,
         periods=(),
+        method_version=CONTINUOUS_METHOD_VERSION,
+        continuous_plan={
+            "mode": "continuous",
+            "method_version": CONTINUOUS_METHOD_VERSION,
+            "planned_exit_date": None,
+            "entries": [],
+            "cash_weight": 1.0,
+            "holding_count": 0,
+            "count_state": "cash",
+            "holding_based": False,
+            "status_note": "暂无合格信号，保留现金。",
+        },
+    )
+
+
+def _legacy_digest() -> EveningResearchDigest:
+    return replace(
+        _digest(),
+        method_version="evening-six-horizon-digest-v0.4.0",
+        continuous_plan=None,
     )
 
 
@@ -459,12 +480,12 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert second.event["status"] == "noop_no_new_trading_day"
     assert len(builds) == len(messages) == 1
     assert messages[0].title == "A股日报｜2026-08-28（周五）计划"
-    assert "2026-08-28周五 A股研究计划" in messages[0].body
-    assert "数据2026-08-27" in messages[0].body
+    assert "2026-08-28 次日交易计划" in messages[0].body
+    assert "数据截至 2026-08-27" in messages[0].body
     assert "六期限重合与差异审计" not in messages[0].body
     assert len(messages[0].body.encode("utf-8")) <= 2_400
     assert messages[0].compact_body is not None
-    assert "数据2026-08-27" in messages[0].compact_body
+    assert "数据截至 2026-08-27" in messages[0].compact_body
     assert len(messages[0].compact_body.encode("utf-8")) <= 2_400
     state = json.loads(
         (tmp_path / "state" / "evening-digest-state.json").read_text(encoding="utf-8")
@@ -895,8 +916,8 @@ def test_holding_summary_consent_is_scoped_per_provider_without_payload_crossing
         assert len(review_calls) == (1 if channels else 0)
         assert ("持仓摘要股票(600919)" in seen["serverchan"]) is server_allowed
         assert ("持仓摘要股票(600919)" in seen["bark"]) is bark_allowed
-        assert ("当前持仓修枝" in seen["serverchan"]) is server_allowed
-        assert ("当前持仓修枝" in seen["bark"]) is bark_allowed
+        assert ("持仓优先" in seen["serverchan"]) is server_allowed
+        assert ("持仓优先" in seen["bark"]) is bark_allowed
         for body in seen.values():
             assert "987654.32" not in body
             assert "73.1%" not in body
@@ -943,7 +964,8 @@ def test_bark_layout_failure_cannot_block_serverchan_or_cross_holding_permission
     assert seen[0].compact_body is None
     assert ("持仓摘要股票" in seen[0].body) is ("serverchan" in holding_channels)
     assert "987654.32" not in seen[0].body
-    assert "六期限计划" in seen[0].body
+    assert "条件新买" in seen[0].body
+    assert "六期限计划" not in seen[0].body
 
 
 def test_concurrent_holding_replacement_cannot_disclose_new_portfolio_details(
@@ -2015,6 +2037,28 @@ def test_unexpected_failure_never_copies_exception_or_secret(tmp_path: Path) -> 
         "reason",
         "status",
     }
+
+
+def test_production_delivery_fails_closed_on_retired_fixed_horizon_digest(
+    tmp_path: Path,
+) -> None:
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        decision_date=CUTOFF,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _legacy_digest(),
+        _notifier=lambda _message: (_ for _ in ()).throw(
+            AssertionError("retired digest must never be sent")
+        ),
+        _archive_digest=lambda _digest, _repository: (_ for _ in ()).throw(
+            AssertionError("retired digest must never be archived as current")
+        ),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_ERROR
+    assert outcome.event["reason"] == "continuous_plan_contract_invalid"
+    assert outcome.event["common_cutoff"] == CUTOFF.isoformat()
 
 
 def test_cli_has_stable_module_and_no_credential_arguments() -> None:

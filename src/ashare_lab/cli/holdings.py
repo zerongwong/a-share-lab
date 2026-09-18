@@ -30,6 +30,8 @@ from ashare_lab.services.holding_ledger import (
 CN = ZoneInfo("Asia/Shanghai")
 EXIT_OK = 0
 EXIT_ERROR = 2
+CONTINUOUS_TRACKING_MODE = "continuous-signal-v2"
+_LEGACY_COMPATIBILITY_WEEKS = 4
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,9 +49,9 @@ def build_parser() -> argparse.ArgumentParser:
     replace.add_argument(
         "--holding-weeks",
         type=int,
-        choices=(1, 2, 4, 13, 26, 52),
-        required=True,
-        help="计划周期：1/2/4/13/26/52周",
+        choices=(_LEGACY_COMPATIBILITY_WEEKS,),
+        default=_LEGACY_COMPATIBILITY_WEEKS,
+        help=argparse.SUPPRESS,
     )
     replace.add_argument("--effective-at", type=_local_datetime, default=None)
     replace.add_argument("--change-id", default=None, help="可选的本次显式变更幂等编号")
@@ -88,11 +90,16 @@ def main(
             portfolio = replace_active_holdings(
                 repository,
                 positions,
-                holding_weeks=args.holding_weeks,
+                # The schema still carries this compatibility discriminator;
+                # it is a fixed observation window, never a holding deadline.
+                holding_weeks=_LEGACY_COMPATIBILITY_WEEKS,
                 effective_at=args.effective_at or datetime.now(CN),
                 source="user_confirmed_local_json",
                 change_id=args.change_id,
-                metadata={HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: _delivery_channels(args)},
+                metadata={
+                    HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: _delivery_channels(args),
+                    "tracking_mode": CONTINUOUS_TRACKING_MODE,
+                },
             )
             payload = _portfolio_payload(portfolio)
         else:
@@ -150,7 +157,7 @@ def _portfolio_payload(portfolio: object) -> dict[str, Any]:
         "status": portfolio.status,
         "holding_portfolio_id": portfolio.id,
         "holding_portfolio_version": portfolio.version,
-        "holding_weeks": portfolio.holding_weeks,
+        "tracking_mode": CONTINUOUS_TRACKING_MODE,
         "effective_at": portfolio.effective_at.isoformat(),
         HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: channels,
         "positions": [

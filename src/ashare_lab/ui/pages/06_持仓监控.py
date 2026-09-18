@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 PAGE_TITLE = "我的持仓与每日修枝"
 STATUS = "收盘后持仓复核可用；盘中实时监控尚未接通"
 AVAILABLE_NOW = (
-    "你可以在本机保存整组持仓和计划周期；除非再次明确替换或清空，"
+    "你可以在本机保存整组持续信号持仓；除非再次明确替换或清空，"
     "这份持仓声明会持续有效。每日复核只使用已验证完整收盘，不会因候选排名变化自动换股。"
 )
 NOT_READY = (
@@ -54,8 +54,8 @@ def render(ui: Any | None = None) -> None:
 
     ui.subheader("还可以做单股手动检查")
     ui.markdown(
-        "输入一只股票代码、分析截止日和持仓成本，可查看不同持有期的计划区、"
-        "减仓区和结构失效位。盘中仍需手动运行；本页不会假装实时盯盘。"
+        "输入一只股票代码、分析截止日和持仓成本，可查看日周结构、减仓区和结构失效位。"
+        "盘中仍需手动运行；本页不会假装实时盯盘。"
     )
     ui.page_link(
         _manual_check_path(),
@@ -85,7 +85,7 @@ def _render_local_ledger(ui: Any) -> None:
     if current is None or current.status != "active":
         ui.info("目前没有有效的持仓声明。")
     else:
-        ui.markdown(f"**计划周期：{current.holding_weeks}周｜本机版本：{current.version}**")
+        ui.markdown(f"**持续信号追踪｜本机版本：{current.version}**")
         allowed_channels = holding_summary_delivery_channels(current)
         ui.caption(
             "持仓摘要外发："
@@ -169,24 +169,14 @@ def _render_local_ledger(ui: Any) -> None:
                 ui.error(f"未保存持仓图授权（{type(exc).__name__}）。")
 
     ui.subheader("明确更新整组持仓")
-    ui.caption("上传UTF-8 JSON；成本和总资金权重可写null，系统不会猜。股票仓内权重必须合计100%。")
-    uploaded = ui.file_uploader("选择本机持仓JSON", type=["json"], key="holding_json")
-    weeks = ui.selectbox(
-        "计划持有周期",
-        options=(1, 2, 4, 13, 26, 52),
-        index=2,
-        format_func=lambda value: {
-            1: "1周",
-            2: "2周",
-            4: "1个月",
-            13: "3个月",
-            26: "6个月",
-            52: "1年",
-        }[value],
+    ui.caption(
+        "上传UTF-8 JSON；成本和总资金权重可写null，系统不会猜。股票仓内权重必须合计100%。"
+        "新登记统一进入 continuous-signal-v2 持续跟踪，不设固定到期日。"
     )
+    uploaded = ui.file_uploader("选择本机持仓JSON", type=["json"], key="holding_json")
     confirmed = ui.checkbox("我确认这是完整的当前持仓，将整组替换本机记录")
     ui.caption(
-        "下面两个选项默认不勾选。授权后也只外发代码/名称、周期、动作、保护线和简短理由；"
+        "下面两个选项默认不勾选。授权后也只外发代码/名称、持续持仓标识、动作、保护线和简短理由；"
         "成本、总金额及账户权重永不外发。"
     )
     allow_serverchan = ui.checkbox(
@@ -219,10 +209,13 @@ def _render_local_ledger(ui: Any) -> None:
             replace_active_holdings(
                 repository,
                 positions,
-                holding_weeks=weeks,
+                # Compatibility field only: continuous monitoring has no
+                # four-week deadline or automatic expiry.
+                holding_weeks=4,
                 effective_at=datetime.now(CN),
                 source="user_confirmed_local_ui",
                 metadata={
+                    "tracking_mode": "continuous-signal-v2",
                     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: [
                         channel
                         for channel, allowed in (
@@ -230,7 +223,7 @@ def _render_local_ledger(ui: Any) -> None:
                             ("bark", allow_bark),
                         )
                         if allowed
-                    ]
+                    ],
                 },
             )
             ui.success("已保存到本机。后续会持续沿用，直到你再次明确修改。")

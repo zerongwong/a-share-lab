@@ -34,7 +34,6 @@ from ashare_lab.domain.errors import AShareLabError
 from ashare_lab.ports.notifications import NotificationMessage, NotificationUrgency
 from ashare_lab.services.build_monthly_model_review import (
     MonthlyModelReview,
-    build_monthly_model_review,
     build_verified_benchmark_evidence,
     load_monthly_review_completion_state,
     mark_monthly_review_completed,
@@ -52,7 +51,6 @@ from ashare_lab.services.run_holding_stop_shadows import (
 from ashare_lab.services.run_recommendation_performance import (
     RecommendationPerformanceRunSummary,
     load_available_local_corporate_action_evidence,
-    run_recommendation_performance,
 )
 from ashare_lab.services.run_zero_budget_daily_update import run_zero_budget_daily_update
 
@@ -122,6 +120,8 @@ run_daily_update = run_zero_budget_daily_update
 
 _HOLDING_ACTIONS = ("hold", "tighten", "reduce", "exit", "review")
 _HOLDING_STATUSES = {"ready", "partial", "data_not_ready", "no_holdings"}
+_LEGACY_FIXED_HORIZON_STATUS = "retired_read_only"
+_LEGACY_FIXED_HORIZON_RETIRED_ON = date(2026, 9, 18)
 
 
 def render_launchagent_plist(
@@ -306,6 +306,15 @@ def run_scheduled_sync(
                     scheduler_root=resolved_scheduler_root,
                     common_cutoff=report.common_cutoff,
                 )
+                if _performance_runner is None and _monthly_review_builder is None:
+                    event.update(
+                        {
+                            "legacy_fixed_horizon_status": _LEGACY_FIXED_HORIZON_STATUS,
+                            "legacy_fixed_horizon_retired_on": (
+                                _LEGACY_FIXED_HORIZON_RETIRED_ON.isoformat()
+                            ),
+                        }
+                    )
                 if bool(prior_state.get("failure_active")):
                     recovery = _safe_notify(_notifier, _recovery_message(report))
                     event["recovery_notification_successful_channels"] = list(
@@ -422,15 +431,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Legacy fixed-horizon cohort settlement and monthly model review remain
+    # available only through explicit compatibility injection.  Production
+    # sync records their read-only retirement and never executes them.
     outcome = run_scheduled_sync(
         csmar_root=args.csmar_root,
         overlay_root=args.overlay_root,
         scheduler_root=args.scheduler_root,
         log_root=args.log_root,
-        _performance_runner=run_recommendation_performance,
         _holding_review_runner=run_active_holding_review,
         _holding_shadow_runner=run_holding_stop_shadows,
-        _monthly_review_builder=build_monthly_model_review,
     )
     print(json.dumps(outcome.event, ensure_ascii=False, sort_keys=True, default=str))
     return outcome.exit_code

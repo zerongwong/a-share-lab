@@ -522,6 +522,8 @@ def test_non_trading_or_already_current_run_is_noop_success(tmp_path: Path) -> N
 
     assert outcome.exit_code == 0
     assert outcome.event["status"] == "noop_current"
+    assert outcome.event["legacy_fixed_horizon_status"] == "retired_read_only"
+    assert outcome.event["legacy_fixed_horizon_retired_on"] == "2026-09-18"
 
 
 def test_invalid_scheduler_clock_returns_stable_error_exit(tmp_path: Path) -> None:
@@ -810,6 +812,42 @@ def test_cli_help_has_no_secret_arguments() -> None:
     assert "--api-key" not in help_text
     assert "--sendkey" not in help_text
     assert "--token" not in help_text
+
+
+def test_cli_main_retires_legacy_fixed_horizon_jobs_but_keeps_holding_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_run_scheduled_sync(**kwargs):
+        calls.append(kwargs)
+        return scheduled_sync.ScheduledSyncOutcome(
+            scheduled_sync.EXIT_CURRENT,
+            {"status": "noop_current"},
+        )
+
+    monkeypatch.setattr(scheduled_sync, "run_scheduled_sync", fake_run_scheduled_sync)
+
+    exit_code = scheduled_sync.main(
+        [
+            "--csmar-root",
+            str(tmp_path / "csmar"),
+            "--overlay-root",
+            str(tmp_path / "overlay"),
+            "--scheduler-root",
+            str(tmp_path / "scheduler"),
+            "--log-root",
+            str(tmp_path / "logs"),
+        ]
+    )
+
+    assert exit_code == scheduled_sync.EXIT_CURRENT
+    assert len(calls) == 1
+    assert "_performance_runner" not in calls[0]
+    assert "_monthly_review_builder" not in calls[0]
+    assert calls[0]["_holding_review_runner"] is scheduled_sync.run_active_holding_review
+    assert calls[0]["_holding_shadow_runner"] is scheduled_sync.run_holding_stop_shadows
 
 
 def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:

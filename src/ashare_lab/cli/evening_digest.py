@@ -399,6 +399,22 @@ def run_evening_digest(
                 reference_dataset_root=resolved_reference,
                 decision_date=target_date,
             )
+            continuous_plan = digest.continuous_plan
+            if (
+                digest.method_version != CONTINUOUS_METHOD_VERSION
+                or not isinstance(continuous_plan, dict)
+                or continuous_plan.get("mode") != "continuous"
+                or continuous_plan.get("method_version") != CONTINUOUS_METHOD_VERSION
+            ):
+                # A production regression must fail closed; never let the
+                # retained one-horizon transport or an injected legacy digest
+                # reappear as the current recommendation.
+                return finish(
+                    _error(
+                        "continuous_plan_contract_invalid",
+                        common_cutoff=digest.common_cutoff.isoformat(),
+                    )
+                )
             if not submission_window_open():
                 return finish(
                     _error(

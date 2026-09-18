@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
-from ashare_lab.cli.holdings import main
+from ashare_lab.cli.holdings import build_parser, main
 from ashare_lab.services.holding_ledger import (
     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY,
     get_active_holding_portfolio,
@@ -50,7 +50,7 @@ def _file(tmp_path: Path) -> Path:
 
 def test_replace_requires_explicit_confirmation(tmp_path: Path, capsys: object) -> None:
     result = main(
-        ["replace", "--file", str(_file(tmp_path)), "--holding-weeks", "4"],
+        ["replace", "--file", str(_file(tmp_path))],
         _repository=_repository(tmp_path),
     )
 
@@ -67,8 +67,6 @@ def test_local_json_replace_list_and_clear(tmp_path: Path, capsys: object) -> No
                 "replace",
                 "--file",
                 str(path),
-                "--holding-weeks",
-                "4",
                 "--effective-at",
                 "2026-08-28T21:00:00+08:00",
                 "--yes",
@@ -81,6 +79,8 @@ def test_local_json_replace_list_and_clear(tmp_path: Path, capsys: object) -> No
     assert main(["list"], _repository=repository) == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed["holding_portfolio_version"] == 1
+    assert listed["tracking_mode"] == "continuous-signal-v2"
+    assert "holding_weeks" not in listed
     assert listed["positions"][0]["cost_price"] is None
     assert listed[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == []
     assert listed["network_used"] is False
@@ -108,8 +108,6 @@ def test_replace_saves_only_explicit_per_provider_summary_consent(
                 "replace",
                 "--file",
                 str(_file(tmp_path)),
-                "--holding-weeks",
-                "4",
                 "--allow-holding-summary-bark",
                 "--yes",
             ],
@@ -122,5 +120,14 @@ def test_replace_saves_only_explicit_per_provider_summary_consent(
     assert payload[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == ["bark"]
     portfolio = get_active_holding_portfolio(repository)
     assert portfolio is not None
+    assert portfolio.holding_weeks == 4
+    assert portfolio.metadata["tracking_mode"] == "continuous-signal-v2"
     assert portfolio.metadata[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == ["bark"]
     assert "external_delivery_consent" not in portfolio.metadata
+
+
+def test_holding_cli_hides_retired_fixed_horizon_selector() -> None:
+    help_text = build_parser().format_help()
+
+    assert "--holding-weeks" not in help_text
+    assert "计划周期" not in help_text

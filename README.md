@@ -139,6 +139,9 @@ Tushare、BaoStock、AKShare 提供增量与核验适配，来源权限、更新
 
 核心模块：[入场合同](src/ashare_lab/analytics/continuous_signals.py)、[锁仓补位](src/ashare_lab/analytics/continuous_portfolio.py)、
 [连续计划](src/ashare_lab/services/build_continuous_digest.py)、[独立净值记录](src/ashare_lab/services/continuous_strategy_journal.py)。
-旧六期限及 MCP `generate_portfolio` 的 3–5 股搜索只保留为固定期限只读对照，不是当前连续组合生产入口；
-历史推荐与到期记录不改写。
+旧六期限及 MCP `generate_portfolio` 的 3–5 股搜索只保留为固定期限历史对照，不是当前连续组合生产入口；
+冻结的历史推荐不改写；显式离线审计只可追加派生结算记录。自 2026-09-18 起，生产同步不再
+结算、复盘或推送这些旧组合，
+旧月度复盘也不再自动运行；只有 `continuous-signal-v2` 可生成当前计划。当前持仓为空时，
+程序保持等待，直至使用者明确确认一次新的真实建仓后才建立新的持仓追踪身份。
 原始行情、账户快照、私有报告、数据库、密钥和签名图片地址不得提交 GitHub。

@@ -25,10 +25,10 @@ def _summary(*, failures: tuple[str, ...] = (), notification_failures: int = 0):
         evaluated_batches=1,
         persisted_batches=1,
         mature_batches=1,
-        notification_attempts=1,
-        notification_accepted_batches=1 if not notification_failures else 0,
+        notification_attempts=0,
+        notification_accepted_batches=0,
         notification_failed_batches=notification_failures,
-        accepted_channels=("serverchan",) if not notification_failures else (),
+        accepted_channels=(),
         failed_batch_ids=failures,
     )
 
@@ -64,7 +64,37 @@ def _digest() -> EveningResearchDigest:
     )
 
 
-def test_default_command_settles_local_archive_and_uses_scheduled_notifier(
+def test_default_command_is_retired_noop_and_never_touches_legacy_archive(
+    monkeypatch,
+    capsys,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(cli, "application_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "build_repository",
+        lambda: (_ for _ in ()).throw(AssertionError("must not open legacy archive")),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_recommendation_performance",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not settle")),
+    )
+
+    status = cli.main([])
+
+    assert status == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "active_tracking": False,
+        "historical_records_preserved": True,
+        "notification_sent": False,
+        "orders_enabled": False,
+        "status": "legacy_fixed_horizon_retired",
+    }
+
+
+def test_explicit_settle_audits_local_archive_without_notification(
     monkeypatch,
     capsys,
     tmp_path: Path,
@@ -81,16 +111,16 @@ def test_default_command_settles_local_archive_and_uses_scheduled_notifier(
 
     monkeypatch.setattr(cli, "run_recommendation_performance", run)
 
-    status = cli.main([])
+    status = cli.main(["settle"])
 
     assert status == cli.EXIT_OK
     assert observed["repository"] is repository
     assert observed["overlay_store"].root == (tmp_path / "cache" / "market_overlay").resolve()
-    assert observed["notifier"] is cli.send_scheduled_notification
+    assert observed["notifier"] is None
     assert observed["as_of"] is None
     payload = json.loads(capsys.readouterr().out)
     assert payload["mature_batches"] == 1
-    assert payload["accepted_channels"] == ["serverchan"]
+    assert payload["accepted_channels"] == []
 
 
 def test_settle_returns_incomplete_when_any_batch_or_notification_failed(
@@ -147,12 +177,6 @@ def test_reconstruct_is_offline_explicit_and_can_only_archive_reconstructed(
         "run_recommendation_performance",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not settle")),
     )
-    monkeypatch.setattr(
-        cli,
-        "send_scheduled_notification",
-        lambda _message: (_ for _ in ()).throw(AssertionError("must not notify")),
-    )
-
     status = cli.main(
         [
             "reconstruct",

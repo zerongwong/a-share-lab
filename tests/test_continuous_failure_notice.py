@@ -434,6 +434,8 @@ def _holding_based_digest(identity):
         periods=(),
         method_version="continuous-signal-v2",
         continuous_plan={
+            "mode": "continuous",
+            "method_version": "continuous-signal-v2",
             "holding_based": True,
             "holding_identity": identity,
             "entries": [

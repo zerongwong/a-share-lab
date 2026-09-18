@@ -65,6 +65,8 @@ def test_page_leads_with_close_based_local_holding_state() -> None:
     assert "持仓摘要外发默认关闭" in copy
     assert "必须分别勾选Server酱或Bark" in copy
     assert "不会把延迟日线称作实时数据" in copy
+    assert "计划周期" not in copy
+    assert "不同持有期" not in copy
 
 
 def test_page_reuses_manual_single_stock_workflow_without_fake_monitoring() -> None:
