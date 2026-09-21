@@ -5,6 +5,14 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Promote the live entry contract to `continuous-signal-v3`: the last completed
+  weekly bars qualify direction, while a completed daily close confirms the
+  breakout or healthy retest.  A confirmed base/range reversal, an
+  `EARLY_UPTREND`, or a non-extended `ORDERLY_UPTREND` may enter the structure
+  gate; early location is now a small ranking preference instead of a veto.
+  The 8% structural-risk limit,
+  executability/evidence checks and late-acceleration freeze remain hard gates.
+  Historical v2 decisions are immutable and are not reinterpreted.
 - Promote the live continuous strategy to `continuous-signal-v2`.  The legal
   state is now zero through eight holdings: zero means cash, one through three
   are lower-exposure transition states, four through eight are formed

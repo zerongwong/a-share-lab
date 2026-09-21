@@ -88,7 +88,7 @@ def _price_plan(**changes):
     return ConditionalEntryPlan(
         kind=ConditionalEntryPlanKind.VOLUME_BREAKOUT,
         data_cutoff=pd.Timestamp(changes.pop("data_cutoff", AS_OF)),
-        horizon="continuous_daily_weekly_v2",
+        horizon="continuous_daily_weekly_v3",
         sessions=20,
         trigger_price=10.0,
         invalidation_price=9.4,
@@ -357,7 +357,7 @@ def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_
     assert digest.method_version == CONTINUOUS_METHOD_VERSION
     assert digest.continuous_plan["planned_exit_date"] is None
     assert digest.continuous_plan["holding_based"] is False
-    assert digest.continuous_plan["signal_profile"] == "continuous_daily_weekly_v2"
+    assert digest.continuous_plan["signal_profile"] == "continuous_daily_weekly_v3"
     assert digest.continuous_plan["holding_count"] == 0
     assert digest.continuous_plan["count_state"] == "cash"
     assert digest.continuous_plan["maximum_new_account_weight"] == pytest.approx(0.20)

@@ -209,7 +209,7 @@ def _initial_plan(result) -> dict[str, Any]:
             "entries": [],
             "cash_weight": 1.0,
             **_count_metadata(0),
-            "status_note": "暂无同时通过早期形态、证据和组合风险门的初建组合；暂不新买。",
+            "status_note": "暂无同时通过周线方向、日线确认、证据和组合风险门的初建组合；暂不新买。",
         }
     industries = tuple(
         row.industry.strip() if isinstance(row.industry, str) else ""

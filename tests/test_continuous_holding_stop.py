@@ -78,7 +78,7 @@ def test_continuous_production_stop_profile_does_not_follow_legacy_holding_deadl
         assert row.source_timeframe == "daily"
         assert row.holding_weeks == legacy_weeks  # Ledger is not rewritten.
         assert row.method_version.endswith("+continuous-v2")
-        assert "signal_profile:continuous_daily_weekly_v2;no_expiry" in row.reasons
+        assert "signal_profile:continuous_daily_weekly_v3;no_expiry" in row.reasons
         evidence.append(
             (
                 row.candidate_stop,

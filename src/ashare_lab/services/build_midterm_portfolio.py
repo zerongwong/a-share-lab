@@ -46,6 +46,7 @@ from ashare_lab.analytics.adaptive_portfolio import (
 from ashare_lab.analytics.continuous_signals import (
     CONTINUOUS_SIGNAL_CONTRACT,
     assess_continuous_entry,
+    continuous_entry_stage_rank_score,
 )
 from ashare_lab.analytics.cycle_policy import (
     EntryStrictness,
@@ -308,6 +309,7 @@ class _CandidateInput:
     industry: str
     entry: EntryReadinessAssessment
     timeframe: MultiTimeframeAssessment
+    continuous_stage_rank_score: float
     returns: pd.Series
     evidence_unknown: tuple[str, ...]
     risk_history_available: bool
@@ -584,6 +586,11 @@ def build_midterm_portfolio(
                 industry=str(item.get("industry", "")).strip(),
                 entry=entry,
                 timeframe=timeframe,
+                continuous_stage_rank_score=(
+                    continuous_entry_stage_rank_score(stage)
+                    if continuous_entry_policy
+                    else 0.0
+                ),
                 returns=returns,
                 evidence_unknown=unknown,
                 risk_history_available=not risk_history_reasons,
@@ -1951,6 +1958,7 @@ def _rank_candidates(
         features["ma20_above_ma60"] = float(
             close_proxy.tail(20).mean() > close_proxy.tail(60).mean()
         )
+        features["early_location_preference"] = row.continuous_stage_rank_score
         raw.append(features)
     if any(not all(math.isfinite(value) for value in item.values()) for item in raw):
         raise ValueError("candidate ranking contains non-finite evidence")
@@ -1980,7 +1988,8 @@ def _rank_candidates(
         # Full-universe relative strength is separate cross-sectional evidence;
         # neither input is a future return probability.
         signal = (
-            0.55 * row.timeframe.score
+            0.50 * row.timeframe.score
+            + 0.05 * percentiles["early_location_preference"][index]
             + 0.15 * horizon_momentum
             + 0.10 * float(relative_strength[row.symbol])
             + 0.20 * risk_quality

@@ -1,7 +1,7 @@
 """Versioned holding-count policy for the continuous A-share strategy.
 
 The legacy fixed-horizon research path keeps its historical three-to-five
-portfolio contract.  This module applies only to ``continuous-signal-v2``.
+portfolio contract.  This module applies only to ``continuous-signal-v3``.
 It separates a valid empty account from concentrated transition states and
 formed portfolios; no count is a permission to weaken an entry or risk gate.
 """

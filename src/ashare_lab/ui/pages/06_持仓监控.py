@@ -171,7 +171,7 @@ def _render_local_ledger(ui: Any) -> None:
     ui.subheader("明确更新整组持仓")
     ui.caption(
         "上传UTF-8 JSON；成本和总资金权重可写null，系统不会猜。股票仓内权重必须合计100%。"
-        "新登记统一进入 continuous-signal-v2 持续跟踪，不设固定到期日。"
+        "新登记统一进入 continuous-signal-v3 持续跟踪，不设固定到期日。"
     )
     uploaded = ui.file_uploader("选择本机持仓JSON", type=["json"], key="holding_json")
     confirmed = ui.checkbox("我确认这是完整的当前持仓，将整组替换本机记录")
@@ -215,7 +215,7 @@ def _render_local_ledger(ui: Any) -> None:
                 effective_at=datetime.now(CN),
                 source="user_confirmed_local_ui",
                 metadata={
-                    "tracking_mode": "continuous-signal-v2",
+                    "tracking_mode": "continuous-signal-v3",
                     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: [
                         channel
                         for channel, allowed in (

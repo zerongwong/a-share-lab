@@ -1,6 +1,6 @@
 # A-share model contract
 
-Production uses [continuous-signal-v2](#current-production-mode-continuous-signal-v2),
+Production uses [continuous-signal-v3](#current-production-mode-continuous-signal-v3),
 whose section below takes precedence over all legacy horizon/default/output
 rules. The fixed-horizon sections, including every earlier 3–5-security search
 and output rule, are preserved as read-only historical research only.
@@ -374,7 +374,7 @@ review condition. A report declaring `multi-timeframe-contract-v0.2.0` must addi
 daily/weekly/monthly bar cutoffs, per-horizon structure/risk/LCB status, pairwise horizon overlap, and
 per-security difference attribution. The exact serialized field names may evolve, but these audit
 semantics may not be omitted.
-# Current production mode: continuous-signal-v2
+# Current production mode: continuous-signal-v3
 
 This section supersedes the **horizon/default/output** provisions of the legacy
 contract below; its evidence, privacy, point-in-time and no-order safeguards
@@ -392,10 +392,13 @@ still apply. Do not silently reactivate six-horizon production recommendations.
 - Daily/completed-weekly signal windows are independently frozen. The old
   `holding_weeks=4` transport field is not a sell date. Protect existing stops
   from downward movement, including same-day recomputation/model migration.
-- Every new entry requires confirmed EARLY_UPTREND plus base breakout/healthy
-  retest and execution/evidence/risk gates. The 120-session <=15% early-stage
-  threshold is an unvalidated hypothesis, not absolute-bottom identification.
-  Do not reapply new-entry eligibility to intact existing holdings.
+- Every new entry requires a confirmed, non-extended uptrend: either
+  confirmed base/range reversal, EARLY_UPTREND or ORDERLY_UPTREND, completed-weekly direction, completed-daily
+  base breakout/healthy retest, and execution/evidence/risk gates. The
+  120-session <=15% threshold only labels and modestly ranks earlier locations;
+  it is not an eligibility veto or absolute-bottom identification. Incomplete
+  weekly bars and intraday penetrations cannot confirm an entry. Do not reapply
+  new-entry eligibility to intact existing holdings.
 - Keep the structural-stop/maximum-entry-price gate: prospective initial loss
   distance <=8%, not a realized-loss guarantee. Unknown corporate-action
   coverage (from entry through cutoff) blocks confirmed exit/stop persistence.

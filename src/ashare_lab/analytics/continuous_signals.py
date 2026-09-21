@@ -17,10 +17,10 @@ from ashare_lab.analytics.multi_timeframe import (
     StructureState,
 )
 
-CONTINUOUS_METHOD_VERSION = "continuous-signal-v2"
+CONTINUOUS_METHOD_VERSION = "continuous-signal-v3"
 CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
     4,  # legacy transport discriminator ONLY; not a holding deadline
-    "continuous_daily_weekly_v2",
+    "continuous_daily_weekly_v3",
     BarTimeframe.WEEKLY,
     8,
     26,
@@ -50,15 +50,22 @@ def assess_continuous_entry(
     stage: MediumTermStageAssessment,
     timeframe: MultiTimeframeAssessment,
 ) -> ContinuousEntryAdmission:
-    """Require observable early, non-extended strength AND confirmed structure.
+    """Require completed breakout evidence while rejecting weak or late stages.
 
-    EARLY_UPTREND uses the frozen stage guard: ordered positive trend with
-    120-session gain <=15%, no extension/vertical acceleration.  This does not
-    claim an absolute bottom, first-ever breakout or inevitable future profit.
+    V3 admits a range/base reversal only when the independent weekly/daily
+    contract already proves an upward weekly direction and a completed daily
+    breakout or healthy retest.  Early and orderly uptrends are also admitted.
+    Location is therefore a ranking preference rather than an eligibility
+    veto.  Downtrends, insufficient history, extended/parabolic formations and
+    explicitly frozen formations remain ineligible.
     """
     reasons: list[str] = []
-    if stage.stage is not MediumTermStage.EARLY_UPTREND or stage.hard_freeze_new_entry:
-        reasons.append("early_non_extended_uptrend_not_confirmed")
+    if stage.stage not in {
+        MediumTermStage.RANGE,
+        MediumTermStage.EARLY_UPTREND,
+        MediumTermStage.ORDERLY_UPTREND,
+    } or stage.hard_freeze_new_entry:
+        reasons.append("downtrend_extended_or_unavailable_stage")
     if not timeframe.candidate_qualified:
         reasons.append("daily_weekly_structure_not_qualified")
     if timeframe.structure.state not in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}:
@@ -69,3 +76,17 @@ def assess_continuous_entry(
     }:
         reasons.append("daily_close_entry_confirmation_required")
     return ContinuousEntryAdmission(not reasons, tuple(reasons))
+
+
+def continuous_entry_stage_rank_score(stage: MediumTermStageAssessment) -> float:
+    """Prefer an earlier valid location without turning it into a hard gate."""
+
+    if stage.stage is MediumTermStage.EARLY_UPTREND and not stage.hard_freeze_new_entry:
+        return 1.0
+    if stage.stage is MediumTermStage.RANGE and not stage.hard_freeze_new_entry:
+        # The separate contract has already proved weekly-up/daily-confirmed;
+        # this is a base reversal, not admission of an arbitrary range.
+        return 0.8
+    if stage.stage is MediumTermStage.ORDERLY_UPTREND and not stage.hard_freeze_new_entry:
+        return 0.6
+    return 0.0

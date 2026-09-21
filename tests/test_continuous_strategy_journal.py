@@ -18,7 +18,7 @@ from ashare_lab.services.continuous_strategy_journal import (
 
 
 def test_journal_and_signal_contract_share_v2_identity():
-    assert JOURNAL_VERSION == SIGNAL_VERSION == "continuous-signal-v2"
+    assert JOURNAL_VERSION == SIGNAL_VERSION == "continuous-signal-v3"
 
 
 @pytest.fixture

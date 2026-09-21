@@ -28,7 +28,7 @@ Read [references/model-contract.md](references/model-contract.md) before produci
 ## Output rules
 
 - State the data cutoff and data-quality limitations first.
-- Default to one `continuous-signal-v2` plan without forced maturity, using fixed daily/completed-weekly signal windows. Show urgent holding risks first, then concise conditional entries, total-account weights, protection lines and cash. Treat zero through eight names as valid under the count-state rules above. Fixed-horizon legacy 3–5-name comparisons must be explicitly labelled read-only compatibility research and cannot masquerade as the live replacement plan.
+- Default to one `continuous-signal-v3` plan without forced maturity, using completed-weekly direction and completed-daily breakout/retest confirmation. A base/range reversal may enter only after that independent confirmation; early and orderly non-extended uptrends may also enter. Early location is a ranking preference, not an eligibility veto. Show urgent holding risks first, then concise conditional entries, total-account weights, protection lines and cash. Treat zero through eight names as valid under the count-state rules above. Fixed-horizon legacy 3–5-name comparisons must be explicitly labelled read-only compatibility research and cannot masquerade as the live replacement plan.
 - Show every hard-gate exclusion that materially changed the result, especially limit-up, suspension, unbuyable, late-stage acceleration, accounting quality, and concentration gates.
 - Report historical or walk-forward metrics with their method and confidence interval. Do not label in-sample statistics as forecasts.
 - Present scenario ranges, not guaranteed returns. If probability calibration is unavailable, say “not estimated.”

@@ -30,7 +30,7 @@ from ashare_lab.services.holding_ledger import (
 CN = ZoneInfo("Asia/Shanghai")
 EXIT_OK = 0
 EXIT_ERROR = 2
-CONTINUOUS_TRACKING_MODE = "continuous-signal-v2"
+CONTINUOUS_TRACKING_MODE = "continuous-signal-v3"
 _LEGACY_COMPATIBILITY_WEEKS = 4
 
 

@@ -432,10 +432,10 @@ def _holding_based_digest(identity):
         minimum_cash_weight=0.7,
         cycle_rule_agreement=0.8,
         periods=(),
-        method_version="continuous-signal-v2",
+        method_version="continuous-signal-v3",
         continuous_plan={
             "mode": "continuous",
-            "method_version": "continuous-signal-v2",
+            "method_version": "continuous-signal-v3",
             "holding_based": True,
             "holding_identity": identity,
             "entries": [

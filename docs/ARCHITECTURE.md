@@ -1,12 +1,12 @@
 # 架构（当前连续组合与旧版六期限对照）
 
-> 当前生产为 `continuous-signal-v2`，以[连续组合合同](CONTINUOUS_STRATEGY.md)为准。
+> 当前生产为 `continuous-signal-v3`，以[连续组合合同](CONTINUOUS_STRATEGY.md)为准。
 > 本文后半部的六期限 3/4/5 股架构只保留为只读兼容记录；不得直接套用于当前晚报、持仓跟踪或补位。
 
 A Share Lab 是本地优先的确定性研究程序。UI、MCP 和通知都只是入口；它们不能绕过数据
 质量、策略和风险服务。
 
-## 当前生产路径 · continuous-signal-v2
+## 当前生产路径 · continuous-signal-v3
 
 ```mermaid
 flowchart LR
