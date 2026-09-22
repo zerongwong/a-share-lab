@@ -85,6 +85,7 @@ from ashare_lab.analytics.multi_timeframe import (
 )
 from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_COUNT_POLICY_VERSION,
+    FORMED_PORTFOLIO_MIN_HOLDINGS,
     MAX_CONTINUOUS_HOLDINGS,
     MAX_NEW_ACCOUNT_WEIGHT,
     continuous_count_preference,
@@ -300,6 +301,9 @@ class MidtermPortfolioResult:
     # Local-only complete admission universe, not truncated to the beam pool.
     # Contains return series: never serialize into notifications or archives.
     qualified_entry_universe: tuple[MidtermCandidate, ...] = ()
+    # Ranked stock-level screen before portfolio optimisation narrows the set.
+    # Kept separately so a cash decision does not hide confirmed formations.
+    screening_candidates: tuple[MidtermResearchCandidate, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,7 +431,7 @@ def build_midterm_portfolio(
         raise ValueError("minimum_historical_return_lcb must be finite")
 
     minimum_candidate_count = 1 if continuous_entry_policy else 3
-    shortlist_default_count = 6 if continuous_entry_policy else 4
+    shortlist_default_count = MAX_CONTINUOUS_HOLDINGS if continuous_entry_policy else 4
     shortlist_maximum_count = MAX_CONTINUOUS_HOLDINGS if continuous_entry_policy else 5
 
     cutoff = _normalize_cutoff(as_of)
@@ -612,6 +616,7 @@ def build_midterm_portfolio(
             holding_weeks,
             relative_strength,
             benchmark_returns,
+            continuous_entry_policy=continuous_entry_policy,
         )
         if raw_candidates
         else []
@@ -662,6 +667,7 @@ def build_midterm_portfolio(
         default_candidate_count=shortlist_default_count,
         maximum_candidates=shortlist_maximum_count,
     )
+    screening_candidates = research_candidates
 
     if len(candidates) < minimum_candidate_count:
         return MidtermPortfolioResult(
@@ -669,6 +675,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            screening_candidates=screening_candidates,
             qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
@@ -693,6 +700,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            screening_candidates=screening_candidates,
             qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
@@ -798,6 +806,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            screening_candidates=screening_candidates,
             qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
@@ -843,6 +852,7 @@ def build_midterm_portfolio(
             data_cutoff=cutoff,
             holding_weeks=holding_weeks,
             research_candidates=research_candidates,
+            screening_candidates=screening_candidates,
             qualified_entry_universe=qualified_entry_universe,
             entry_ready_count=daily_entry_ready_count,
             horizon_candidate_count=horizon_candidate_count,
@@ -972,6 +982,7 @@ def build_midterm_portfolio(
         holding_weeks=holding_weeks,
         positions=positions,
         research_candidates=research_candidates,
+        screening_candidates=screening_candidates,
         qualified_entry_universe=qualified_entry_universe,
         stock_exposure=best.stock_exposure,
         cash_weight=best.cash_weight,
@@ -1937,6 +1948,8 @@ def _rank_candidates(
     holding_weeks: int,
     relative_strength: Mapping[str, float],
     benchmark_returns: pd.Series | None = None,
+    *,
+    continuous_entry_policy: bool = False,
 ) -> list[MidtermCandidate]:
     raw: list[dict[str, float]] = []
     contract = horizon_contract(holding_weeks)
@@ -1987,9 +2000,17 @@ def _rank_candidates(
         # longer horizons no longer reuse one shared 20/60/120 daily blend.
         # Full-universe relative strength is separate cross-sectional evidence;
         # neither input is a future return probability.
+        # A continuous-only preference must not change historical horizon
+        # rankings. Equal zero bonuses still have a positive percentile, so
+        # adding the term unconditionally would silently dilute their score.
+        formation_score = 0.55 * row.timeframe.score
+        if continuous_entry_policy:
+            formation_score = (
+                0.50 * row.timeframe.score
+                + 0.05 * percentiles["early_location_preference"][index]
+            )
         signal = (
-            0.50 * row.timeframe.score
-            + 0.05 * percentiles["early_location_preference"][index]
+            formation_score
             + 0.15 * horizon_momentum
             + 0.10 * float(relative_strength[row.symbol])
             + 0.20 * risk_quality
@@ -2311,7 +2332,11 @@ def _select_stock_count(
 ) -> tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]]:
     """Choose one count under the applicable versioned policy.
 
-    A viable four-stock set is the baseline.  A five-stock set may replace it
+    Continuous mode compares feasible three-to-five-name sets first and uses
+    one/two names only when no formed set survives. Within the selected group,
+    conservative historical return ranks first and joint risk breaks ties.
+
+    In legacy fixed-horizon mode, a viable four-stock set is the baseline. A five-stock set may replace it
     only when it has a higher conservative return lower bound, does not worsen
     the three path/tail risk measures by more than 50 basis points, and improves
     either down-period correlation by five points or maximum single-name risk
@@ -2326,9 +2351,19 @@ def _select_stock_count(
             count: rank
             for rank, count in enumerate(continuous_count_preference(maximum_stock_exposure))
         }
-        rows = [row for count_rows in viable_by_count.values() for row in count_rows]
+        rows = [
+            row
+            for count, count_rows in viable_by_count.items()
+            if 1 <= count <= MAX_CONTINUOUS_HOLDINGS
+            for row in count_rows
+            if len(row[2]) == count
+        ]
         if not rows:
-            raise RuntimeError("at least one viable 1-to-8 stock set is required")
+            raise RuntimeError("at least one viable 1-to-5 stock set is required")
+        formed = [row for row in rows if len(row[2]) >= FORMED_PORTFOLIO_MIN_HOLDINGS]
+        # One/two names are a fallback for an insufficient qualified portfolio,
+        # not a competitor that can displace a feasible three-to-five-name set.
+        rows = formed or rows
 
         def continuous_key(
             row: tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]],

@@ -10,6 +10,7 @@ import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
+from ashare_lab.analytics.portfolio_count_policy import CONTINUOUS_COUNT_POLICY_VERSION
 from ashare_lab.cli import evening_report, scheduled_sync
 from ashare_lab.cli.evening_digest import _message_for_channel
 from ashare_lab.domain.errors import NotificationDeliveryError
@@ -57,6 +58,7 @@ def _digest() -> EveningResearchDigest:
         continuous_plan={
             "mode": "continuous",
             "method_version": CONTINUOUS_METHOD_VERSION,
+            "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
             "planned_exit_date": None,
             "entries": [],
             "cash_weight": 1.0,
@@ -442,6 +444,51 @@ def test_dynamic_chart_validation_rejects_forged_identity_or_disclosure(tmp_path
         )
 
 
+@pytest.mark.parametrize("prior_policy", [None, "continuous-count-policy-v2.0.0"])
+def test_count_policy_upgrade_rebuilds_once_then_deduplicates(tmp_path, prior_policy):
+    state_path = tmp_path / "state" / "evening-digest-state.json"
+    state_path.parent.mkdir(parents=True)
+    state = {
+        "last_provider_accepted_common_cutoff": CUTOFF.isoformat(),
+        "plan_for_date": FRIDAY.isoformat(),
+        "method_version": CONTINUOUS_METHOD_VERSION,
+        "accepted_channels": ["serverchan"],
+    }
+    if prior_policy is not None:
+        state["count_policy_version"] = prior_policy
+    state_path.write_text(json.dumps(state))
+    builds, messages = [], []
+    options = {
+        **_paths(tmp_path),
+        "_latest_cutoff": lambda _root: CUTOFF,
+        "_next_trading_day": lambda _cutoff: FRIDAY,
+        "_build_digest": lambda **kwargs: builds.append(kwargs) or _digest(),
+        "_notifier": lambda message: messages.append(message) or _accepted_summary(),
+    }
+    first = evening_report.run_evening_digest(**options)
+    second = evening_report.run_evening_digest(**options)
+    assert first.event["status"] == "provider_accepted"
+    assert second.event["status"] == "noop_no_new_trading_day"
+    assert len(builds) == len(messages) == 1
+    assert json.loads(state_path.read_text())["count_policy_version"] == CONTINUOUS_COUNT_POLICY_VERSION
+
+
+def test_old_count_policy_result_cannot_be_sent_as_current(tmp_path):
+    digest = _digest()
+    digest = replace(digest, continuous_plan={
+        **digest.continuous_plan, "count_policy_version": "continuous-count-policy-v2.0.0"
+    })
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: digest,
+        _notifier=lambda _message: pytest.fail("outdated policy must not send"),
+    )
+    assert outcome.event["reason"] == "continuous_plan_contract_invalid"
+    assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+
+
 def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path: Path) -> None:
     messages = []
     builds = []
@@ -480,7 +527,7 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert second.event["status"] == "noop_no_new_trading_day"
     assert len(builds) == len(messages) == 1
     assert messages[0].title == "A股日报｜2026-08-28（周五）计划"
-    assert "2026-08-28 次日交易计划" in messages[0].body
+    assert "2026-08-28 交易计划" in messages[0].body
     assert "数据截至 2026-08-27" in messages[0].body
     assert "六期限重合与差异审计" not in messages[0].body
     assert len(messages[0].body.encode("utf-8")) <= 2_400
@@ -492,6 +539,7 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     )
     assert set(state) == {
         "method_version",
+        "count_policy_version",
         "accepted_channels",
         "delivery_confirmed",
         "last_provider_accepted_common_cutoff",
@@ -503,15 +551,22 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
         "chart_attempts",
     }
     assert state["last_provider_accepted_common_cutoff"] == "2026-08-27"
+    assert state["count_policy_version"] == CONTINUOUS_COUNT_POLICY_VERSION
     assert state["plan_for_date"] == "2026-08-28"
     assert state["delivery_confirmed"] is False
     assert state["provider_receipt_ids"] == ["serverchan:0123456789abcdef"]
     log_path = tmp_path / "logs" / "evening-report.jsonl"
     entries = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
-    assert [entry["status"] for entry in entries] == [
+    assert [entry["status"] for entry in entries if entry["status"] != "in_progress"] == [
         "provider_accepted",
         "noop_no_new_trading_day",
     ]
+    assert [entry["stage"] for entry in entries if "stage" in entry][:10] == [
+        "data_lock", "verified_cutoff", "trading_calendar", "full_market_build",
+        "full_market_build_complete", "holding_review", "archive", "render",
+        "provider_submission", "record_submission",
+    ]
+    entries = [entry for entry in entries if entry["status"] != "in_progress"]
     assert entries[0]["exit_code"] == evening_report.EXIT_OK
     assert entries[0]["raw_data_exposed"] is False
     assert entries[0]["orders_enabled"] is False
@@ -805,7 +860,7 @@ def test_long_build_crossing_submission_window_is_a_visible_failure(tmp_path, se
     )
     assert outcome.exit_code == evening_report.EXIT_ERROR
     assert outcome.event["reason"] == "morning_window_ended_before_submission"
-    logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text())
+    logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text().splitlines()[-1])
     assert logged["exit_code"] == evening_report.EXIT_ERROR
     assert logged["status"] == "error"
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
@@ -1655,7 +1710,7 @@ def test_unverified_next_trading_day_fails_closed_before_notification(tmp_path: 
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
     log_text = (tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8")
     assert secret not in log_text
-    assert json.loads(log_text)["plan_for_date"] is None
+    assert json.loads(log_text.splitlines()[-1])["plan_for_date"] is None
 
 
 def test_default_notifier_attempts_both_providers_and_keeps_independent_results(
@@ -1972,7 +2027,9 @@ def test_busy_lock_is_logged_without_building_or_sending(tmp_path: Path) -> None
 
     assert outcome.exit_code == evening_report.EXIT_RETRY
     assert outcome.event["status"] == "already_running"
-    logged = json.loads((tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8"))
+    logged = json.loads(
+        (tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
     assert logged["status"] == "already_running"
     assert logged["reason"] == "daily_data_lock_busy"
 
@@ -2018,7 +2075,7 @@ def test_unexpected_failure_never_copies_exception_or_secret(tmp_path: Path) -> 
     assert secret not in json.dumps(outcome.event, ensure_ascii=False)
     log_text = (tmp_path / "logs" / "evening-report.jsonl").read_text(encoding="utf-8")
     assert secret not in log_text
-    log_event = json.loads(log_text)
+    log_event = json.loads(log_text.splitlines()[-1])
     assert log_event["status"] == "error"
     assert log_event["reason"] == "unexpected_evening_digest_error"
     assert set(log_event) <= {

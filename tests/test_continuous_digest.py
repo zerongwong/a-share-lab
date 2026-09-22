@@ -117,6 +117,38 @@ def _new_candidate(**changes):
     )
 
 
+def test_initial_plan_distinguishes_missing_data_from_no_formations_and_blocked_formations():
+    result = _fixture()["result"]
+    result.status = MidtermPortfolioStatus.DATA_NOT_READY
+    assert service._initial_plan(result)["cash_weight"] is None
+    assert "尚不能判断" in service._initial_plan(result)["status_note"]
+    result.status = MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO
+    assert "未找到" in service._initial_plan(result)["status_note"]
+    result.horizon_candidate_count = 3
+    assert "已找到3只" in service._initial_plan(result)["status_note"]
+    assert service._initial_plan(result)["entries"] == []
+
+
+def test_screen_preserves_preoptimisation_candidates_and_explains_risk_before_evidence():
+    first = SimpleNamespace(
+        symbol="600001", name="合成候选",
+        price_observation_plan=_price_plan(initial_risk_fraction=0.101),
+        evidence_unknown=("announcement",), risk_history_available=True,
+        timeframe=None, action=SimpleNamespace(value="wait_confirmation"),
+    )
+    second = deepcopy(first)
+    second.symbol = "600002"
+    second.price_observation_plan = _price_plan(initial_risk_fraction=0.06)
+    result = _fixture()["result"]
+    result.screening_candidates = (first, second)
+    result.research_candidates = (second,)
+    rows = service._screening_candidates(result)
+    assert len(rows) == 2
+    assert rows[0]["reason"] == "结构风险10.1%，超过8%"
+    assert rows[1]["reason"] == "财务、公告或可成交性待核验"
+    assert all(row["entry_qualified"] is False for row in rows)
+
+
 def test_snapshot_marks_fixed_shares_and_cash_without_rebalancing_or_using_cost():
     args = _fixture(2)
     portfolio = args["portfolio"]
@@ -407,6 +439,13 @@ def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkey
     monkeypatch.setattr(service, "get_active_holding_portfolio", lambda _repo: None)
     reports = []
     calls = []
+
+    def public_fixture(_h, _m, **kwargs):
+        result = _result(kwargs["holding_weeks"])
+        for index, candidate in enumerate(result.research_candidates):
+            candidate.symbol = f"60000{index}"
+        return result
+
     for cap in (0.0, 0.8):
 
         def shadow(repository, *, _cap=cap, **kwargs):
@@ -422,7 +461,7 @@ def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkey
                 decision_date=CUTOFF,
                 repository=object(),
                 _hybrid_loader=lambda *_a, **_k: _hybrid(object()),
-                _portfolio_builder=lambda _h, _m, **kwargs: _result(kwargs["holding_weeks"]),
+                _portfolio_builder=public_fixture,
             )
         )
     assert len(calls) == 2

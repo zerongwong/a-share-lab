@@ -436,6 +436,7 @@ def _holding_based_digest(identity):
         continuous_plan={
             "mode": "continuous",
             "method_version": "continuous-signal-v3",
+            "count_policy_version": "continuous-count-policy-v3.0.0",
             "holding_based": True,
             "holding_identity": identity,
             "entries": [

@@ -28,6 +28,7 @@ import pandas as pd
 
 from ashare_lab.analytics.cycle_policy import EntryStrictness
 from ashare_lab.analytics.multi_timeframe import MULTI_TIMEFRAME_IMPLEMENTATION_STATUS
+from ashare_lab.analytics.portfolio_count_policy import MAX_CONTINUOUS_HOLDINGS
 from ashare_lab.domain.errors import AShareLabError, DataUnavailableError
 from ashare_lab.ports.notifications import MAX_COMPACT_NOTIFICATION_BODY_BYTES
 from ashare_lab.services.build_midterm_portfolio import (
@@ -691,18 +692,25 @@ def _render_continuous_digest(digest, review, include_holdings):
         as_of=digest.common_cutoff,
         plan_date=digest.plan_for_date,
         market_summary=(
-            f"{digest.cycle_label}｜{count_summary}｜"
+            f"{digest.cycle_label}｜{_cycle_posture(digest.entry_strictness)}｜{count_summary}｜"
             f"股票敞口上限{digest.max_stock_exposure:.0%}"
         ),
         holding_lines=lines,
         entries=entries,
         cash_weight=cash,
         status_note=note,
+        screening_candidates=(
+            [] if private and not include_holdings else plan.get("screening_candidates", [])
+        ),
     )
 
 
 def _continuous_count_summary(count: object, state: object) -> str:
-    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 8:
+    if (
+        isinstance(count, bool)
+        or not isinstance(count, int)
+        or not 0 <= count <= MAX_CONTINUOUS_HOLDINGS
+    ):
         return "组合只数待核验"
     labels = {
         "cash": "现金观察",

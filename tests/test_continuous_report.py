@@ -34,7 +34,7 @@ def _render(**changes):
 
 def test_one_portfolio_uses_account_weights_and_keeps_risk_conditions():
     body = _render()
-    assert "2026-09-07 次日交易计划" in body
+    assert "2026-09-07 交易计划" in body
     assert body.index("优先退出") < body.index("市场：") < body.index("条件新买")
     assert "合成测试(600000)｜总资金12.5%" in body
     assert "确认≥10.01，买≤10.30+量｜保护9.4812" in body
@@ -96,7 +96,7 @@ def test_undated_report_is_holding_verification_not_a_new_buy_plan():
 
 def test_dated_public_plan_without_holding_lines_does_not_invent_missing_holdings():
     body = _render(holding_lines=[], entries=[], cash_weight=1.0, status_note="暂不建仓")
-    assert "2026-09-07 次日交易计划" in body
+    assert "2026-09-07 交易计划" in body
     assert "持仓优先" not in body
     assert "持仓信息未提供" not in body
     assert "计划现金：总资金100%" in body
@@ -135,6 +135,46 @@ def test_rejected_entries_do_not_hide_qualified_ones_or_acquire_weights():
     assert "其余未过门：暂不新买" in body
 
 
+def test_ranked_screen_is_visible_but_never_promoted_to_buy_or_weight():
+    candidates = [
+        {
+            "symbol": f"60001{index}",
+            "name": f"研究候选{index}",
+            "formation": "确认突破",
+            "reason": "结构风险10.2%，超过8%",
+            # The screen is observation-only, even with stray execution fields.
+            "entry_qualified": True,
+            "account_weight": 0.2,
+            "entry_label": "危险买入价999",
+        }
+        for index in range(6)
+    ]
+    body = _render(entries=[], holding_lines=[], cash_weight=1.0,
+                   screening_candidates=candidates)
+    assert "重点候选 · 观察，不代表可以买" in body
+    assert body.count("结构风险10.2%，超过8%") == 5
+    assert "研究候选5" not in body
+    assert "危险买入价999" not in body
+    assert "总资金20%" not in body
+    assert "暂不新买" in body
+    assert len(body.encode()) <= 4096
+
+
+def test_screen_deduplicates_qualified_entries_and_repeated_observations():
+    candidate = {"symbol": "600000", "name": "重复", "formation": "确认突破", "reason": "观察"}
+    body = _render(screening_candidates=[candidate, candidate])
+    assert "重复" not in body
+    candidate["symbol"] = "600002"
+    body = _render(screening_candidates=[candidate, candidate])
+    assert body.count("重复(600002)") == 1
+
+
+@pytest.mark.parametrize("candidates", ["bad", {}, [None]])
+def test_screen_requires_explicit_mapping_sequence(candidates):
+    with pytest.raises(TypeError):
+        _render(screening_candidates=candidates)
+
+
 @pytest.mark.parametrize("weight", [-0.1, 1.1, float("inf"), True])
 def test_invalid_cash_or_overallocated_account_fail_closed(weight):
     with pytest.raises((ValueError, TypeError)):
@@ -150,16 +190,16 @@ def test_duplicate_stocks_and_past_plan_dates_fail_closed():
         _render(plan_date=date(2026, 9, 4))
 
 
-def test_eight_qualified_entries_are_supported_and_nine_fail_closed():
+def test_five_qualified_entries_are_supported_and_six_fail_closed():
     body = _render(
-        entries=[_entry(symbol=f"60000{index}", account_weight=0.05) for index in range(8)],
-        cash_weight=0.6,
+        entries=[_entry(symbol=f"60000{index}", account_weight=0.10) for index in range(5)],
+        cash_weight=0.5,
     )
-    assert body.count("总资金5%") == 8
-    with pytest.raises(ValueError, match="at most eight"):
+    assert body.count("总资金10%") == 5
+    with pytest.raises(ValueError, match="at most five"):
         _render(
-            entries=[_entry(symbol=f"6000{index:02}", account_weight=0.05) for index in range(9)],
-            cash_weight=0.55,
+            entries=[_entry(symbol=f"6000{index:02}", account_weight=0.10) for index in range(6)],
+            cash_weight=0.4,
         )
 
 

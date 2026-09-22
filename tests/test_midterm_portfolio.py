@@ -324,6 +324,23 @@ def _uptrend_indices(dates: pd.Series) -> dict[str, pd.DataFrame]:
     }
 
 
+def test_real_continuous_builder_accepts_current_five_name_shortlist_policy() -> None:
+    histories, metadata = _universe()
+    dates = histories[next(iter(histories))]["trade_date"]
+    result = build_midterm_portfolio(
+        histories, metadata, as_of=dates.iloc[-1], holding_weeks=4,
+        market_index_histories=_uptrend_indices(dates),
+        risk_budget=_loose_budget(holding_sessions=20),
+        minimum_historical_return_lcb=-1.0,
+        minimum_universe_size=3, candidate_pool_size=8, beam_width=8,
+        continuous_entry_policy=True,
+    )
+    assert result.price_cycle is not None
+    assert result.status is not MidtermPortfolioStatus.DATA_NOT_READY
+    assert len(result.screening_candidates) <= 5
+    assert len(result.positions) <= 5
+
+
 def test_builds_one_adaptive_research_portfolio_and_orders_weights() -> None:
     histories, metadata = _universe()
     cutoff = histories[next(iter(histories))]["trade_date"].iloc[-1]
@@ -994,7 +1011,7 @@ def test_continuous_count_policy_uses_five_as_tie_preference_not_a_quota() -> No
     assert chosen is five
 
 
-def test_continuous_count_policy_does_not_fill_slots_at_lower_conservative_return() -> None:
+def test_continuous_count_policy_prefers_feasible_formed_set_to_concentrated_transition() -> None:
     two = _selection_row(2, lcb=0.07, correlation=0.50, contribution=0.70)
     five = _selection_row(5, lcb=0.06, correlation=0.40, contribution=0.25)
 
@@ -1004,7 +1021,22 @@ def test_continuous_count_policy_does_not_fill_slots_at_lower_conservative_retur
         maximum_stock_exposure=0.80,
     )
 
+    assert chosen is five
+
+
+def test_continuous_policy_keeps_transition_when_no_formed_set_is_qualified() -> None:
+    two = _selection_row(2, lcb=0.07, correlation=0.50, contribution=0.70)
+    chosen = _select_stock_count(
+        {1: [], 2: [two], 3: [], 4: [], 5: []}, continuous_policy=True
+    )
     assert chosen is two
+
+
+@pytest.mark.parametrize("declared_count", (5, 6))
+def test_continuous_selector_never_accepts_six_name_input_as_new_portfolio(declared_count) -> None:
+    six = _selection_row(6, lcb=0.10, correlation=0.30, contribution=0.20)
+    with pytest.raises(RuntimeError, match="1-to-5"):
+        _select_stock_count({declared_count: [six]}, continuous_policy=True)
 
 
 def test_continuous_cash_option_wins_an_exact_zero_lcb_tie(monkeypatch) -> None:

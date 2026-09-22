@@ -16,7 +16,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,6 +26,9 @@ from ashare_lab.bootstrap import application_data_dir
 WORKER_TIMEOUT_SECONDS = 8 * 60
 WORKER_TERMINATE_GRACE_SECONDS = 5
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+_REPORT_START = time(8, 45)
+_REPORT_END = time(9, 30)
+_LAST_RETRY = time(9, 20)
 
 
 def _read_state(path: Path) -> dict:
@@ -145,7 +148,7 @@ def supervise_evening_report(
     _clock: Callable[[], datetime] | None = None,
     _notifier: Callable | None = None,
 ) -> tuple[int, dict]:
-    """Run one regular 09:00–09:29 attempt with a finite wall-clock lifetime."""
+    """Run one regular 08:45–09:29 attempt with a finite wall-clock lifetime."""
     if not 0 < timeout_seconds <= WORKER_TIMEOUT_SECONDS:
         raise ValueError("worker timeout must be within the automatic attempt budget")
     parser = argparse.ArgumentParser(add_help=False)
@@ -163,8 +166,12 @@ def supervise_evening_report(
         _safe_log(log_root, event)
         return code, event
 
-    if now.weekday() in {5, 6} or now.hour != 9 or now.minute >= 30:
+    local_time = now.timetz().replace(tzinfo=None)
+    if now.weekday() in {5, 6} or not _REPORT_START <= local_time < _REPORT_END:
         return finish(0, "noop_outside_preopen_window")
+    # A late login must not start an eight-minute build past the opening bell.
+    deadline = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    attempt_timeout = min(timeout_seconds, max(0.1, (deadline - now).total_seconds() - 5))
     process = None
     try:
         _safe_log(log_root, {"job": "ashare-evening-worker", "status": "worker_started"})
@@ -175,7 +182,7 @@ def supervise_evening_report(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        code = process.wait(timeout=timeout_seconds)
+        code = process.wait(timeout=attempt_timeout)
     except subprocess.TimeoutExpired:
         try:
             if process is not None:
@@ -183,7 +190,7 @@ def supervise_evening_report(
         except Exception:
             return finish(2, "error", reason="evening_worker_termination_unconfirmed")
         outcome = finish(2, "error", reason="evening_worker_deadline_exceeded")
-        if now.minute >= 20:
+        if local_time >= _LAST_RETRY:
             notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
             _safe_log(
                 log_root,
@@ -197,7 +204,7 @@ def supervise_evening_report(
         return finish(2, "error", reason="evening_worker_start_or_wait_failed")
     if code == 0:
         return finish(0, "worker_completed")
-    if code != 0 and now.minute >= 20:
+    if code != 0 and local_time >= _LAST_RETRY:
         notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
         _safe_log(
             log_root,

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -37,6 +38,7 @@ from ashare_lab.adapters.notification_channels import (
 )
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
+from ashare_lab.analytics.portfolio_count_policy import CONTINUOUS_COUNT_POLICY_VERSION
 from ashare_lab.bootstrap import application_data_dir, project_root
 from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
 from ashare_lab.domain.errors import AShareLabError, DataUnavailableError
@@ -92,7 +94,7 @@ _TRADING_CALENDAR_LOOKAHEAD_DAYS = 14
 _HOLDING_CHART_CHANNELS = frozenset({"serverchan"})
 _HOLDING_CHART_MAX_URL_TTL_SECONDS = 3_600
 _MAX_CHART_ATTEMPTS = 4
-_AUTOMATIC_REPORT_START = time(9, 0)
+_AUTOMATIC_REPORT_START = time(8, 45)
 _AUTOMATIC_REPORT_END = time(9, 30)
 _FINAL_AUTOMATIC_RETRY = time(9, 20)
 _MANUAL_REPORT_START = time(8, 0)
@@ -117,6 +119,9 @@ _LOG_EVENT_KEYS = (
     "chart_reason",
     "chart_attempts",
     "text_already_accepted",
+    "stage",
+    "elapsed_seconds",
+    "count_policy_version",
 )
 
 
@@ -242,6 +247,19 @@ def run_evening_digest(
         project_root() / "migrations",
     )
     archiver = _archive_digest or _archive_original_digest
+    started_at = monotonic()
+
+    def progress(stage: str, *, common_cutoff: date | None = None) -> None:
+        fields: dict[str, Any] = {
+            "stage": stage,
+            "elapsed_seconds": round(monotonic() - started_at, 3),
+            "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
+        }
+        if common_cutoff is not None:
+            fields["common_cutoff"] = common_cutoff.isoformat()
+        _safe_write_log_outcome(
+            log_path, EveningDigestOutcome(EXIT_OK, _event("in_progress", **fields))
+        )
 
     def finish(outcome: EveningDigestOutcome) -> EveningDigestOutcome:
         local_time = now.timetz().replace(tzinfo=None)
@@ -288,6 +306,7 @@ def run_evening_digest(
         )
 
     try:
+        progress("data_lock")
         with daily_update_lock(lock_path) as acquired:
             if not acquired:
                 return finish(
@@ -300,9 +319,13 @@ def run_evening_digest(
             prior_state = _read_state(state_path)
             last_sent = _state_cutoff(prior_state)
             current_method_matches = (
-                _build_digest is not None
-                or prior_state.get("method_version") == CONTINUOUS_METHOD_VERSION
+                (
+                    _build_digest is not None
+                    or prior_state.get("method_version") == CONTINUOUS_METHOD_VERSION
+                )
+                and prior_state.get("count_policy_version") == CONTINUOUS_COUNT_POLICY_VERSION
             )
+            progress("verified_cutoff")
             latest = latest_reader(resolved_overlay)
             if latest is None:
                 return finish(_error("verified_market_data_unavailable"))
@@ -351,6 +374,7 @@ def run_evening_digest(
                     )
                 )
             try:
+                progress("trading_calendar", common_cutoff=latest)
                 preflight_plan_for_date = _validate_next_trading_day(
                     latest,
                     next_trading_day(latest),
@@ -393,6 +417,7 @@ def run_evening_digest(
                     )
             else:
                 digest_builder = _build_digest
+            progress("full_market_build", common_cutoff=latest)
             digest = digest_builder(
                 dataset_root=resolved_csmar,
                 overlay_root=resolved_overlay,
@@ -400,11 +425,13 @@ def run_evening_digest(
                 decision_date=target_date,
             )
             continuous_plan = digest.continuous_plan
+            progress("full_market_build_complete", common_cutoff=digest.common_cutoff)
             if (
                 digest.method_version != CONTINUOUS_METHOD_VERSION
                 or not isinstance(continuous_plan, dict)
                 or continuous_plan.get("mode") != "continuous"
                 or continuous_plan.get("method_version") != CONTINUOUS_METHOD_VERSION
+                or continuous_plan.get("count_policy_version") != CONTINUOUS_COUNT_POLICY_VERSION
             ):
                 # A production regression must fail closed; never let the
                 # retained one-horizon transport or an injected legacy digest
@@ -482,6 +509,7 @@ def run_evening_digest(
             # outcomes and later maturity observations are append-only and can
             # never rewrite this recommendation snapshot.
             holding_identity: tuple[str, int] | None = None
+            progress("holding_review", common_cutoff=digest.common_cutoff)
             current_ledger_identity: tuple[str, int] | None = None
             holding_symbols: tuple[str, ...] = ()
             holding_context = None
@@ -542,8 +570,10 @@ def run_evening_digest(
                 return finish(
                     _error("holding_version_changed_before_submission", common_cutoff=cutoff)
                 )
+            progress("archive", common_cutoff=digest.common_cutoff)
             archive = archiver(digest, repository)
 
+            progress("render", common_cutoff=digest.common_cutoff)
             public_body = render_evening_digest_markdown(
                 digest,
                 None,
@@ -737,6 +767,7 @@ def run_evening_digest(
                         plan_for_date=plan_for_date.isoformat(),
                     )
                 )
+            progress("provider_submission", common_cutoff=digest.common_cutoff)
             notification = notifier(message)
             if not isinstance(notification, EveningNotificationSummary):
                 raise TypeError("notifier must return EveningNotificationSummary")
@@ -749,6 +780,7 @@ def run_evening_digest(
             elif chart_status == "pending" and chart_attempts >= _MAX_CHART_ATTEMPTS:
                 chart_status = "exhausted"
             notification_event = {
+                "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
                 "configured_channels": list(notification.configured_channels),
                 "accepted_channels": list(notification.accepted_channels),
                 "failed_channels": list(notification.failed_channels),
@@ -761,6 +793,7 @@ def run_evening_digest(
                 "chart_attempts": chart_attempts,
                 "text_already_accepted": text_already_accepted,
             }
+            progress("record_submission", common_cutoff=digest.common_cutoff)
             _record_evening_delivery_events(
                 repository,
                 archive=archive,
@@ -789,6 +822,7 @@ def run_evening_digest(
                 {
                     "last_provider_accepted_common_cutoff": cutoff,
                     "method_version": digest.method_version,
+                    "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
                     "plan_for_date": plan_for_date.isoformat(),
                     "provider_accepted_at": now.isoformat(),
                     "accepted_channels": list(notification.accepted_channels),

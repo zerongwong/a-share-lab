@@ -13,6 +13,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from ashare_lab.analytics.portfolio_count_policy import MAX_CONTINUOUS_HOLDINGS
 from ashare_lab.ports.market_data import normalize_symbol
 
 _FOOTNOTE = "仅信号退出，不设到期卖出｜不自动下单，不保证收益。"
@@ -27,6 +28,7 @@ def render_continuous_report(
     entries: Sequence[Mapping[str, Any]],
     cash_weight: float | None,
     status_note: str,
+    screening_candidates: Sequence[Mapping[str, Any]] = (),
     chart_markdown: str | None = None,
     max_bytes: int = 4096,
 ) -> str:
@@ -58,6 +60,10 @@ def render_continuous_report(
         raise TypeError("holding_lines must be a sequence of authorized text lines")
     if isinstance(entries, (str, bytes, Mapping)) or not isinstance(entries, Sequence):
         raise TypeError("entries must be a sequence of mappings")
+    if isinstance(screening_candidates, (str, bytes, Mapping)) or not isinstance(
+        screening_candidates, Sequence
+    ):
+        raise TypeError("screening_candidates must be a sequence of mappings")
 
     market = _text(market_summary, "market_summary", allow_empty=True)
     status = _text(status_note, "status_note", allow_empty=True)
@@ -93,13 +99,13 @@ def render_continuous_report(
         qualified.append(
             f"- {name}({symbol})｜总资金{_percent(weight)}｜{condition}｜保护{_decimal(protection)}"
         )
-    if len(qualified) > 8:
-        raise ValueError("a continuous portfolio supports at most eight qualified new entries")
+    if len(qualified) > MAX_CONTINUOUS_HOLDINGS:
+        raise ValueError("a continuous portfolio supports at most five qualified new entries")
     cash = None if cash_weight is None else _fraction(cash_weight, "cash_weight")
     if total_new_weight > 1 or (cash is not None and total_new_weight + cash > 1 + Decimal("1e-9")):
         raise ValueError("new entries and planned cash cannot exceed the total account")
 
-    title = "持仓核验" if plan_date is None else f"{plan_date.isoformat()} 次日交易计划"
+    title = "持仓核验" if plan_date is None else f"{plan_date.isoformat()} 交易计划"
     prefix = [f"# 🪻 {title}", f"数据截至 {as_of.isoformat()}"]
     if holdings or plan_date is None:
         prefix.extend(("", "## 🩷 持仓优先"))
@@ -115,6 +121,20 @@ def render_continuous_report(
             suffix.append("其余未过门：暂不新买。")
     else:
         suffix.append("⏸ 暂不新买｜等待合格信号")
+    observations = []
+    for candidate in screening_candidates[:5]:
+        if not isinstance(candidate, Mapping):
+            raise TypeError("each screening candidate must be a mapping")
+        symbol = normalize_symbol(_required_string(candidate, "symbol"))
+        if symbol in symbols:
+            continue
+        symbols.add(symbol)
+        name = _text(_required_string(candidate, "name"), "name")
+        formation = _text(_required_string(candidate, "formation"), "formation")
+        reason = _text(_required_string(candidate, "reason"), "reason")
+        observations.append(f"- {name}({symbol})｜{formation}｜{reason}")
+    if observations:
+        suffix.extend(("", "## 重点候选 · 观察，不代表可以买", *observations))
     suffix.extend(
         (
             "现金：未核定（不代表空仓）" if cash is None else f"计划现金：总资金{_percent(cash)}",

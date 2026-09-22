@@ -97,12 +97,14 @@ def build_continuous_research_digest(
         "holding_based": False,
         "status_note": "数据或市场证据不足，暂不生成新买计划。",
         "search_scope": (
-            "initial_0_to_8_no_slot_filling;"
+            "initial_target_3_to_5_max_5_with_0_to_2_transition;"
             "single_replacement_all_admitted_plus_cash;one_stock_per_industry"
         ),
     }
     result = captured.get("result")
     snapshot = captured.get("snapshot")
+    plan["screening_candidates"] = _screening_candidates(result)
+    plan["screening_candidate_count"] = getattr(result, "horizon_candidate_count", 0)
     # Independent daily audit only: its cap/state NEVER feeds selection, the
     # holding ledger, protective stops, or the externally rendered plan.
     try:
@@ -133,7 +135,7 @@ def build_continuous_research_digest(
             if len(portfolio.positions) <= MAX_CONTINUOUS_HOLDINGS:
                 plan.update(_count_metadata(len(portfolio.positions)))
             else:
-                plan["status_note"] = "登记持仓超过八只，须先复核组合结构；暂停新增。"
+                plan["status_note"] = "登记持仓超过五只，须先复核组合结构；暂停新增。"
         else:
             plan.update(_count_metadata(0))
     if result is None or snapshot is None or result.price_cycle is None:
@@ -205,11 +207,19 @@ def _entry(
 
 def _initial_plan(result) -> dict[str, Any]:
     if result.status is not MidtermPortfolioStatus.RESEARCH_ONLY or not result.positions:
+        screened = _screening_candidates(result)
+        count = getattr(result, "horizon_candidate_count", len(screened))
+        if result.status is MidtermPortfolioStatus.DATA_NOT_READY:
+            note = "数据核验未完成，尚不能判断是否存在合格股票；暂停新买。"
+        elif count:
+            note = f"已找到{count}只确认形态候选；买点风险、证据或组合门尚未全部通过，暂不新买。"
+        else:
+            note = "本轮未找到同时通过周线方向和日线确认的股票，暂不新买。"
         return {
             "entries": [],
-            "cash_weight": 1.0,
+            "cash_weight": None if result.status is MidtermPortfolioStatus.DATA_NOT_READY else 1.0,
             **_count_metadata(0),
-            "status_note": "暂无同时通过周线方向、日线确认、证据和组合风险门的初建组合；暂不新买。",
+            "status_note": note,
         }
     industries = tuple(
         row.industry.strip() if isinstance(row.industry, str) else ""
@@ -251,6 +261,43 @@ def _initial_plan(result) -> dict[str, Any]:
 
 def _count_metadata(count: int) -> dict[str, Any]:
     return {"holding_count": count, "count_state": continuous_count_state(count)}
+
+
+def _screening_candidates(result) -> list[dict[str, Any]]:
+    """Expose up to five ranked formations without assigning an entry or weight."""
+    candidates = getattr(result, "screening_candidates", ()) or getattr(
+        result, "research_candidates", ()
+    )
+    rows = []
+    for candidate in candidates[:5]:
+        price = candidate.price_observation_plan
+        risk = None if price is None else price.initial_risk_fraction
+        if price is None:
+            reason = "保护线证据不足"
+        elif risk is not None and math.isfinite(risk) and risk > 0.08 + 1e-12:
+            reason = f"结构风险{risk:.1%}，超过8%"
+        elif price.initial_risk_qualified is not True:
+            reason = "买价与保护线尚不匹配"
+        elif candidate.evidence_unknown:
+            reason = "财务、公告或可成交性待核验"
+        elif not candidate.risk_history_available:
+            reason = "风险计算历史不足"
+        elif candidate.action.value != "conditional_entry":
+            reason = "当前周期的量价确认尚不足"
+        else:
+            reason = "个股门已通过，须结合组合与当日买价"
+        pattern = candidate.timeframe.structure.state.value if candidate.timeframe else ""
+        rows.append({
+            "symbol": candidate.symbol,
+            "name": candidate.name,
+            "formation": {
+                "volume_confirmed_breakout": "确认突破",
+                "healthy_post_breakout_pullback": "健康回踩",
+            }.get(pattern, "形态待核验"),
+            "reason": reason,
+            "entry_qualified": False,
+        })
+    return rows
 
 
 def mark_locked_account_weights(portfolio, histories, *, as_of: date, review):

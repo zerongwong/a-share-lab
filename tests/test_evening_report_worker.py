@@ -202,6 +202,32 @@ def test_timeout_releases_real_child_advisory_lock(tmp_path):
                 process.wait(timeout=5)
 
 
+def test_preparation_attempt_before_nine_does_not_send_premature_failure(tmp_path):
+    options = _options(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 9, 8, 8, 45, tzinfo=worker._SHANGHAI)
+    process = _Process(["timeout", -signal.SIGTERM, -signal.SIGTERM])
+    code, event = worker.supervise_evening_report(
+        **options,
+        _popen=lambda *_args, **_kwargs: process,
+        _kill_group=lambda *_args: None,
+        _notifier=lambda _message: pytest.fail("08:45 is not the final retry"),
+    )
+    assert code == 2
+    assert event["reason"] == "evening_worker_deadline_exceeded"
+
+
+def test_late_login_attempt_is_bounded_before_market_open(tmp_path):
+    options = _options(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 9, 8, 9, 29, tzinfo=worker._SHANGHAI)
+    process = _Process([0])
+    code, _ = worker.supervise_evening_report(
+        **options,
+        _popen=lambda *_args, **_kwargs: process,
+    )
+    assert code == 0
+    assert process.timeouts == [55]
+
+
 def test_regular_stable_entry_uses_supervisor(monkeypatch, capsys):
     from ashare_lab.cli import evening_report
 

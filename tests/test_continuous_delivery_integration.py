@@ -202,29 +202,29 @@ def test_real_evening_renderer_outputs_one_account_weighted_plan_with_price_boun
         assert forbidden not in body
 
 
-def test_continuous_renderer_keeps_all_eight_qualified_names_without_legacy_truncation():
+def test_continuous_renderer_keeps_five_qualified_names_without_legacy_truncation():
     digest = _continuous_digest()
     entries = tuple(
         {
             **digest.continuous_plan["entries"][0],
             "symbol": f"6000{index:02d}",
-            "name": f"八只合成{index}",
+            "name": f"五只合成{index}",
             "account_weight": 0.10,
         }
-        for index in range(8)
+        for index in range(5)
     )
     plan = {
         **digest.continuous_plan,
         "entries": entries,
-        "cash_weight": 0.20,
-        "holding_count": 8,
+        "cash_weight": 0.50,
+        "holding_count": 5,
         "count_state": "formed",
     }
     body = render_evening_digest_markdown(
         replace(digest, max_stock_exposure=0.80, minimum_cash_weight=0.20, continuous_plan=plan)
     )
-    assert body.count("总资金10%") == 8
-    assert "8只·成型组合" in body
+    assert body.count("总资金10%") == 5
+    assert "5只·成型组合" in body
 
 
 def test_holding_based_details_cannot_escape_without_holding_authorization():

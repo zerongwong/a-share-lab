@@ -208,8 +208,8 @@ def test_zero_stock_cash_metrics_are_not_fabricated_equity_correlations():
     assert decision.metrics.observation_count == 0
 
 
-@pytest.mark.parametrize("count", [1, 2, 3])
-def test_one_to_three_holdings_are_valid_transition_states_without_normalized_risk_rejection(
+@pytest.mark.parametrize("count", [1, 2])
+def test_one_to_two_holdings_are_valid_transition_states_without_normalized_risk_rejection(
     count,
 ):
     retained = _retained()[:count]
@@ -249,13 +249,14 @@ def test_initial_empty_portfolio_can_add_one_stock_without_normalized_risk_false
     )
 
 
-def test_four_to_eight_holdings_keep_normalized_position_risk_constraint():
-    retained = tuple(_candidate(f"OLD{i}", i) for i in range(4))
+@pytest.mark.parametrize("count", (3, 4, 5))
+def test_three_to_five_holdings_keep_normalized_position_risk_constraint(count):
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(count))
     decision = select_continuous_replacement(
         retained,
         {row.symbol: 0.1 for row in retained},
         [],
-        cash_weight=0.6,
+        cash_weight=1 - 0.1 * count,
         budget=replace(
             AdaptiveRiskBudget(),
             max_position_downside_risk_contribution=0.01,
@@ -274,9 +275,6 @@ def test_four_to_eight_holdings_keep_normalized_position_risk_constraint():
         (3, 0.151),
         (4, 0.151),
         (5, 0.151),
-        (6, 0.134),
-        (7, 0.115),
-        (8, 0.101),
     ],
 )
 def test_count_specific_stock_exposure_ceiling_blocks_overdeployed_retained_state(
@@ -297,31 +295,32 @@ def test_count_specific_stock_exposure_ceiling_blocks_overdeployed_retained_stat
     assert decision.evaluated_count == 0
 
 
-def test_eight_positions_have_no_slot_but_still_get_baseline_risk_review():
-    retained = tuple(_candidate(f"OLD{i}", i) for i in range(8))
+def test_five_positions_have_no_slot_but_still_get_baseline_risk_review():
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(5))
     decision = select_continuous_replacement(
         retained,
         {row.symbol: 0.1 for row in retained},
         [_candidate("NEW", 9, mean=0.004)],
-        cash_weight=0.2,
+        cash_weight=0.5,
         budget=AdaptiveRiskBudget(),
     )
     assert decision.status is ContinuousPortfolioStatus.HOLD_CASH
-    assert decision.reasons == ("maximum_eight_holdings_no_free_slot",)
+    assert decision.reasons == ("maximum_five_holdings_no_free_slot",)
     assert decision.evaluated_count == 1
 
 
-def test_more_than_eight_positions_requires_review_before_market_comparison():
-    retained = tuple(_candidate(f"OLD{i}", i) for i in range(9))
+@pytest.mark.parametrize("count", (6, 7, 8))
+def test_more_than_five_positions_requires_review_before_market_comparison(count):
+    retained = tuple(_candidate(f"OLD{i}", i) for i in range(count))
     decision = select_continuous_replacement(
         retained,
         {row.symbol: 0.09 for row in retained},
         [],
-        cash_weight=0.19,
+        cash_weight=1 - 0.09 * count,
         budget=AdaptiveRiskBudget(),
     )
     assert decision.status is ContinuousPortfolioStatus.REVIEW_REQUIRED
-    assert "maximum_eight_holdings" in decision.reasons
+    assert "maximum_five_holdings" in decision.reasons
     assert decision.evaluated_count == 0
 
 

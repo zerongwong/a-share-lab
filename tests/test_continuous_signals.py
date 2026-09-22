@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
 from ashare_lab.analytics.continuous_signals import (
@@ -8,7 +9,7 @@ from ashare_lab.analytics.continuous_signals import (
     assess_continuous_entry,
     continuous_entry_stage_rank_score,
 )
-from ashare_lab.analytics.medium_term_stage import MediumTermStage
+from ashare_lab.analytics.medium_term_stage import MediumTermStage, assess_medium_term_stage
 from ashare_lab.analytics.multi_timeframe import ExecutionState, StructureState, horizon_contract
 
 
@@ -20,9 +21,17 @@ def _admit(
     execution=ExecutionState.READY_BREAKOUT,
     candidate_qualified=True,
     execution_ready=True,
+    stage_metrics=None,
 ):
+    metrics = {
+        "distance_ma20": 0.0,
+        "distance_ma60": 0.0,
+        "return_60": 0.0,
+        "return_120": 0.0,
+    }
+    metrics.update(stage_metrics or {})
     return assess_continuous_entry(
-        SimpleNamespace(stage=stage, hard_freeze_new_entry=frozen),
+        SimpleNamespace(stage=stage, hard_freeze_new_entry=frozen, **metrics),
         SimpleNamespace(
             candidate_qualified=candidate_qualified,
             execution_ready=execution_ready,
@@ -71,6 +80,42 @@ def test_confirmed_non_extended_breakout_and_healthy_retest_can_enter(
 )
 def test_non_uptrend_or_extended_stage_remains_ineligible(stage):
     assert not _admit(stage=stage).qualified
+
+
+@pytest.mark.parametrize(
+    "metric,limit",
+    [
+        ("distance_ma20", 0.10),
+        ("distance_ma60", 0.18),
+        ("return_60", 0.50),
+        ("return_120", 0.85),
+    ],
+)
+def test_range_reversal_cannot_bypass_existing_extension_limits(metric, limit):
+    assert _admit(stage=MediumTermStage.RANGE, stage_metrics={metric: limit}).qualified
+    admission = _admit(
+        stage=MediumTermStage.RANGE, stage_metrics={metric: limit + 0.0001}
+    )
+    assert not admission.qualified
+    assert "entry_extension_exceeds_existing_limits" in admission.reasons
+
+
+def test_mixed_ma_reversal_with_actual_extended_history_is_rejected():
+    stage = assess_medium_term_stage(pd.Series([20.0] * 61 + [10.0] * 40 + [14.0] * 20))
+    assert stage.stage is MediumTermStage.RANGE
+    assert not stage.hard_freeze_new_entry
+    assert stage.distance_ma60 > 0.18
+    admission = assess_continuous_entry(
+        stage,
+        SimpleNamespace(
+            candidate_qualified=True,
+            execution_ready=True,
+            structure=SimpleNamespace(state=StructureState.BREAKOUT),
+            execution=SimpleNamespace(state=ExecutionState.READY_BREAKOUT),
+        ),
+    )
+    assert not admission.qualified
+    assert "entry_extension_exceeds_existing_limits" in admission.reasons
 
 
 def test_early_location_is_a_rank_bonus_not_an_orderly_trend_veto():

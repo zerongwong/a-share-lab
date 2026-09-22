@@ -1,4 +1,4 @@
-"""Render the independent Monday-to-Friday 09:00 pre-open report task."""
+"""Render the independent Monday-to-Friday pre-open report task."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ EVENING_REPORT_MODULE = "ashare_lab.cli.evening_report"
 # Friday.  The CLI still verifies that today is the next official trading
 # session; weekday scheduling alone is never treated as market-calendar proof.
 EVENING_REPORT_SCHEDULE = [
-    {"Weekday": weekday, "Hour": 9, "Minute": minute}
+    {"Weekday": weekday, "Hour": hour, "Minute": minute}
     for weekday in range(1, 6)
-    for minute in (0, 10, 20)
+    for hour, minute in ((8, 45), (8, 55), (9, 5), (9, 20))
 ]
 
 
@@ -41,7 +41,13 @@ def render_evening_report_launchagent_plist(
     if "KeepAlive" in document:
         raise ValueError("evening report LaunchAgent must not contain KeepAlive")
     if document.get("StartCalendarInterval") != EVENING_REPORT_SCHEDULE:
-        raise ValueError("pre-open report must retry at 09:00, 09:10 and 09:20 Monday-to-Friday")
+        raise ValueError("pre-open report must run at 08:45, 08:55, 09:05 and 09:20 weekdays")
+    # This deadline-sensitive computation reads the complete local market.
+    # Background I/O and CPU throttling can stretch a normal two-minute build
+    # past its watchdog. Keep the process ordinary while retaining its budget.
+    document.pop("LowPriorityIO", None)
+    document.pop("Nice", None)
+    document["ProcessType"] = "Standard"
     document["ProgramArguments"] = [
         "/usr/bin/caffeinate",
         "-i",

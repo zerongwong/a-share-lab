@@ -35,6 +35,26 @@ class MediumTermStageAssessment:
     distance_ma120: float | None
 
 
+def entry_extension_exceeded(
+    *,
+    distance_ma20: float | None,
+    distance_ma60: float | None,
+    return_60: float | None,
+    return_120: float | None,
+) -> bool:
+    """Apply the frozen extension limits independently of MA ordering."""
+
+    return any(
+        value is not None and value > limit
+        for value, limit in (
+            (distance_ma20, 0.10),
+            (distance_ma60, 0.18),
+            (return_60, 0.50),
+            (return_120, 0.85),
+        )
+    )
+
+
 def _clean_close(close: pd.Series) -> pd.Series:
     if not isinstance(close, pd.Series):
         raise TypeError("close must be a pandas Series")
@@ -102,7 +122,9 @@ def assess_medium_term_stage(close: pd.Series) -> MediumTermStageAssessment:
     ma120 = float(clean.tail(120).mean())
     ordered_uptrend = latest > ma20 > ma60 > ma120 and r20 > 0 and r60 > 0
     ordered_downtrend = latest < ma20 < ma60 < ma120 and r20 < 0 and r60 < 0
-    extended = d20 > 0.10 or d60 > 0.18 or r60 > 0.50 or r120 > 0.85
+    extended = entry_extension_exceeded(
+        distance_ma20=d20, distance_ma60=d60, return_60=r60, return_120=r120
+    )
 
     if hard_freeze:
         stage = MediumTermStage.PARABOLIC

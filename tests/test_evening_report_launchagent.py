@@ -36,10 +36,14 @@ def test_report_template_is_independent_secret_free_and_weekday_preopen_only() -
     assert document["RunAtLoad"] is True
     assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
     assert [item["Weekday"] for item in document["StartCalendarInterval"]] == [
-        day for day in range(1, 6) for _ in range(3)
+        day for day in range(1, 6) for _ in range(4)
     ]
-    assert all(item["Hour"] == 9 for item in document["StartCalendarInterval"])
-    assert {item["Minute"] for item in document["StartCalendarInterval"]} == {0, 10, 20}
+    assert {(item["Hour"], item["Minute"]) for item in document["StartCalendarInterval"]} == {
+        (8, 45), (8, 55), (9, 5), (9, 20)
+    }
+    assert document["ProcessType"] == "Standard"
+    assert "LowPriorityIO" not in document
+    assert "Nice" not in document
     assert 0 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert 6 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
     assert "KeepAlive" not in document
@@ -112,5 +116,5 @@ def test_readme_documents_manual_run_and_explicit_installation() -> None:
     assert ".venv/bin/python -m ashare_lab.cli.evening_report" in readme
     assert "./scripts/install_evening_report_launchagent.sh" in readme
     assert "./scripts/uninstall_evening_report_launchagent.sh" in readme
-    assert "周一至周五09:00" in readme
+    assert "周一至周五08:45" in readme
     assert "当天是否交易日" in readme

@@ -658,12 +658,12 @@ def test_candidate_count_outside_three_to_five_fails_closed(count: int) -> None:
     (
         (1, 0.15, False, False),
         (2, 0.30, True, False),
-        (3, 0.45, True, False),
-        (6, 0.80, True, True),
-        (8, 0.80, True, True),
+        (3, 0.45, True, True),
+        (4, 0.60, True, True),
+        (5, 0.75, True, True),
     ),
 )
-def test_continuous_count_policy_supports_one_to_eight_without_weakening_gates(
+def test_continuous_count_policy_supports_up_to_five_without_weakening_gates(
     count: int,
     expected_exposure: float,
     correlation_applicable: bool,
@@ -681,6 +681,14 @@ def test_continuous_count_policy_supports_one_to_eight_without_weakening_gates(
     assert result.metrics.position_risk_contribution_applicable is contribution_applicable
     assert result.risk_budget.correlation_applicable is correlation_applicable
     assert result.risk_budget.position_risk_contribution_applicable is contribution_applicable
+
+
+@pytest.mark.parametrize("count", (6, 7, 8))
+def test_continuous_policy_rejects_more_than_five_at_optimizer_boundary(count: int) -> None:
+    with pytest.raises(AdaptivePortfolioDataError, match="one and five"):
+        optimize_adaptive_portfolio(
+            _candidate_set(count), budget=_lax_budget(), count_policy=CONTINUOUS_COUNT_POLICY_VERSION
+        )
 
 
 def test_continuous_single_name_exposure_respects_tighter_cycle_industry_cap() -> None:

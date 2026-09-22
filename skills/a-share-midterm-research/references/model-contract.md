@@ -380,13 +380,14 @@ This section supersedes the **horizon/default/output** provisions of the legacy
 contract below; its evidence, privacy, point-in-time and no-order safeguards
 still apply. Do not silently reactivate six-horizon production recommendations.
 
-- One ongoing zero-to-eight-stock research target, no forced holding deadline.
-  Zero names means cash; one to three are concentrated transition states and
-  must use reduced stock exposure; four to eight form a portfolio; five to six
-  are the normal preference. Every count is conditional on eligible evidence,
+- One ongoing three-to-five-stock research target, maximum five, no forced holding deadline.
+  The separately versioned `continuous-count-policy-v3.0.0` first compares
+  qualified three-to-five-name sets. Only when none qualifies may one or two
+  be considered as reduced-exposure transitions; zero means cash.
+  Every count is conditional on eligible evidence,
   so do not relax risk gates or add an inferior name merely to fill a slot.
   Before the cycle overlay, the count-specific stock-exposure ceilings for one
-  through eight names are 15%, 30%, 45%, 60%, 75%, 80%, 80% and 80%; actual
+  through five names are 15%, 30%, 45%, 60% and 75%; actual
   exposure is the lower of that ceiling and the current cycle ceiling, with the
   remainder in cash.
 - Daily/completed-weekly signal windows are independently frozen. The old
@@ -410,9 +411,9 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   available cash and risk constraints permit. Existing drifted weights are facts,
   not permission to add or rebalance automatically. Pair correlation is explicitly
   not applicable to a one-name state. Normalized single-name downside-risk
-  contribution is explicitly not applicable to one-to-three-name transition states,
+  contribution is explicitly not applicable to one-to-two-name transition states,
   where it is mechanically high; reduced total exposure, the 20% account cap and
-  all absolute path/tail/data gates remain binding. Four through eight names restore
+  all absolute path/tail/data gates remain binding. Three through five names restore
   the normalized contribution hard gate. Never fabricate a passing value for an
   inapplicable statistic.
 - Initial allocation still projects the continuous target to ten-percentage-point
@@ -439,6 +440,10 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   continuous decision/NAV records are separate from immutable legacy maturities.
   Actual versus shadow, cash, open positions, costs and company actions must be
   distinguished; absent evidence is unavailable, not zero return.
+- Keep up to five ranked technical screening candidates independent of portfolio
+  optimisation. Mark observations explicitly, without new-buy weights; distinguish
+  missing financial/announcement/execution evidence from a market with no qualifying
+  formations. Never synthesize a passing evidence flag to produce a list.
 - Only authorized ServerChan summaries/images may leave the local machine.
   Verify exact holding version before disclosure; R2 secrets and raw financial
   data are never report content. Provider acceptance is not end-device delivery.

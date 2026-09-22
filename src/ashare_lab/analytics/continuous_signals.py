@@ -8,7 +8,11 @@ An entry gate must never be reapplied to an intact existing holding.
 
 from dataclasses import dataclass
 
-from ashare_lab.analytics.medium_term_stage import MediumTermStage, MediumTermStageAssessment
+from ashare_lab.analytics.medium_term_stage import (
+    MediumTermStage,
+    MediumTermStageAssessment,
+    entry_extension_exceeded,
+)
 from ashare_lab.analytics.multi_timeframe import (
     BarTimeframe,
     ExecutionState,
@@ -66,6 +70,16 @@ def assess_continuous_entry(
         MediumTermStage.ORDERLY_UPTREND,
     } or stage.hard_freeze_new_entry:
         reasons.append("downtrend_extended_or_unavailable_stage")
+    # RANGE describes mixed MA ordering, not proof of an unextended entry.
+    # Preserve the existing limits even when a sharp reversal is not yet
+    # classified as an ordered uptrend by the shared legacy stage classifier.
+    if entry_extension_exceeded(
+        distance_ma20=stage.distance_ma20,
+        distance_ma60=stage.distance_ma60,
+        return_60=stage.return_60,
+        return_120=stage.return_120,
+    ):
+        reasons.append("entry_extension_exceeds_existing_limits")
     if not timeframe.candidate_qualified:
         reasons.append("daily_weekly_structure_not_qualified")
     if timeframe.structure.state not in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}:

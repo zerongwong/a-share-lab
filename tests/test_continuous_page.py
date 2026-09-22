@@ -68,7 +68,7 @@ def test_import_and_initial_page_do_not_load_data_or_call_network():
     page.render(ui, decision_date=TODAY, _view_loader=forbidden)
     assert "不发送微信" in _text(ui)
     assert "一组组合" in _text(ui)
-    assert "0–8只" in _text(ui)
+    assert "目标3–5只、上限5只" in _text(ui)
     assert "新仓通常约总资金15%" in _text(ui)
     assert not any(kind in {"selectbox", "radio"} for kind, _args, _kwargs in ui.messages)
 
@@ -101,7 +101,7 @@ def test_explicit_calendar_button_allows_future_qualified_plan():
         _view_loader=lambda **_kwargs: _view(),
         _calendar_resolver=lambda _cutoff: date(2026, 9, 7),
     )
-    assert "2026-09-07 次日交易计划" in _text(ui)
+    assert "2026-09-07 交易计划" in _text(ui)
     assert "总资金20%" in _text(ui)
 
 

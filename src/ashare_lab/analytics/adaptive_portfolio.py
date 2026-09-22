@@ -23,13 +23,14 @@ remain the audit target.  Their limits are:
 * 5 stocks: 85% stock exposure, 8%--25% per stock.
 
 Those limits remain the legacy fixed-horizon contract.  The explicitly selected
-``continuous-count-policy-v2.0.0`` instead admits one through eight names, caps
+``continuous-count-policy-v3.0.0`` instead targets three through five names with
+one-to-two-name transition states, caps
 normal count-state stock exposure at 15%, 30%, 45%, 60%, 75%, 80%, 80% and 80%,
 and independently enforces a 20% total-account hard cap per new position.
 
 The operational stock sleeve is then selected by exhaustive search on a 10%
 integer grid.  Legacy three-stock sleeves permit 20%--50% per name, four-stock
-sleeves 10%--40%, and five-stock sleeves 10%--30%; continuous v2 supplies its
+sleeves 10%--40%, and five-stock sleeves 10%--30%; continuous v3 supplies its
 own count-specific sleeve box.  The grid must sum to 100% of the stock sleeve
 and must still respect the total-account industry cap.  All risk
 and return metrics use these operational weights, not the continuous target.
@@ -82,6 +83,7 @@ from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_COUNT_POLICY_VERSION,
     CONTINUOUS_OPERATION_STOCK_SLEEVE_LIMITS,
     CONTINUOUS_POSITION_LIMITS,
+    FORMED_PORTFOLIO_MIN_HOLDINGS,
     MAX_NEW_ACCOUNT_WEIGHT,
 )
 from ashare_lab.analytics.weight_quantization import (
@@ -589,7 +591,7 @@ def _prepare_candidates(
     limits, _sleeve_limits = _count_policy_limits(count_policy)
     if len(prepared) not in limits:
         if count_policy == CONTINUOUS_COUNT_POLICY_VERSION:
-            raise AdaptivePortfolioDataError("between one and eight candidates are required")
+            raise AdaptivePortfolioDataError("between one and five candidates are required")
         raise AdaptivePortfolioDataError("exactly three, four, or five candidates are required")
     symbols = [item.symbol for item in prepared]
     if len(set(symbols)) != len(symbols):
@@ -992,7 +994,8 @@ def _evaluate_prepared(
     contributions = _downside_risk_contributions(returns, weights)
     max_contribution = float(contributions.max())
     contribution_applicable = not (
-        count_policy == CONTINUOUS_COUNT_POLICY_VERSION and len(candidates) < 4
+        count_policy == CONTINUOUS_COUNT_POLICY_VERSION
+        and len(candidates) < FORMED_PORTFOLIO_MIN_HOLDINGS
     )
 
     holding_returns = _non_overlapping_portfolio_returns(

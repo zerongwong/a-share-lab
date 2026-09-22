@@ -33,12 +33,16 @@ from ashare_lab.analytics.adaptive_portfolio import (
     _fixed_share_rolling_drawdown_magnitudes,
     _non_overlapping_portfolio_returns,
 )
-from ashare_lab.analytics.portfolio_count_policy import CONTINUOUS_POSITION_LIMITS
+from ashare_lab.analytics.portfolio_count_policy import (
+    CONTINUOUS_POSITION_LIMITS,
+    FORMED_PORTFOLIO_MIN_HOLDINGS,
+    MAX_CONTINUOUS_HOLDINGS,
+)
 
-CONTINUOUS_PORTFOLIO_METHOD_VERSION = "locked-holdings-single-replacement-lcb20-v0.2.0"
+CONTINUOUS_PORTFOLIO_METHOD_VERSION = "locked-holdings-single-replacement-lcb20-v0.3.0"
 _PROXY_SESSIONS = 20
 _NEW_WEIGHTS = (0.10, 0.20)
-_MAX_HOLDINGS = 8
+_MAX_HOLDINGS = MAX_CONTINUOUS_HOLDINGS
 _MAX_ACCOUNT_WEIGHT = 0.20
 _WARNINGS = (
     "research_only_not_future_return_or_global_optimum",
@@ -207,7 +211,7 @@ def _metrics(
         budget.holding_period_cost_rate,
         budget.lcb_confidence,
         len(weights) > 1,
-        len(weights) >= 4,
+        len(weights) >= FORMED_PORTFOLIO_MIN_HOLDINGS,
     )
 
 
@@ -252,7 +256,7 @@ def _structure_reasons(
 ) -> tuple[str, ...]:
     reasons: list[str] = []
     if len(candidates) > _MAX_HOLDINGS:
-        reasons.append("maximum_eight_holdings")
+        reasons.append("maximum_five_holdings")
     if any(weight > _MAX_ACCOUNT_WEIGHT + 1e-12 for weight in weights.values()):
         reasons.append("maximum_20pct_account_weight")
     industries: dict[str, float] = {}
@@ -384,7 +388,7 @@ def select_continuous_replacement(
     if len(retained) == _MAX_HOLDINGS:
         return result(
             ContinuousPortfolioStatus.HOLD_CASH,
-            ("maximum_eight_holdings_no_free_slot",),
+            ("maximum_five_holdings_no_free_slot",),
         )
     valid: list[AdaptiveCandidate] = []
     replacement_symbols = [row.symbol for row in replacements if isinstance(row, AdaptiveCandidate)]
