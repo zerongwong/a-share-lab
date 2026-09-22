@@ -736,7 +736,7 @@ def test_second_process_lock_owner_is_harmless_noop(tmp_path: Path) -> None:
     assert called is False
 
 
-def test_delayed_0840_sync_defers_before_lock_and_can_resume_after_report(
+def test_delayed_0800_sync_defers_before_lock_and_can_resume_after_report(
     tmp_path: Path,
 ) -> None:
     calls = []
@@ -745,7 +745,7 @@ def test_delayed_0840_sync_defers_before_lock_and_can_resume_after_report(
 
     deferred = scheduled_sync.run_scheduled_sync(
         **paths,
-        clock=lambda: datetime(2026, 8, 28, 0, 50, tzinfo=UTC),
+        clock=lambda: datetime(2026, 8, 28, 0, 18, tzinfo=UTC),
         _run_update=lambda **kwargs: calls.append(kwargs) or _report(current=True),
         _notifier=lambda _message: _NotificationResult(),
     )
@@ -759,7 +759,7 @@ def test_delayed_0840_sync_defers_before_lock_and_can_resume_after_report(
 
     resumed = scheduled_sync.run_scheduled_sync(
         **paths,
-        clock=lambda: datetime(2026, 8, 28, 1, 30, tzinfo=UTC),
+        clock=lambda: datetime(2026, 8, 28, 1, 0, tzinfo=UTC),
         _run_update=lambda **kwargs: calls.append(kwargs) or _report(current=True),
         _notifier=lambda _message: _NotificationResult(),
     )
@@ -848,6 +848,7 @@ def test_cli_main_retires_legacy_fixed_horizon_jobs_but_keeps_holding_review(
     assert "_monthly_review_builder" not in calls[0]
     assert calls[0]["_holding_review_runner"] is scheduled_sync.run_active_holding_review
     assert calls[0]["_holding_shadow_runner"] is scheduled_sync.run_holding_stop_shadows
+    assert calls[0]["_notifier"] is None
 
 
 def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
@@ -866,8 +867,7 @@ def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
     assert document["StartCalendarInterval"] == [
         {"Hour": 6, "Minute": 30},
         {"Hour": 7, "Minute": 30},
-        {"Hour": 8, "Minute": 20},
-        {"Hour": 8, "Minute": 40},
+        {"Hour": 8, "Minute": 0},
         {"Hour": 15, "Minute": 30},
         {"Hour": 16, "Minute": 30},
         {"Hour": 18, "Minute": 30},
@@ -915,8 +915,7 @@ def test_launchagent_renderer_replaces_placeholders_without_inserting_arguments(
     assert document["StartCalendarInterval"] == [
         {"Hour": 6, "Minute": 30},
         {"Hour": 7, "Minute": 30},
-        {"Hour": 8, "Minute": 20},
-        {"Hour": 8, "Minute": 40},
+        {"Hour": 8, "Minute": 0},
         {"Hour": 15, "Minute": 30},
         {"Hour": 16, "Minute": 30},
         {"Hour": 18, "Minute": 30},
@@ -939,7 +938,8 @@ def test_installers_only_manage_daily_label_and_preserve_data_and_keys() -> None
     assert "import ashare_lab.cli.scheduled_sync" in install
     assert "render_launchagent_plist" in install
     assert "plutil -replace ProgramArguments.0" not in install
-    assert "次日06:30、07:30、08:20、08:40盘前补齐" in install
+    assert "次日06:30、07:30、08:00盘前补齐" in install
+    assert "08:18–09:00" in install
     assert "BACKUP_PLIST" in install
     assert "正在恢复安装前状态" in install
     assert "research.db" not in uninstall
@@ -952,3 +952,31 @@ def test_installers_only_manage_daily_label_and_preserve_data_and_keys() -> None
 def test_pyproject_registers_scheduled_command() -> None:
     source = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert 'ashare-scheduled-sync = "ashare_lab.cli.scheduled_sync:main"' in source
+
+
+def test_default_sync_failure_and_recovery_remain_local_without_credentials_or_messages(tmp_path, monkeypatch):
+    attempted = []
+    monkeypatch.setattr(scheduled_sync, "load_serverchan_sendkey", lambda: attempted.append("credential"))
+    monkeypatch.setattr(scheduled_sync, "send_scheduled_notification", lambda message: attempted.append("send"))
+    def fail(**kwargs):
+        raise DataUnavailableError("provider unavailable")
+    failure = scheduled_sync.run_scheduled_sync(**_paths(tmp_path), clock=lambda: NOW, _run_update=fail)
+    assert failure.exit_code == scheduled_sync.EXIT_ERROR
+    assert failure.event["notification_policy"] == "automatic_sync_silent"
+    assert json.loads((tmp_path / "scheduler/daily-sync-state.json").read_text())["failure_active"] is True
+    recovery = scheduled_sync.run_scheduled_sync(**_paths(tmp_path), clock=lambda: NOW, _run_update=lambda **k: _report(current=True))
+    assert recovery.exit_code == scheduled_sync.EXIT_CURRENT
+    assert "recovery_notification_successful_channels" not in recovery.event
+    assert json.loads((tmp_path / "scheduler/daily-sync-state.json").read_text())["failure_active"] is False
+    assert attempted == []
+
+
+def test_default_unexpected_entrypoint_failure_does_not_notify(tmp_path, monkeypatch):
+    attempted = []
+    monkeypatch.setattr(scheduled_sync, "send_scheduled_notification", lambda message: attempted.append(message))
+    def fail(**kwargs):
+        raise RuntimeError("unexpected fault")
+    result = scheduled_sync.run_scheduled_sync(**_paths(tmp_path), clock=lambda: NOW, _run_update=fail)
+    assert result.event["reason"] == "unexpected_scheduler_error"
+    assert result.event["notification_policy"] == "automatic_sync_silent"
+    assert attempted == []

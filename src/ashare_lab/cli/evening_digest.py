@@ -94,10 +94,11 @@ _TRADING_CALENDAR_LOOKAHEAD_DAYS = 14
 _HOLDING_CHART_CHANNELS = frozenset({"serverchan"})
 _HOLDING_CHART_MAX_URL_TTL_SECONDS = 3_600
 _MAX_CHART_ATTEMPTS = 4
-_AUTOMATIC_REPORT_START = time(8, 45)
-_AUTOMATIC_REPORT_END = time(9, 30)
-_FINAL_AUTOMATIC_RETRY = time(9, 20)
+_AUTOMATIC_REPORT_START = time(8, 20)
+_AUTOMATIC_REPORT_END = time(8, 58)
+_FINAL_AUTOMATIC_RETRY = time(8, 50)
 _MANUAL_REPORT_START = time(8, 0)
+_MANUAL_REPORT_END = time(9, 30)
 _NOTIFICATION_CHANNELS_ENV = "ASHARE_EVENING_NOTIFICATION_CHANNELS"
 _SUPPORTED_NOTIFICATION_CHANNELS = ("serverchan", "bark")
 _LOG_EVENT_KEYS = (
@@ -262,20 +263,41 @@ def run_evening_digest(
         )
 
     def finish(outcome: EveningDigestOutcome) -> EveningDigestOutcome:
-        local_time = now.timetz().replace(tzinfo=None)
+        finished_at = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
+        local_time = finished_at.timetz().replace(tzinfo=None)
         if (
             outcome.exit_code != EXIT_OK
+            and finished_at.date() == report_date
             and _FINAL_AUTOMATIC_RETRY <= local_time < _AUTOMATIC_REPORT_END
         ):
-            _send_final_failure_notice(
-                repository=repository,
-                notifier=notifier,
-                state_root=resolved_state_root,
-                dataset_root=resolved_csmar,
-                overlay_root=resolved_overlay,
-                now=now,
-                holding_reviewer=_build_holding_review,
-            )
+            if send_now:
+                _send_final_failure_notice(
+                    repository=repository,
+                    notifier=notifier,
+                    state_root=resolved_state_root,
+                    dataset_root=resolved_csmar,
+                    overlay_root=resolved_overlay,
+                    now=finished_at,
+                    holding_reviewer=_build_holding_review,
+                )
+            else:
+                # Deadline notices must never wait for a second market/holding
+                # review. The independent watchdog uses this same locked receipt.
+                from ashare_lab.cli.preopen_deadline import notify_incomplete_once
+
+                def injected_notice(message):
+                    receipt = notifier(message)
+                    return (
+                        isinstance(receipt, EveningNotificationSummary)
+                        and "serverchan" in receipt.accepted_channels
+                    )
+
+                notify_incomplete_once(
+                    state_root=resolved_state_root,
+                    now=finished_at,
+                    notifier=injected_notice if _notifier is not None else None,
+                    clock=_clock,
+                )
         _safe_write_log_outcome(log_path, outcome)
         return outcome
 
@@ -291,7 +313,7 @@ def run_evening_digest(
             )
         )
     initial_local_time = now.timetz().replace(tzinfo=None)
-    if send_now and not (_MANUAL_REPORT_START <= initial_local_time < _AUTOMATIC_REPORT_END):
+    if send_now and not (_MANUAL_REPORT_START <= initial_local_time < _MANUAL_REPORT_END):
         return finish(_error("manual_send_requires_current_preopen_window"))
     if not send_now and not (_AUTOMATIC_REPORT_START <= initial_local_time < _AUTOMATIC_REPORT_END):
         return finish(EveningDigestOutcome(EXIT_OK, _event("noop_outside_morning_window")))
@@ -300,9 +322,10 @@ def run_evening_digest(
         checked_at = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
         checked_time = checked_at.timetz().replace(tzinfo=None)
         window_start = _MANUAL_REPORT_START if send_now else _AUTOMATIC_REPORT_START
+        window_end = _MANUAL_REPORT_END if send_now else _AUTOMATIC_REPORT_END
         return (
             checked_at.date() == report_date
-            and window_start <= checked_time < _AUTOMATIC_REPORT_END
+            and window_start <= checked_time < window_end
         )
 
     try:
@@ -387,6 +410,21 @@ def run_evening_digest(
                         plan_for_date=None,
                     )
                 )
+            if preflight_plan_for_date >= report_date:
+                # The watchdog can use this local, date-scoped calendar verdict
+                # without making a network request or taking the data-sync lock.
+                # An older next session proves stale data, NOT a holiday today.
+                with suppress(OSError):
+                    _write_state(
+                        resolved_state_root / "preopen-session-state.json",
+                        {
+                            "date": report_date.isoformat(),
+                            "is_trading_day": preflight_plan_for_date == report_date,
+                            "checked_at": (
+                                _clock or (lambda: datetime.now(_SHANGHAI))
+                            )().astimezone(_SHANGHAI).isoformat(),
+                        },
+                    )
             if preflight_plan_for_date != report_date:
                 if preflight_plan_for_date < report_date:
                     return finish(
@@ -406,7 +444,17 @@ def run_evening_digest(
                     )
                 )
 
+            registered_holdings = None
             if _build_digest is None:
+                # Membership is the user's confirmed fact, never an output of
+                # today's screen. A ledger error must not become an empty account.
+                registered_holdings = get_active_holding_portfolio(repository)
+            if registered_holdings is not None and registered_holdings.positions:
+                # Held accounts get a holding-only review. Do not wait for
+                # full-market selection / new-entry financial due diligence.
+                def digest_builder(**kwargs):
+                    return _holding_only_digest(registered_holdings, latest)
+            elif _build_digest is None:
                 from ashare_lab.services.build_continuous_digest import (
                     build_continuous_research_digest,
                 )
@@ -417,7 +465,12 @@ def run_evening_digest(
                     )
             else:
                 digest_builder = _build_digest
-            progress("full_market_build", common_cutoff=latest)
+            build_stage = (
+                "holding_only_build"
+                if registered_holdings is not None and registered_holdings.positions
+                else "full_market_build"
+            )
+            progress(build_stage, common_cutoff=latest)
             digest = digest_builder(
                 dataset_root=resolved_csmar,
                 overlay_root=resolved_overlay,
@@ -425,7 +478,7 @@ def run_evening_digest(
                 decision_date=target_date,
             )
             continuous_plan = digest.continuous_plan
-            progress("full_market_build_complete", common_cutoff=digest.common_cutoff)
+            progress(f"{build_stage}_complete", common_cutoff=digest.common_cutoff)
             if (
                 digest.method_version != CONTINUOUS_METHOD_VERSION
                 or not isinstance(continuous_plan, dict)
@@ -794,12 +847,10 @@ def run_evening_digest(
                 "text_already_accepted": text_already_accepted,
             }
             progress("record_submission", common_cutoff=digest.common_cutoff)
-            _record_evening_delivery_events(
-                repository,
-                archive=archive,
-                notification=notification,
-            )
             if not notification.any_accepted:
+                _record_evening_delivery_events(
+                    repository, archive=archive, notification=notification
+                )
                 if text_already_accepted:
                     _write_state(
                         state_path,
@@ -824,7 +875,9 @@ def run_evening_digest(
                     "method_version": digest.method_version,
                     "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
                     "plan_for_date": plan_for_date.isoformat(),
-                    "provider_accepted_at": now.isoformat(),
+                    "provider_accepted_at": (
+                        _clock or (lambda: datetime.now(_SHANGHAI))
+                    )().astimezone(_SHANGHAI).isoformat(),
                     "accepted_channels": list(notification.accepted_channels),
                     "provider_receipt_ids": list(notification.provider_receipt_ids),
                     "delivery_confirmed": False,
@@ -832,6 +885,12 @@ def run_evening_digest(
                     "chart_attempts": chart_attempts,
                     "chart_reason": chart_reason,
                 },
+            )
+            # Persist provider acceptance before optional database bookkeeping.
+            # A slow/failed journal write must not cause the independent
+            # deadline check to announce that an accepted report is missing.
+            _record_evening_delivery_events(
+                repository, archive=archive, notification=notification
             )
             return finish(
                 EveningDigestOutcome(
@@ -921,6 +980,35 @@ def _send_final_failure_notice(
             )
     except Exception:
         return
+
+
+def _holding_only_digest(portfolio, cutoff: date) -> EveningResearchDigest:
+    """Transport for a review, not a newly optimized allocation or market view."""
+    return EveningResearchDigest(
+        common_cutoff=cutoff,
+        decision_date=cutoff,
+        cycle_label="持仓跟踪",
+        entry_strictness="unavailable",
+        max_stock_exposure=0.0,
+        minimum_cash_weight=0.0,
+        cycle_rule_agreement=0.0,
+        periods=(),
+        method_version=CONTINUOUS_METHOD_VERSION,
+        continuous_plan={
+            "mode": "continuous",
+            "method_version": CONTINUOUS_METHOD_VERSION,
+            "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
+            "holding_based": True,
+            "holding_review_only": True,
+            "holding_identity": [portfolio.id, portfolio.version],
+            "holding_count": len(portfolio.positions),
+            "entries": [],
+            "cash_weight": None,
+            "status_note": "仅跟踪已登记持仓；建议不等于成交，买卖后由用户确认更新。",
+            "pending_exit_symbols": [],
+            "screening_candidates": [],
+        },
+    )
 
 
 def _archive_original_digest(

@@ -85,7 +85,7 @@ def _paths(tmp_path: Path) -> dict[str, object]:
         "reference_root": tmp_path / "reference",
         "state_root": tmp_path / "state",
         "log_root": tmp_path / "logs",
-        "_clock": lambda: datetime(2026, 8, 28, 1, 0, tzinfo=UTC),
+        "_clock": lambda: datetime(2026, 8, 28, 0, 40, tzinfo=UTC),
     }
 
 
@@ -709,6 +709,8 @@ def test_image_rejected_after_text_acceptance_is_revoked_and_republished_with_ne
 def test_morning_window_and_plan_date_block_daytime_and_non_report_runs(tmp_path):
     for label, instant in (
         ("07", datetime(2026, 8, 27, 23, tzinfo=UTC)),
+        ("0858", datetime(2026, 8, 28, 0, 58, tzinfo=UTC)),
+        ("0900", datetime(2026, 8, 28, 1, 0, tzinfo=UTC)),
         ("12", datetime(2026, 8, 28, 4, tzinfo=UTC)),
         ("22", datetime(2026, 8, 28, 14, tzinfo=UTC)),
     ):
@@ -827,12 +829,15 @@ def test_weekday_without_calendar_session_is_noop_not_an_invented_plan(tmp_path)
         "common_cutoff": CUTOFF.isoformat(),
         "plan_for_date": next_verified_session.isoformat(),
     }
+    calendar_state = json.loads((tmp_path / "state" / "preopen-session-state.json").read_text())
+    assert calendar_state["date"] == FRIDAY.isoformat()
+    assert calendar_state["is_trading_day"] is False
 
 
 @pytest.mark.parametrize(
     ("send_now", "end_time"),
     [
-        (False, datetime(2026, 8, 28, 1, 30, tzinfo=UTC)),
+        (False, datetime(2026, 8, 28, 0, 58, tzinfo=UTC)),
         (False, datetime(2026, 8, 28, 2, 0, tzinfo=UTC)),
         (True, datetime(2026, 8, 28, 1, 30, tzinfo=UTC)),
     ],
@@ -841,7 +846,7 @@ def test_long_build_crossing_submission_window_is_a_visible_failure(tmp_path, se
     current = [
         datetime(2026, 8, 28, 0, 30, tzinfo=UTC)
         if send_now
-        else datetime(2026, 8, 28, 1, 0, tzinfo=UTC)
+        else datetime(2026, 8, 28, 0, 40, tzinfo=UTC)
     ]
     options = _paths(tmp_path)
     options["_clock"] = lambda: current[0]
@@ -900,12 +905,12 @@ def test_default_text_only_ignores_old_chart_grants_and_pending_image_retry(tmp_
 
 
 def test_window_is_checked_again_after_archiving_before_actual_send(tmp_path):
-    current = [datetime(2026, 8, 28, 1, tzinfo=UTC)]
+    current = [datetime(2026, 8, 28, 0, 40, tzinfo=UTC)]
     options = _paths(tmp_path)
     options["_clock"] = lambda: current[0]
 
     def archive(*_args):
-        current[0] = datetime(2026, 8, 28, 1, 30, tzinfo=UTC)
+        current[0] = datetime(2026, 8, 28, 0, 58, tzinfo=UTC)
         return SimpleNamespace(report_id="synthetic-expired-report")
 
     outcome = evening_report.run_evening_digest(
@@ -1264,7 +1269,7 @@ def test_authorized_r2_chart_is_attached_only_to_serverchan(tmp_path: Path) -> N
             for position in earlier_portfolio.positions
         ),
         holding_weeks=earlier_portfolio.holding_weeks,
-        effective_at=datetime(2026, 8, 28, 1, tzinfo=UTC),
+        effective_at=datetime(2026, 8, 28, 0, 30, tzinfo=UTC),
         metadata={
             "holding_summary_delivery_channels": ["serverchan", "bark"],
             HOLDING_CHART_DELIVERY_CHANNELS_KEY: ["serverchan"],
@@ -1976,7 +1981,7 @@ def test_saturday_and_sunday_are_hard_noop_before_state_or_data_reads(
 
 def test_monday_legacy_state_without_plan_revalidates_stale_cutoff(tmp_path: Path) -> None:
     paths = _paths(tmp_path)
-    paths["_clock"] = lambda: datetime(2026, 8, 31, 1, tzinfo=UTC)
+    paths["_clock"] = lambda: datetime(2026, 8, 31, 0, 40, tzinfo=UTC)
     state_path = paths["state_root"] / "evening-digest-state.json"
     state_path.parent.mkdir(parents=True)
     state_path.write_text(
@@ -2193,3 +2198,104 @@ def test_log_failure_does_not_turn_rejected_delivery_into_success(
     assert outcome.exit_code == evening_report.EXIT_ERROR
     assert outcome.event["reason"] == "notification_providers_not_accepted"
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
+
+
+def test_held_account_morning_skips_full_market_selection(tmp_path, monkeypatch):
+    from ashare_lab.services import build_continuous_digest
+    from ashare_lab.services.holding_ledger import get_active_holding_portfolio
+
+    repository = _recommendation_repository(tmp_path)
+    portfolio = _register_four_holding_channels(repository)
+    messages, reviews = [], []
+
+    def forbidden(**_kwargs):
+        pytest.fail("holding review must not wait for full-market or financial screening")
+
+    def review(*_args, **_kwargs):
+        reviews.append(True)
+        return _holding_review_for_portfolio(portfolio)
+
+    monkeypatch.setattr(build_continuous_digest, "build_continuous_research_digest", forbidden)
+    result = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        _repository=repository,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_holding_review=review,
+        _notifier=lambda message: messages.append(message) or _accepted_summary(),
+    )
+    assert result.event["status"] == "provider_accepted"
+    assert len(reviews) == len(messages) == 1
+    assert "持仓观察" in messages[0].body
+    assert "买卖后请确认更新" in messages[0].body
+    assert "建仓组合" not in messages[0].body
+    assert "候选" not in messages[0].body
+    assert "股票敞口上限0%" not in messages[0].body
+    assert get_active_holding_portfolio(repository).id == portfolio.id
+
+
+def test_automatic_final_failure_does_not_wait_for_holding_analysis(tmp_path):
+    from ashare_lab.cli import evening_digest
+
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 8, 28, 0, 50, tzinfo=UTC)
+    messages = []
+
+    def failed_build(**_kwargs):
+        raise RuntimeError("synthetic failure")
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("deadline fallback must not run a holding analysis")
+
+    result = evening_digest.run_evening_digest(
+        **options,
+        _build_digest=failed_build,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_holding_review=forbidden,
+        _notifier=lambda message: messages.append(message) or _accepted_summary(),
+    )
+    assert result.exit_code == evening_digest.EXIT_ERROR
+    assert len(messages) == 1
+    assert "不是荐股结论" in messages[0].body
+    assert (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+
+
+def test_provider_receipt_is_saved_before_database_bookkeeping(tmp_path, monkeypatch):
+    from ashare_lab.cli import evening_digest
+
+    current = [datetime(2026, 8, 28, 0, 40, tzinfo=UTC)]
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: current[0]
+    state_path = tmp_path / "state" / "evening-digest-state.json"
+
+    def notifier(_message):
+        current[0] = datetime(2026, 8, 28, 0, 41, tzinfo=UTC)
+        return _accepted_summary()
+
+    def fail_after_receipt(*_args, **_kwargs):
+        saved = json.loads(state_path.read_text())
+        assert saved["plan_for_date"] == FRIDAY.isoformat()
+        assert "serverchan" in saved["accepted_channels"]
+        assert saved["provider_accepted_at"] == "2026-08-28T08:41:00+08:00"
+        raise OSError("synthetic journal failure")
+
+    monkeypatch.setattr(evening_digest, "_record_evening_delivery_events", fail_after_receipt)
+    result = evening_digest.run_evening_digest(
+        **options,
+        _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
+        _build_digest=lambda **_kwargs: _digest(),
+        _notifier=notifier,
+    )
+    assert result.exit_code == evening_digest.EXIT_ERROR
+    assert state_path.exists()
+    from ashare_lab.cli.preopen_deadline import notify_incomplete_once
+
+    def at_deadline():
+        return datetime(2026, 8, 28, 0, 58, tzinfo=UTC)
+    status = notify_incomplete_once(
+        state_root=tmp_path / "state", now=at_deadline(), clock=at_deadline,
+        notifier=lambda _message: pytest.fail("an accepted report must not trigger a false failure"),
+    )
+    assert status == "plan_already_provider_accepted"

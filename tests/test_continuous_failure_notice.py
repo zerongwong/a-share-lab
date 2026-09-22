@@ -126,14 +126,14 @@ def _accepted(*channels):
     )
 
 
-def _paths(tmp_path: Path, *, minute=20):
+def _paths(tmp_path: Path, *, minute=50):
     return {
         "csmar_root": tmp_path / "csmar",
         "overlay_root": tmp_path / "overlay",
         "reference_root": tmp_path / "reference",
         "state_root": tmp_path / "state",
         "log_root": tmp_path / "logs",
-        "_clock": lambda: datetime(2026, 8, 31, 1, minute, tzinfo=UTC),
+        "_clock": lambda: datetime(2026, 8, 31, 0, minute, tzinfo=UTC),
     }
 
 
@@ -143,13 +143,14 @@ def _run(
     repository=None,
     notifier=None,
     reviewer=_broken_builder,
-    minute=20,
+    minute=50,
     builder=_broken_builder,
     latest=CUTOFF,
     next_day=date(2026, 8, 31),
 ):
     return cli.run_evening_digest(
         **_paths(tmp_path, minute=minute),
+        send_now=True,
         _repository=repository or ReadOnlyRepository(),
         _build_digest=builder,
         _build_holding_review=reviewer,
@@ -172,7 +173,7 @@ def no_real_io(monkeypatch):
     monkeypatch.setattr(cli, "latest_verified_overlay_cutoff", lambda _root: CUTOFF)
 
 
-@pytest.mark.parametrize("minute", [0, 10, 19])
+@pytest.mark.parametrize("minute", [20, 30, 49])
 def test_earlier_error_slots_do_not_send_failure_notice(tmp_path, minute):
     messages = []
     result = _run(tmp_path, minute=minute, notifier=lambda msg: messages.append(msg))
@@ -474,7 +475,7 @@ def test_holding_based_plan_revision_mismatch_stops_before_archive_and_submit(
         pytest.fail("a plan built for another holding revision cannot be archived or submitted")
 
     result = cli.run_evening_digest(
-        **_paths(tmp_path, minute=0),
+        **_paths(tmp_path, minute=40),
         _repository=repo,
         _build_digest=lambda **_kwargs: digest,
         _build_holding_review=lambda *_args, **_kwargs: _review(),
@@ -530,7 +531,7 @@ def test_review_failure_suppresses_replacements_but_keeps_live_authorization_gua
         lambda *_args, **kwargs: delivery_events.append(kwargs),
     )
     result = cli.run_evening_digest(
-        **_paths(tmp_path, minute=0),
+        **_paths(tmp_path, minute=40),
         _repository=repo,
         _build_digest=lambda **_kwargs: digest,
         _build_holding_review=reviewer,

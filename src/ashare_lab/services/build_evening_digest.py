@@ -665,6 +665,23 @@ def _render_continuous_digest(digest, review, include_holdings):
     plan = digest.continuous_plan
     assert plan is not None
     private = bool(plan.get("holding_based"))
+    if plan.get("holding_review_only"):
+        if not include_holdings:
+            lines = ["持仓授权待核验，暂不披露持仓结论。"]
+        elif review is None:
+            lines = ["持仓核验未完成：暂不确认持有或退出，请勿视为安全信号。"]
+        else:
+            lines = _holding_review_lines(review, name_bytes=36, reason_bytes=90)
+            for label in _HORIZON_LABELS.values():
+                lines = [line.replace(f"｜{label}｜", "｜") for line in lines]
+        return "\n\n".join(
+            [
+                f"## {digest.plan_for_date} 持仓观察",
+                f"数据截至 {digest.common_cutoff}",
+                "\n".join(lines),
+                "仅跟踪已登记持仓。退出建议不视为已卖出；买卖后请确认更新。",
+            ]
+        )
     if private and not include_holdings:
         entries, cash, note = [], None, "持仓授权待核验，组合补位信息暂不披露。"
     else:

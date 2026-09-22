@@ -2,8 +2,8 @@
 
 This entrypoint is deliberately independent from Streamlit.  It serializes
 scheduled runs with an advisory lock, writes only derived and sanitized status
-events to a private rotating log, and sends best-effort failure/recovery
-notifications through credentials already stored in macOS Keychain.
+events to a private rotating log. Automatic sync is silent: data failure and
+recovery are reported in the permitted pre-open summary, not separate pushes.
 """
 
 from __future__ import annotations
@@ -76,8 +76,7 @@ _LAUNCHAGENT_MODULE = "ashare_lab.cli.scheduled_sync_worker"
 _DAILY_SYNC_SCHEDULE = [
     {"Hour": 6, "Minute": 30},
     {"Hour": 7, "Minute": 30},
-    {"Hour": 8, "Minute": 20},
-    {"Hour": 8, "Minute": 40},
+    {"Hour": 8, "Minute": 0},
     {"Hour": 15, "Minute": 30},
     {"Hour": 16, "Minute": 30},
     {"Hour": 18, "Minute": 30},
@@ -85,11 +84,11 @@ _DAILY_SYNC_SCHEDULE = [
 ]
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 # The supervised sync has a twelve-minute wall-clock limit.  A job that has
-# not started by 08:45 cannot safely own the shared data lock before the
-# formal 09:00 report.  Reserve the lock through the complete automatic
-# report retry window; a later scheduled/manual run can resume normally.
-_MORNING_REPORT_RESERVATION_START = time(8, 45)
-_MORNING_REPORT_RESERVATION_END = time(9, 30)
+# not finished before 08:18 must yield to the 08:20 report. The lightweight
+# supervisor also clamps an already-started worker's deadline and reserves
+# process-group termination time. Never unlink a live lock to force progress.
+_MORNING_REPORT_RESERVATION_START = time(8, 18)
+_MORNING_REPORT_RESERVATION_END = time(9, 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,7 +208,7 @@ def run_scheduled_sync(
     log_root: str | Path | None = None,
     clock: Callable[[], datetime] | None = None,
     _run_update: Callable[..., DailyUpdateReport] = run_daily_update,
-    _notifier: Callable[[NotificationMessage], NotificationSummary] = send_scheduled_notification,
+    _notifier: Callable[[NotificationMessage], NotificationSummary] | None = None,
     _performance_runner: PerformanceRunner | None = None,
     _holding_review_runner: HoldingReviewRunner | None = None,
     _holding_shadow_runner: HoldingShadowRunner | None = None,
@@ -221,7 +220,8 @@ def run_scheduled_sync(
     day produced no work, or another invocation already owns the lock.  Exit 1
     means the provider call completed but the verified cutoff did not advance
     through the latest completed session.  Exit 2 is a setup/runtime error.
-    Notification delivery is best effort and never changes the data exit code.
+    No external notification is sent by default or by the automatic CLI. An
+    explicitly injected notifier is a compatibility/manual-use seam only.
     """
 
     fallback_now = datetime.now(UTC)
@@ -315,7 +315,7 @@ def run_scheduled_sync(
                             ),
                         }
                     )
-                if bool(prior_state.get("failure_active")):
+                if bool(prior_state.get("failure_active")) and _notifier is not None:
                     recovery = _safe_notify(_notifier, _recovery_message(report))
                     event["recovery_notification_successful_channels"] = list(
                         recovery.successful_channels
@@ -441,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
         log_root=args.log_root,
         _holding_review_runner=run_active_holding_review,
         _holding_shadow_runner=run_holding_stop_shadows,
+        _notifier=None,
     )
     print(json.dumps(outcome.event, ensure_ascii=False, sort_keys=True, default=str))
     return outcome.exit_code
@@ -468,7 +469,7 @@ def _run_performance_reviews(
     overlay_root: Path,
     scheduler_root: Path,
     common_cutoff: date,
-    notifier: Callable[[NotificationMessage], NotificationSummary],
+    notifier: Callable[[NotificationMessage], NotificationSummary] | None,
     now: datetime,
 ) -> None:
     """Settle mature recommendation cohorts without changing sync success.
@@ -746,7 +747,7 @@ def _handle_failure(
     *,
     state_path: Path,
     prior_state: dict[str, Any],
-    notifier: Callable[[NotificationMessage], NotificationSummary],
+    notifier: Callable[[NotificationMessage], NotificationSummary] | None,
 ) -> None:
     fingerprint = _failure_fingerprint(event)
     already_delivered = (
@@ -755,8 +756,10 @@ def _handle_failure(
         and bool(prior_state.get("notification_succeeded"))
     )
     notification = NotificationSummary()
-    if not already_delivered:
+    if not already_delivered and notifier is not None:
         notification = _safe_notify(notifier, _failure_message(event))
+    if notifier is None:
+        event["notification_policy"] = "automatic_sync_silent"
     event["notification_deduplicated"] = already_delivered
     event["notification_successful_channels"] = list(notification.successful_channels)
     event["notification_failed_channels"] = list(notification.failed_channels)

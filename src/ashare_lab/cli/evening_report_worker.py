@@ -22,35 +22,15 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ashare_lab.bootstrap import application_data_dir
+from ashare_lab.cli.preopen_deadline import notify_incomplete_once
 
 WORKER_TIMEOUT_SECONDS = 8 * 60
 WORKER_TERMINATE_GRACE_SECONDS = 5
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_REPORT_START = time(8, 45)
-_REPORT_END = time(9, 30)
-_LAST_RETRY = time(9, 20)
-
-
-def _read_state(path: Path) -> dict:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
-
-
-def _write_notice_state(path: Path, now: datetime) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    try:
-        temporary.write_text(
-            json.dumps({"accepted_date": now.date().isoformat(), "delivery_confirmed": False}),
-            encoding="utf-8",
-        )
-        os.chmod(temporary, 0o600)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+_REPORT_START = time(8, 20)
+_REPORT_END = time(8, 58)
+_LAST_RETRY = time(8, 50)
+_TERMINATION_RESERVE_SECONDS = 2 * WORKER_TERMINATE_GRACE_SECONDS
 
 
 def _safe_log(log_root: Path, event: dict) -> None:
@@ -83,46 +63,6 @@ def _safe_log(log_root: Path, event: dict) -> None:
         return
 
 
-def _send_serverchan_notice(message) -> bool:
-    from ashare_lab.cli.evening_digest import send_serverchan_digest
-
-    return send_serverchan_digest(message)
-
-
-def notify_incomplete_once(
-    *, state_root: Path, now: datetime, notifier: Callable | None = None
-) -> str:
-    """A plain public notice, independent from recommendation deduplication."""
-    try:
-        plan_state = _read_state(state_root / "evening-digest-state.json")
-        if plan_state.get(
-            "plan_for_date"
-        ) == now.date().isoformat() and "serverchan" in plan_state.get("accepted_channels", []):
-            return "plan_already_provider_accepted"
-        path = state_root / "evening-failure-notice-state.json"
-        if _read_state(path).get("accepted_date") == now.date().isoformat():
-            return "failure_notice_already_provider_accepted"
-        from ashare_lab.ports.notifications import NotificationMessage
-
-        accepted = (notifier or _send_serverchan_notice)(
-            NotificationMessage(
-                title="A股盘前计划暂未完成｜暂停新买",
-                body=(
-                    "今日盘前研究计划计算或提交尚未完成确认。"
-                    "暂不依据旧报告新买；请以随后完整计划为准。"
-                    "本条未确认任何持仓的买卖信号。"
-                ),
-                group="A股研究室·盘前计划",
-            )
-        )
-        if accepted is True:
-            _write_notice_state(path, now)
-            return "failure_notice_provider_accepted"
-        return "failure_notice_provider_not_accepted"
-    except Exception:
-        return "failure_notice_provider_not_accepted"
-
-
 def terminate_worker_group(process, *, kill_group: Callable = os.killpg) -> None:
     """Terminate only the process group created by this invocation."""
     with suppress(ProcessLookupError):
@@ -148,7 +88,7 @@ def supervise_evening_report(
     _clock: Callable[[], datetime] | None = None,
     _notifier: Callable | None = None,
 ) -> tuple[int, dict]:
-    """Run one regular 08:45–09:29 attempt with a finite wall-clock lifetime."""
+    """Run one 08:20–08:57 attempt, reserving shutdown time before 08:58."""
     if not 0 < timeout_seconds <= WORKER_TIMEOUT_SECONDS:
         raise ValueError("worker timeout must be within the automatic attempt budget")
     parser = argparse.ArgumentParser(add_help=False)
@@ -157,7 +97,8 @@ def supervise_evening_report(
     parsed, _ = parser.parse_known_args(list(argv))
     state_root = (parsed.state_root or application_data_dir() / "scheduler").expanduser()
     log_root = (parsed.log_root or Path.home() / "Library" / "Logs" / "A股研究助手").expanduser()
-    now = (_clock or (lambda: datetime.now(_SHANGHAI)))().astimezone(_SHANGHAI)
+    clock = _clock or (lambda: datetime.now(_SHANGHAI))
+    now = clock().astimezone(_SHANGHAI)
 
     def finish(code: int, status: str, *, reason: str | None = None):
         event = {"job": "ashare-evening-worker", "status": status, "exit_code": code}
@@ -166,12 +107,34 @@ def supervise_evening_report(
         _safe_log(log_root, event)
         return code, event
 
+    def final_notice() -> None:
+        # A long attempt must not keep its start time as its delivery clock.
+        fresh_now = clock().astimezone(_SHANGHAI)
+        if fresh_now.date() != now.date() or fresh_now.timetz().replace(tzinfo=None) < _LAST_RETRY:
+            return
+        notice = notify_incomplete_once(
+            state_root=state_root, now=fresh_now, notifier=_notifier, clock=clock
+        )
+        _safe_log(
+            log_root,
+            {"job": "ashare-evening-worker", "status": notice, "delivery_confirmed": False},
+        )
+
     local_time = now.timetz().replace(tzinfo=None)
     if now.weekday() in {5, 6} or not _REPORT_START <= local_time < _REPORT_END:
         return finish(0, "noop_outside_preopen_window")
-    # A late login must not start an eight-minute build past the opening bell.
-    deadline = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    attempt_timeout = min(timeout_seconds, max(0.1, (deadline - now).total_seconds() - 5))
+    deadline = now.replace(hour=8, minute=58, second=0, microsecond=0)
+
+    def remaining_timeout() -> float:
+        return min(
+            timeout_seconds,
+            (deadline - clock().astimezone(_SHANGHAI)).total_seconds()
+            - _TERMINATION_RESERVE_SECONDS,
+        )
+
+    if remaining_timeout() <= 0:
+        final_notice()
+        return finish(0, "noop_insufficient_worker_budget")
     process = None
     try:
         _safe_log(log_root, {"job": "ashare-evening-worker", "status": "worker_started"})
@@ -182,32 +145,34 @@ def supervise_evening_report(
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        attempt_timeout = remaining_timeout()
+        if attempt_timeout <= 0:
+            raise subprocess.TimeoutExpired("automatic-preopen-worker", 0)
         code = process.wait(timeout=attempt_timeout)
     except subprocess.TimeoutExpired:
         try:
             if process is not None:
                 terminate_worker_group(process, kill_group=_kill_group)
         except Exception:
+            final_notice()
             return finish(2, "error", reason="evening_worker_termination_unconfirmed")
         outcome = finish(2, "error", reason="evening_worker_deadline_exceeded")
-        if local_time >= _LAST_RETRY:
-            notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
-            _safe_log(
-                log_root,
-                {"job": "ashare-evening-worker", "status": notice, "delivery_confirmed": False},
-            )
+        final_notice()
         return outcome
     except Exception:
         if process is not None:
             with suppress(Exception):
                 terminate_worker_group(process, kill_group=_kill_group)
+        final_notice()
         return finish(2, "error", reason="evening_worker_start_or_wait_failed")
     if code == 0:
         return finish(0, "worker_completed")
-    if code != 0 and local_time >= _LAST_RETRY:
-        notice = notify_incomplete_once(state_root=state_root, now=now, notifier=_notifier)
-        _safe_log(
-            log_root,
-            {"job": "ashare-evening-worker", "status": notice, "delivery_confirmed": False},
-        )
+    # A crashed leader can leave network/helper descendants alive. The owned
+    # session is still ours to close even though wait() already reaped its leader.
+    try:
+        terminate_worker_group(process, kill_group=_kill_group)
+    except Exception:
+        final_notice()
+        return finish(2, "error", reason="evening_worker_termination_unconfirmed")
+    final_notice()
     return finish(1 if code == 1 else 2, "error", reason="evening_worker_not_completed")

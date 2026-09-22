@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.cli.holdings import build_parser, main
 from ashare_lab.services.holding_ledger import (
@@ -131,3 +133,27 @@ def test_holding_cli_hides_retired_fixed_horizon_selector() -> None:
 
     assert "--holding-weeks" not in help_text
     assert "计划周期" not in help_text
+
+
+def test_explicit_share_quantity_survives_ledger_roundtrip(tmp_path, capsys):
+    repository = _repository(tmp_path)
+    path = _file(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["positions"][0]["quantity"] = 600
+    path.write_text(json.dumps(payload))
+    assert main(["replace", "--file", str(path), "--yes"], _repository=repository) == 0
+    position = get_active_holding_portfolio(repository).positions[0]
+    assert position.metadata["quantity"] == 600
+    assert position.metadata["quantity_user_confirmed"] is True
+    assert json.loads(capsys.readouterr().out)["positions"][0]["quantity"] == 600
+
+
+@pytest.mark.parametrize("quantity", [True, 0, -1, 0.5, "600", float("nan"), float("inf")])
+def test_invalid_share_quantity_cannot_change_holdings(tmp_path, quantity):
+    repository = _repository(tmp_path)
+    path = _file(tmp_path)
+    payload = json.loads(path.read_text())
+    payload["positions"][0]["quantity"] = quantity
+    path.write_text(json.dumps(payload))
+    assert main(["replace", "--file", str(path), "--yes"], _repository=repository) == 2
+    assert get_active_holding_portfolio(repository) is None

@@ -95,7 +95,7 @@ def calendar_for_day(root, day):
     return None
 
 
-def send_serverchan(message):
+def send_serverchan(message, *, before_send=None):
     import httpx
 
     from ashare_lab.adapters.macos_keychain import load_serverchan_sendkey
@@ -118,6 +118,10 @@ def send_serverchan(message):
         ) as client,
         ServerChanNotificationChannel(token, client=client) as channel,
     ):
+        # The failure-notice supervisor can spend time in the keychain or
+        # client setup. Recheck its narrow session/holding permission here.
+        if before_send is not None and not before_send():
+            return False
         return channel.send(message).accepted
 
 
@@ -224,16 +228,55 @@ def worker():
         time.sleep(max(1, 60 - (time.monotonic() - started)))
 
 
-def failure_notice():
+def failure_notice(*, _clock=None, _repository=None):
     from ashare_lab.bootstrap import build_repository
     from ashare_lab.ports.notifications import NotificationMessage, NotificationUrgency
     from ashare_lab.services.holding_ledger import get_active_holding_portfolio
-    from ashare_lab.services.intraday_stop_monitor import read_config, write_private_json
+    from ashare_lab.services.intraday_stop_monitor import (
+        in_monitor_hours,
+        read_config,
+        write_private_json,
+    )
 
-    root, now = _root(), datetime.now(CN)
-    current = get_active_holding_portfolio(build_repository())
-    if read_config(root) is None or current is None or not current.positions:
-        return {"status": "no_holdings_or_disabled"}
+    root = _root()
+    clock = _clock or (lambda: datetime.now(CN))
+    now = clock().astimezone(CN)
+    if not in_monitor_hours(now):
+        return {"status": "outside_session"}
+    repository = _repository if _repository is not None else build_repository()
+
+    def eligible_portfolio(checked_at):
+        if not in_monitor_hours(checked_at):
+            return None, "outside_session"
+        current = get_active_holding_portfolio(repository)
+        if (
+            read_config(root) is None
+            or current is None
+            or not current.positions
+            or current.status != "active"
+        ):
+            return None, "no_holdings_or_disabled"
+        if current.effective_at > checked_at:
+            return None, "holding_not_yet_effective"
+        # Do not perform another network calendar lookup from an already
+        # failed worker. A fresh known holiday vetoes the health notice;
+        # unknown calendar state permits only a clearly non-trading warning.
+        try:
+            calendar_state = json.loads((root / "calendar.json").read_text())
+        except (OSError, ValueError):
+            calendar_state = {}
+        if (
+            isinstance(calendar_state, dict)
+            and calendar_state.get("date") == checked_at.date().isoformat()
+            and calendar_state.get("open") is False
+        ):
+            return None, "market_closed"
+        return current, None
+
+    current, suppressed = eligible_portfolio(now)
+    if suppressed:
+        return {"status": suppressed}
+    identity = (current.id, current.version)
     path = root / "worker-failure-notice.json"
     try:
         state = json.loads(path.read_text())
@@ -245,13 +288,31 @@ def failure_notice():
         return {"status": "failure_notice_already_attempted"}
     state["attempts"] += 1
     write_private_json(path, state)
+    final_suppression = None
+
+    def before_send():
+        nonlocal final_suppression
+        checked_at = clock().astimezone(CN)
+        latest, final_suppression = eligible_portfolio(checked_at)
+        if final_suppression is not None:
+            return False
+        if checked_at.date() != now.date() or (latest.id, latest.version) != identity:
+            final_suppression = "holding_or_session_changed"
+            return False
+        return True
+
+    if not before_send():
+        return {"status": final_suppression}
     accepted = send_serverchan(
         NotificationMessage(
             title="A股盘中监控中断提醒",
             urgency=NotificationUrgency.TIME_SENSITIVE,
-            body=f"{now:%m-%d %H:%M}｜本机监控任务超时或异常，当前不能保证止损提醒。请直接查看券商行情；程序将继续重试，不会自动下单。",
-        )
+            body=f"{now:%m-%d %H:%M}｜本机监控任务超时或异常，当前不能保证止损提醒。本条不是买卖信号，交易日历未核验时也不代表今日一定开市。请直接查看券商行情；程序将继续重试，不会自动下单。",
+        ),
+        before_send=before_send,
     )
+    if final_suppression is not None:
+        return {"status": final_suppression}
     state["accepted"] = accepted
     write_private_json(path, state)
     return {"status": "provider_accepted" if accepted else "delivery_unconfirmed"}

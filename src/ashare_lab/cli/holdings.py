@@ -12,6 +12,7 @@ import argparse
 import json
 import sys
 from datetime import date, datetime
+from math import isfinite
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -131,6 +132,18 @@ def _read_positions(path: Path) -> tuple[HoldingPositionInput, ...]:
         if not isinstance(row, dict):
             raise ValueError("Every positions item must be an object")
         metadata = _company_action_metadata(row)
+        if row.get("quantity") is not None:
+            quantity = row["quantity"]
+            if (
+                isinstance(quantity, bool)
+                or not isinstance(quantity, (int, float))
+                or not isfinite(quantity)
+                or quantity <= 0
+                or quantity != int(quantity)
+            ):
+                raise ValueError("quantity must be an explicit positive whole-share count")
+            metadata["quantity"] = int(quantity)
+            metadata["quantity_user_confirmed"] = True
         results.append(
             HoldingPositionInput(
                 symbol=str(row.get("symbol", "")),
@@ -167,6 +180,7 @@ def _portfolio_payload(portfolio: object) -> dict[str, Any]:
                 "name": item.name,
                 "entry_date": item.entry_date.isoformat(),
                 "cost_price": item.cost_price,
+                "quantity": item.metadata.get("quantity"),
                 "stock_sleeve_weight": item.stock_sleeve_weight,
                 "account_weight": item.account_weight,
                 "status": item.status,
