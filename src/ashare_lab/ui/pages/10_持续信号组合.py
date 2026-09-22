@@ -210,13 +210,15 @@ def _report_text(view: LocalContinuousView) -> str:
 
 def _count_summary(plan: Mapping[str, Any]) -> str:
     count, state = plan.get("holding_count"), plan.get("count_state")
-    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 8:
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 5:
         return "组合只数待核验"
     label = {
         "cash": "现金观察",
         "concentrated_transition": "过渡组合",
         "preferred_formed": "常态组合",
         "formed": "成型组合",
+        "concentrated": "低仓集中组合",
+        "diversified": "分散组合",
     }.get(state, "状态待核验")
     return f"{count}只·{label}"
 
@@ -237,7 +239,7 @@ def render(
     ui.title(PAGE_TITLE)
     ui.caption("一组组合，持续跟踪｜先处理弱仓，再择机补位｜不设到期卖出")
     ui.caption(
-        "目标3–5只、上限5只：0只现金观察，1–2只低敞口过渡｜"
+        "比较0–5只：0只现金观察，1–2只低仓集中组合｜周线突破后核验财务公告｜"
         "每行业最多1只｜新仓通常约总资金15%，上限20%｜不凑数"
     )
     ui.info("本页仅在本机研究和看图，不发送微信、不上传图片、不自动改动持仓。")

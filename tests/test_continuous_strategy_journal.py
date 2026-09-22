@@ -17,8 +17,25 @@ from ashare_lab.services.continuous_strategy_journal import (
 )
 
 
-def test_journal_and_signal_contract_share_v2_identity():
-    assert JOURNAL_VERSION == SIGNAL_VERSION == "continuous-signal-v3"
+def test_journal_and_signal_contract_share_current_identity():
+    assert JOURNAL_VERSION == SIGNAL_VERSION == "continuous-signal-v4"
+
+
+def test_current_method_default_does_not_relabel_archived_v3_decision(connection):
+    original = archive_continuous_decision(
+        connection,
+        "old-v3",
+        date(2026, 9, 1),
+        {"candidates": []},
+        method_version="continuous-signal-v3",
+    )
+    archive_continuous_decision(connection, "new-v4", date(2026, 9, 22), {"candidates": []})
+    stored = connection.execute(
+        "SELECT method_version, payload_json FROM continuous_strategy_decisions WHERE decision_id=?",
+        ("old-v3",),
+    ).fetchone()
+    assert stored[0] == "continuous-signal-v3"
+    assert json.loads(stored[1]) == original
 
 
 @pytest.fixture

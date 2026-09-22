@@ -9,6 +9,7 @@ import pytest
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics import continuous_signals, medium_term_stage
 from ashare_lab.services import review_active_holdings as service
+from ashare_lab.services.holding_ledger import HoldingPositionInput, replace_active_holdings
 from ashare_lab.services.review_active_holdings import (
     CompanyActionClearance,
     HoldingAction,
@@ -64,6 +65,61 @@ def _review(repository, history, *, cutoff=CUTOFF, clearance=None, continuous=Tr
         company_action_clear_by_symbol=_clearance() if clearance is None else clearance,
         continuous_profile=continuous,
     )
+
+
+def _declare_tracking_mode(repository, mode):
+    replace_active_holdings(
+        repository,
+        (
+            HoldingPositionInput(
+                symbol="600919",
+                name="江苏银行",
+                entry_date=ENTRY,
+                cost_price=None,
+                stock_sleeve_weight=1.0,
+                account_weight=None,
+            ),
+        ),
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 28, 21, tzinfo=UTC),
+        metadata={} if mode is None else {"tracking_mode": mode},
+    )
+
+
+@pytest.mark.parametrize("mode", [None, "continuous-signal-v1", "continuous-signal-v3"])
+def test_older_holding_declaration_preserves_daily_stop_profile(repository, mode):
+    from test_review_active_holdings import _history
+
+    _declare_tracking_mode(repository, mode)
+    row = _review(repository, _history(end=CUTOFF.isoformat()), persist=False).rows[0]
+    assert row.status is HoldingReviewRowStatus.READY
+    assert row.source_timeframe == "daily"
+    assert row.method_version.endswith("+continuous-v2")
+
+
+def test_explicit_new_v4_holding_uses_weekly_stop_not_new_entry_readmission(repository):
+    from test_review_active_holdings import _history
+
+    _declare_tracking_mode(repository, "continuous-signal-v4")
+    row = _review(repository, _history(end=CUTOFF.isoformat()), persist=False).rows[0]
+    assert row.status is HoldingReviewRowStatus.READY
+    assert row.source_timeframe == "weekly_completed"
+    assert row.method_version.endswith("+continuous-weekly-v4")
+    assert "signal_profile:continuous_weekly_breakout_daily_execution_v4;no_expiry" in row.reasons
+
+
+def test_retained_position_keeps_persisted_old_profile_after_declaration_version_update(repository):
+    from test_review_active_holdings import _history
+
+    _declare_tracking_mode(repository, "continuous-signal-v3")
+    history = _history(end=CUTOFF.isoformat())
+    first = _review(repository, history).rows[0]
+    _declare_tracking_mode(repository, "continuous-signal-v4")
+    second = _review(repository, history).rows[0]
+    assert first.position_key == second.position_key
+    assert second.source_timeframe == "daily"
+    assert second.method_version == first.method_version
+    assert second.effective_stop >= first.effective_stop
 
 
 def test_continuous_production_stop_profile_does_not_follow_legacy_holding_deadline(repository):

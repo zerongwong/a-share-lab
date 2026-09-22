@@ -57,7 +57,8 @@ from datetime import date, datetime
 from typing import Any, Literal
 from uuid import uuid4
 
-CONTINUOUS_METHOD_VERSION = "continuous-signal-v3"
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
+
 CONTINUOUS_VALUATION_METHOD = "continuous-zero-flow-nav-v1"
 _EVIDENCE_FLAGS = (
     "positions_complete",

@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
+
 PAGE_TITLE = "我的持仓与每日修枝"
 STATUS = "收盘后持仓复核可用；盘中实时监控尚未接通"
 AVAILABLE_NOW = (
@@ -171,7 +173,7 @@ def _render_local_ledger(ui: Any) -> None:
     ui.subheader("明确更新整组持仓")
     ui.caption(
         "上传UTF-8 JSON；成本和总资金权重可写null，系统不会猜。股票仓内权重必须合计100%。"
-        "新登记统一进入 continuous-signal-v3 持续跟踪，不设固定到期日。"
+        f"新登记统一进入 {CONTINUOUS_METHOD_VERSION} 持续跟踪，不设固定到期日。"
     )
     uploaded = ui.file_uploader("选择本机持仓JSON", type=["json"], key="holding_json")
     confirmed = ui.checkbox("我确认这是完整的当前持仓，将整组替换本机记录")
@@ -215,7 +217,7 @@ def _render_local_ledger(ui: Any) -> None:
                 effective_at=datetime.now(CN),
                 source="user_confirmed_local_ui",
                 metadata={
-                    "tracking_mode": "continuous-signal-v3",
+                    "tracking_mode": CONTINUOUS_METHOD_VERSION,
                     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: [
                         channel
                         for channel, allowed in (

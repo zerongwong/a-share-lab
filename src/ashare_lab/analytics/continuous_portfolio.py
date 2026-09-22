@@ -35,8 +35,8 @@ from ashare_lab.analytics.adaptive_portfolio import (
 )
 from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_POSITION_LIMITS,
-    FORMED_PORTFOLIO_MIN_HOLDINGS,
     MAX_CONTINUOUS_HOLDINGS,
+    RISK_CONTRIBUTION_MIN_HOLDINGS,
 )
 
 CONTINUOUS_PORTFOLIO_METHOD_VERSION = "locked-holdings-single-replacement-lcb20-v0.3.0"
@@ -211,7 +211,7 @@ def _metrics(
         budget.holding_period_cost_rate,
         budget.lcb_confidence,
         len(weights) > 1,
-        len(weights) >= FORMED_PORTFOLIO_MIN_HOLDINGS,
+        len(weights) >= RISK_CONTRIBUTION_MIN_HOLDINGS,
     )
 
 

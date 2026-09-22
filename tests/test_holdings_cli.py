@@ -79,7 +79,7 @@ def test_local_json_replace_list_and_clear(tmp_path: Path, capsys: object) -> No
     assert main(["list"], _repository=repository) == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed["holding_portfolio_version"] == 1
-    assert listed["tracking_mode"] == "continuous-signal-v3"
+    assert listed["tracking_mode"] == "continuous-signal-v4"
     assert "holding_weeks" not in listed
     assert listed["positions"][0]["cost_price"] is None
     assert listed[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == []
@@ -121,7 +121,7 @@ def test_replace_saves_only_explicit_per_provider_summary_consent(
     portfolio = get_active_holding_portfolio(repository)
     assert portfolio is not None
     assert portfolio.holding_weeks == 4
-    assert portfolio.metadata["tracking_mode"] == "continuous-signal-v3"
+    assert portfolio.metadata["tracking_mode"] == "continuous-signal-v4"
     assert portfolio.metadata[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == ["bark"]
     assert "external_delivery_consent" not in portfolio.metadata
 

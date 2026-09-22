@@ -23,6 +23,11 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import (
+    CONTINUOUS_METHOD_VERSION,
+    CONTINUOUS_SIGNAL_CONTRACT,
+    LEGACY_CONTINUOUS_HOLDING_CONTRACT,
+)
 from ashare_lab.analytics.cost_stop import (
     COST_STOP_METHOD_VERSION,
     CostStopObservation,
@@ -393,11 +398,21 @@ def _review_one(
                 ).date(),
                 remembered_history=remembered.get("cost_stop_history"),
             )
-        from ashare_lab.analytics.continuous_signals import CONTINUOUS_SIGNAL_CONTRACT
-
-        profile_kwargs = (
-            {"signal_contract": CONTINUOUS_SIGNAL_CONTRACT} if continuous_profile else {}
-        )
+        # An entry strategy upgrade is not user confirmation to reinterpret
+        # an existing position.  Unversioned/v1-v3 holdings keep daily stops.
+        # Only explicit v4 declarations start the weekly protection profile.
+        remembered_method = "" if stored is None else str(stored.get("method_version", ""))
+        if remembered_method.endswith("+continuous-weekly-v4"):
+            holding_contract = CONTINUOUS_SIGNAL_CONTRACT
+        elif remembered_method.endswith("+continuous-v2"):
+            holding_contract = LEGACY_CONTINUOUS_HOLDING_CONTRACT
+        else:
+            holding_contract = (
+                CONTINUOUS_SIGNAL_CONTRACT
+                if portfolio.metadata.get("tracking_mode") == CONTINUOUS_METHOD_VERSION
+                else LEGACY_CONTINUOUS_HOLDING_CONTRACT
+            )
+        profile_kwargs = {"signal_contract": holding_contract} if continuous_profile else {}
         assessment = assess_multi_timeframe(
             frame,
             as_of=cutoff,
@@ -519,11 +534,7 @@ def _review_one(
             and company_action_clearance.from_date is not None
             else ()
         ),
-        *(
-            (f"signal_profile:{CONTINUOUS_SIGNAL_CONTRACT.label};no_expiry",)
-            if continuous_profile
-            else ()
-        ),
+        *((f"signal_profile:{holding_contract.label};no_expiry",) if continuous_profile else ()),
     )
     row = HoldingTreeReviewRow(
         symbol=holding.symbol,
@@ -566,7 +577,9 @@ def _review_one(
             None if company_action_clearance is None else company_action_clearance.from_date
         ),
         method_version=(
-            f"{HOLDING_TREE_METHOD_VERSION}+continuous-v2"
+            f"{HOLDING_TREE_METHOD_VERSION}+continuous-weekly-v4"
+            if continuous_profile and holding_contract is CONTINUOUS_SIGNAL_CONTRACT
+            else f"{HOLDING_TREE_METHOD_VERSION}+continuous-v2"
             if continuous_profile
             else HOLDING_TREE_METHOD_VERSION
         ),

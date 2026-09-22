@@ -46,6 +46,25 @@ def test_one_portfolio_uses_account_weights_and_keeps_risk_conditions():
         assert absent not in body
 
 
+def test_v4_protection_is_planned_not_misrepresented_as_actual_cost_stop():
+    entries = [
+        _entry(
+            symbol=f"60000{index}", account_weight=0.1,
+            initial_risk_policy="actual_cost_loss_8pct_v1",
+            entry_label="买入10.01–10.30，关键位失守不买",
+        )
+        for index in range(5)
+    ]
+    body = _render(entries=entries, cash_weight=0.5)
+    assert body.count("计划保护9.4812") == 5
+    assert body.count("成交登记后按实际成本重算8%") == 1
+    assert "结构先失效先退出" in body
+    assert len(body.encode()) <= 4096
+    legacy = _render(entries=[_entry()])
+    assert "计划保护" not in legacy
+    assert "重算8%" not in legacy
+
+
 @pytest.mark.parametrize("qualification", [False, None])
 def test_observation_entries_never_become_new_buys(qualification):
     entry = _entry(name="不能透露的观察股", entry_qualified=False)

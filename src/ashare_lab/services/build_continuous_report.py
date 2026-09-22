@@ -72,6 +72,7 @@ def render_continuous_report(
     symbols: set[str] = set()
     total_new_weight = Decimal(0)
     rejected_count = 0
+    has_planned_cost_stop = False
     for entry in entries:
         if not isinstance(entry, Mapping):
             raise TypeError("each entry must be a mapping")
@@ -95,9 +96,13 @@ def render_continuous_report(
         protection = _number(entry.get("protection_line"), "protection_line")
         if protection <= 0:
             raise ValueError("protection_line must be positive")
+        actual_cost_policy = entry.get("initial_risk_policy") == "actual_cost_loss_8pct_v1"
+        protection_label = "计划保护" if actual_cost_policy else "保护"
+        has_planned_cost_stop = has_planned_cost_stop or actual_cost_policy
         total_new_weight += weight
         qualified.append(
-            f"- {name}({symbol})｜总资金{_percent(weight)}｜{condition}｜保护{_decimal(protection)}"
+            f"- {name}({symbol})｜总资金{_percent(weight)}｜{condition}｜"
+            f"{protection_label}{_decimal(protection)}"
         )
     if len(qualified) > MAX_CONTINUOUS_HOLDINGS:
         raise ValueError("a continuous portfolio supports at most five qualified new entries")
@@ -117,6 +122,8 @@ def render_continuous_report(
     suffix = ["", "## 🩵 条件新买"]
     if qualified:
         suffix.extend(qualified)
+        if has_planned_cost_stop:
+            suffix.append("计划保护线供建仓参考；成交登记后按实际成本重算8%，结构先失效先退出。")
         if rejected_count:
             suffix.append("其余未过门：暂不新买。")
     else:

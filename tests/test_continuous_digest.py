@@ -123,7 +123,7 @@ def test_initial_plan_distinguishes_missing_data_from_no_formations_and_blocked_
     assert service._initial_plan(result)["cash_weight"] is None
     assert "尚不能判断" in service._initial_plan(result)["status_note"]
     result.status = MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO
-    assert "未找到" in service._initial_plan(result)["status_note"]
+    assert "没有通过已完成周线" in service._initial_plan(result)["status_note"]
     result.horizon_candidate_count = 3
     assert "已找到3只" in service._initial_plan(result)["status_note"]
     assert service._initial_plan(result)["entries"] == []
@@ -172,6 +172,17 @@ def test_snapshot_marks_fixed_shares_and_cash_without_rebalancing_or_using_cost(
     assert cash == pytest.approx(0.5 / 0.98)
     assert sum(weights.values()) + cash == pytest.approx(1.0)
     assert portfolio.metadata == original
+
+
+def test_candidate_message_identifies_financial_pass_and_real_remaining_review_gap():
+    candidates = [{"symbol": "601298", "reason": "财务、公告或可成交性待核验"}]
+    service._describe_candidate_evidence(candidates, [{
+        "symbol": "601298.SH", "fundamental_gate": "pass", "fundamental_reasons": [],
+        "announcement_gate": "unknown",
+        "announcement_reasons": ["OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED"],
+        "execution_gate": "pass",
+    }])
+    assert candidates[0]["reason"] == "财务初筛通过；公告正文待审"
 
 
 @pytest.mark.parametrize(
@@ -389,7 +400,7 @@ def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_
     assert digest.method_version == CONTINUOUS_METHOD_VERSION
     assert digest.continuous_plan["planned_exit_date"] is None
     assert digest.continuous_plan["holding_based"] is False
-    assert digest.continuous_plan["signal_profile"] == "continuous_daily_weekly_v3"
+    assert digest.continuous_plan["signal_profile"] == "continuous_weekly_breakout_daily_execution_v4"
     assert digest.continuous_plan["holding_count"] == 0
     assert digest.continuous_plan["count_state"] == "cash"
     assert digest.continuous_plan["maximum_new_account_weight"] == pytest.approx(0.20)
@@ -428,6 +439,39 @@ def test_unreadable_ledger_is_not_interpreted_as_an_empty_initial_account(monkey
     assert digest.continuous_plan["entries"] == []
     assert digest.continuous_plan["cash_weight"] is None
     assert "读取失败" in digest.continuous_plan["status_note"]
+
+
+def test_candidate_evidence_canonicalizes_csmar_codes_and_restores_internal_identity(monkeypatch):
+    from test_evening_digest import CUTOFF, _hybrid, _result
+
+    monkeypatch.setattr(service, "get_active_holding_portfolio", lambda _repo: None)
+    seen = []
+
+    def evidence(metadata, **kwargs):
+        seen.append((metadata, kwargs))
+        return SimpleNamespace(
+            metadata={symbol: {**item, "fundamental_gate": "pass"} for symbol, item in metadata.items()},
+            results=(), diagnostics={"requested_count": 2, "veto_count": 2},
+        )
+
+    def builder(_h, _m, **kwargs):
+        enriched = kwargs["candidate_evidence_resolver"](
+            {"000001": {"industry": "银行", "exchange": "SZ"},
+             "601298": {"industry": "港口", "exchange": "SH"}}, cutoff=CUTOFF,
+        )
+        assert set(enriched) == {"000001", "601298"}
+        assert all(item["fundamental_gate"] == "pass" for item in enriched.values())
+        return _result(kwargs["holding_weeks"])
+
+    digest = service.build_continuous_research_digest(
+        dataset_root="synthetic", overlay_root="synthetic", reference_dataset_root="synthetic",
+        decision_date=CUTOFF, repository=object(), known_at=datetime.now(UTC),
+        _hybrid_loader=lambda *_a, **_k: _hybrid(object()),
+        _portfolio_builder=builder, _evidence_resolver=evidence,
+    )
+    assert tuple(seen[0][0]) == ("000001.SZ", "601298.SH")
+    assert seen[0][1]["symbols"] == ("000001.SZ", "601298.SH")
+    assert "财务或公告核验未通过" in digest.continuous_plan["status_note"]
 
 
 def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkeypatch):

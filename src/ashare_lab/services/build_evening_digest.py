@@ -157,6 +157,9 @@ class EveningDigestCandidate:
     price_plan_maximum_entry_price: float | None = None
     price_plan_initial_risk_qualified: bool | None = None
     price_plan_initial_risk_reason: str | None = None
+    price_plan_initial_risk_policy: str | None = None
+    price_plan_planned_cost_stop_price: float | None = None
+    price_plan_effective_initial_protection_price: float | None = None
     price_plan_initial_protection_support: float | None = None
     price_plan_initial_protection_atr: float | None = None
     price_plan_initial_protection_evidence_date: date | None = None
@@ -717,6 +720,8 @@ def _continuous_count_summary(count: object, state: object) -> str:
         "concentrated_transition": "过渡组合",
         "preferred_formed": "常态组合",
         "formed": "成型组合",
+        "concentrated": "低仓集中组合",
+        "diversified": "分散组合",
     }
     return f"{count}只·{labels.get(state, '状态待核验')}"
 
@@ -1245,6 +1250,8 @@ def _structured_plan_fields(plan: ConditionalEntryPlan | None) -> dict[str, Any]
                 "maximum_entry_price",
                 "initial_protection_support",
                 "initial_protection_atr",
+                "planned_cost_stop_price",
+                "effective_initial_protection_price",
             )
         },
         "price_plan_initial_risk_fraction": _optional_fraction(
@@ -1257,7 +1264,7 @@ def _structured_plan_fields(plan: ConditionalEntryPlan | None) -> dict[str, Any]
         ),
         **{
             f"price_plan_{name}": _clean_optional_text(getattr(plan, name, None))
-            for name in ("initial_risk_reason", "initial_protection_method_version")
+            for name in ("initial_risk_reason", "initial_protection_method_version", "initial_risk_policy")
         },
         **{
             f"price_plan_{name}": (
@@ -1702,6 +1709,18 @@ def _format_plan(
     ):
         return None
     maximum = _positive_optional(getattr(plan, "maximum_entry_price", None))
+    actual_cost_policy = (
+        getattr(plan, "initial_risk_policy", None) == "actual_cost_loss_8pct_v1"
+    )
+    weekly_key = (
+        _positive_optional(getattr(plan, "primary_structure_reference_price", None))
+        if actual_cost_policy
+        else None
+    )
+    if actual_cost_policy and (maximum is None or weekly_key is None):
+        # The v4 next-session condition requires both a verified weekly key
+        # and a bounded buying location; an upper price cap alone is unsafe.
+        return None
     if maximum is not None:
         upper = math.floor(maximum * 100 + 1e-9) / 100
         raw_lower = (
@@ -1712,6 +1731,8 @@ def _format_plan(
         lower = _positive_optional(raw_lower)
         if lower is None:
             return None
+        if actual_cost_policy:
+            lower = max(lower, weekly_key)
         lower = math.ceil(lower * 100 - 1e-9) / 100
         if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
             high = _positive_optional(plan.price_high)
@@ -1721,6 +1742,8 @@ def _format_plan(
         if lower > upper:
             return f"不入场：门槛{lower:.2f}>上限{upper:.2f}"
         if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
+            if actual_cost_policy:
+                return f"回踩{lower:.2f}–{upper:.2f}，关键位失守不买"
             return f"回踩{lower:.2f}–{upper:.2f}"
         if plan.kind not in (
             ConditionalEntryPlanKind.RECLAIM,
@@ -1728,6 +1751,8 @@ def _format_plan(
         ):
             return None
         volume = "+量" if plan.kind is ConditionalEntryPlanKind.VOLUME_BREAKOUT else ""
+        if actual_cost_policy:
+            return f"买入{lower:.2f}–{upper:.2f}{volume}，关键位失守不买"
         # The threshold confirms the prior close, not a lower bound for the
         # following open. Keep that distinct from the actual buy-price cap.
         return f"确认≥{lower:.2f}，买≤{upper:.2f}{volume}"

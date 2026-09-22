@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 from ashare_lab.analytics.cycle_policy import EntryStrictness
 from ashare_lab.domain.errors import DataUnavailableError
@@ -640,6 +641,42 @@ def test_risk_capped_reclaim_and_pullback_never_round_above_ceiling():
         )
         == "不入场：门槛10.31>上限10.30"
     )
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        (ConditionalEntryPlanKind.RECLAIM, "买入10.01–10.30，关键位失守不买"),
+        (ConditionalEntryPlanKind.VOLUME_BREAKOUT, "买入10.01–10.30+量，关键位失守不买"),
+        (ConditionalEntryPlanKind.HEALTHY_PULLBACK, "回踩10.01–10.30，关键位失守不买"),
+    ],
+)
+def test_v4_plan_does_not_permit_next_session_buy_below_weekly_key(kind, expected):
+    from ashare_lab.services.build_evening_digest import _format_plan
+
+    plan = ConditionalEntryPlan(
+        kind=kind,
+        data_cutoff=pd.Timestamp(CUTOFF),
+        horizon="持续信号",
+        sessions=20,
+        trigger_price=10.001,
+        price_low=9.90,
+        price_high=10.3099,
+        maximum_entry_price=10.3099,
+        primary_structure_reference_price=10.001,
+        initial_risk_policy="actual_cost_loss_8pct_v1",
+    )
+    assert _format_plan(
+        plan, expected_cutoff=CUTOFF, expected_sessions=20, observation=False
+    ) == expected
+    assert _format_plan(
+        replace(plan, primary_structure_reference_price=None),
+        expected_cutoff=CUTOFF, expected_sessions=20, observation=False,
+    ) is None
+    assert _format_plan(
+        replace(plan, maximum_entry_price=9.99),
+        expected_cutoff=CUTOFF, expected_sessions=20, observation=False,
+    ) == "不入场：门槛10.01>上限9.99"
 
 
 def test_no_successful_hybrid_load_fails_without_fabricating_digest() -> None:

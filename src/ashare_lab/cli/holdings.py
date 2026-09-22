@@ -17,6 +17,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
 from ashare_lab.bootstrap import build_repository
 from ashare_lab.services.holding_ledger import (
     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY,
@@ -30,7 +31,7 @@ from ashare_lab.services.holding_ledger import (
 CN = ZoneInfo("Asia/Shanghai")
 EXIT_OK = 0
 EXIT_ERROR = 2
-CONTINUOUS_TRACKING_MODE = "continuous-signal-v3"
+CONTINUOUS_TRACKING_MODE = CONTINUOUS_METHOD_VERSION
 _LEGACY_COMPATIBILITY_WEEKS = 4
 
 

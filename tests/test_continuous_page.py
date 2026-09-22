@@ -68,7 +68,7 @@ def test_import_and_initial_page_do_not_load_data_or_call_network():
     page.render(ui, decision_date=TODAY, _view_loader=forbidden)
     assert "不发送微信" in _text(ui)
     assert "一组组合" in _text(ui)
-    assert "目标3–5只、上限5只" in _text(ui)
+    assert "比较0–5只" in _text(ui)
     assert "新仓通常约总资金15%" in _text(ui)
     assert not any(kind in {"selectbox", "radio"} for kind, _args, _kwargs in ui.messages)
 

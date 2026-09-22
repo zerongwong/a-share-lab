@@ -37,7 +37,7 @@ def _snapshot(**changes):
         "holding_revision_id": "synthetic-holding-revision",
         "holding_version": 2,
         "mode": "actual",
-        "method_version": "continuous-signal-v3",
+        "method_version": service.CONTINUOUS_METHOD_VERSION,
         "portfolio_id": "synthetic-stable-continuous-account",
         "position_units": {"600001.SH": 10},
         "close_prices": {"600001": 20},

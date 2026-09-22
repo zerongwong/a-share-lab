@@ -156,6 +156,39 @@ def test_range_stop_must_be_below_the_entire_entry_range() -> None:
     assert plan.initial_risk_reason == "initial_entry_risk_structure_stop_not_below_buy_price"
 
 
+@pytest.mark.parametrize("kind", tuple(ConditionalEntryPlanKind))
+def test_continuous_cost_eight_percent_does_not_rewrite_or_veto_distant_structure(kind):
+    original = replace(_risk_plan(stop=80.0, kind=kind), maximum_entry_price=100.0)
+    plan = _with_initial_entry_risk(original, continuous_policy=True)
+    assert plan.initial_risk_qualified is True
+    assert plan.initial_risk_policy == "actual_cost_loss_8pct_v1"
+    assert plan.initial_risk_fraction == pytest.approx(0.20)
+    assert plan.invalidation_price == 80.0
+    assert plan.maximum_entry_price == 100.0
+    assert plan.planned_cost_stop_price == pytest.approx(92.0)
+    assert plan.effective_initial_protection_price == pytest.approx(92.0)
+    assert original.planned_cost_stop_price is None
+
+
+def test_continuous_structure_can_protect_earlier_and_ceiling_remains_binding():
+    plan = _with_initial_entry_risk(
+        replace(_risk_plan(stop=97.0), maximum_entry_price=100.0), continuous_policy=True
+    )
+    assert plan.initial_risk_qualified
+    assert plan.effective_initial_protection_price == 97.0
+    above_ceiling = _with_initial_entry_risk(
+        replace(_risk_plan(stop=80.0), trigger_price=100.01, maximum_entry_price=100.0),
+        continuous_policy=True,
+    )
+    assert not above_ceiling.initial_risk_qualified
+
+
+@pytest.mark.parametrize("stop", [None, 100.0, 101.0])
+def test_continuous_eight_percent_does_not_invent_missing_or_inverted_structure(stop):
+    plan = _with_initial_entry_risk(_risk_plan(stop=stop), continuous_policy=True)
+    assert not plan.initial_risk_qualified
+
+
 def test_horizon_plan_cannot_use_daily_trigger_to_invent_a_missing_primary_structure() -> None:
     frame = _breakout_history(77)
     cutoff = pd.Timestamp(frame.iloc[-1]["trade_date"]).normalize()
@@ -339,6 +372,54 @@ def test_real_continuous_builder_accepts_current_five_name_shortlist_policy() ->
     assert result.status is not MidtermPortfolioStatus.DATA_NOT_READY
     assert len(result.screening_candidates) <= 5
     assert len(result.positions) <= 5
+
+
+def test_continuous_search_only_runs_after_candidate_evidence_and_never_weights_unknown(monkeypatch):
+    import importlib
+
+    from test_continuous_signals import _weekly_setup
+
+    module = importlib.import_module("ashare_lab.services.build_midterm_portfolio")
+    histories, metadata = _universe()
+    symbols = tuple(metadata)[:3]
+    recent = _weekly_setup()
+    early_dates = pd.bdate_range(end=recent.trade_date.iloc[0] - pd.Timedelta(days=1), periods=460)
+    early_close = np.linspace(7.0, 8.99, 460)
+    early = pd.DataFrame({"trade_date": early_dates, "open": early_close,
+                          "high": early_close + 0.04, "low": early_close - 0.04,
+                          "close": early_close, "volume_shares": 100.0})
+    frame = pd.concat([early, recent], ignore_index=True)
+    histories = {symbol: frame.copy() for symbol in symbols}
+    metadata = {symbol: {**metadata[symbol], "fundamental_gate": "unknown",
+                         "announcement_gate": "unknown"} for symbol in symbols}
+    stages, pools = [], []
+
+    def resolve(items, *, cutoff):
+        stages.append("evidence")
+        assert set(items) == set(symbols)
+        return {symbols[0]: {"fundamental_gate": "pass", "announcement_gate": "pass",
+                             "name": "not allowed to overwrite identity"},
+                symbols[1]: {"fundamental_gate": "veto", "announcement_gate": "unknown"}}
+
+    def search(pool, **kwargs):
+        assert stages == ["evidence"]
+        pools.append(pool)
+        assert all(not row.evidence_unknown for row in pool)
+        return {n: [] for n in range(1, 6)}, {n: [] for n in range(1, 6)}, 0
+
+    monkeypatch.setattr(module, "_search_candidate_portfolios", search)
+    result = build_midterm_portfolio(
+        histories, metadata, as_of=frame.trade_date.iloc[-1], holding_weeks=4,
+        market_index_histories=_uptrend_indices(frame.trade_date),
+        risk_budget=_loose_budget(holding_sessions=20), minimum_historical_return_lcb=-1.0,
+        minimum_universe_size=3, candidate_pool_size=8, beam_width=8,
+        continuous_entry_policy=True, candidate_evidence_resolver=resolve,
+    )
+    assert len(pools) == 1  # No second duplicate optimiser run.
+    assert [row.symbol for row in pools[0]] == [symbols[0]]
+    assert pools[0][0].name == metadata[symbols[0]]["name"]
+    assert symbols[1] in {row.symbol for row in result.exclusions}
+    assert result.positions == ()
 
 
 def test_builds_one_adaptive_research_portfolio_and_orders_weights() -> None:
@@ -1011,7 +1092,7 @@ def test_continuous_count_policy_uses_five_as_tie_preference_not_a_quota() -> No
     assert chosen is five
 
 
-def test_continuous_count_policy_prefers_feasible_formed_set_to_concentrated_transition() -> None:
+def test_continuous_count_policy_compares_two_and_five_on_same_objective() -> None:
     two = _selection_row(2, lcb=0.07, correlation=0.50, contribution=0.70)
     five = _selection_row(5, lcb=0.06, correlation=0.40, contribution=0.25)
 
@@ -1021,7 +1102,7 @@ def test_continuous_count_policy_prefers_feasible_formed_set_to_concentrated_tra
         maximum_stock_exposure=0.80,
     )
 
-    assert chosen is five
+    assert chosen is two
 
 
 def test_continuous_policy_keeps_transition_when_no_formed_set_is_qualified() -> None:

@@ -56,6 +56,7 @@ def build_continuous_research_digest(
     _hybrid_loader=load_hybrid_universe,
     _portfolio_builder=build_midterm_portfolio,
     _holding_reviewer=build_evening_holding_review,
+    _evidence_resolver=None,
 ):
     """Keep legacy digest transport, but return one separately versioned plan."""
     captured: dict[str, Any] = {}
@@ -66,7 +67,54 @@ def build_continuous_research_digest(
         return hybrid
 
     def builder(*args, **kwargs):
-        result = _portfolio_builder(*args, **kwargs, continuous_entry_policy=True)
+        def resolve_evidence(metadata, *, cutoff):
+            from ashare_lab.adapters.csmar_local import infer_a_share_exchange
+            from ashare_lab.bootstrap import application_data_dir
+            from ashare_lab.ports.market_data import normalize_symbol
+            from ashare_lab.services.candidate_evidence import enrich_candidate_evidence
+
+            identities = {}
+            canonical_metadata = {}
+            for symbol, item in metadata.items():
+                code = normalize_symbol(symbol)
+                exchange = str(item.get("exchange") or infer_a_share_exchange(code) or "")
+                canonical = f"{code}.{exchange}"
+                if exchange not in {"SH", "SZ", "BJ"} or canonical in identities:
+                    raise ValueError("candidate evidence identity is ambiguous")
+                identities[canonical] = symbol
+                canonical_metadata[canonical] = item
+            batch = (_evidence_resolver or enrich_candidate_evidence)(
+                canonical_metadata, symbols=tuple(canonical_metadata), cutoff=cutoff,
+                knowledge_time=known_at or datetime.now(UTC),
+                cache_dir=application_data_dir() / "cache" / "candidate_evidence",
+                review_dir=application_data_dir() / "candidate_reviews",
+                total_timeout_seconds=75,
+            )
+            captured["evidence_diagnostics"] = batch.diagnostics
+            captured["candidate_evidence_records"] = [
+                {
+                    "symbol": row.symbol,
+                    "fundamental_gate": row.fundamental_gate,
+                    "announcement_gate": row.announcement_gate,
+                    "execution_gate": row.execution_gate,
+                    "fundamental_reasons": list(row.fundamental_reasons),
+                    "announcement_reasons": list(row.announcement_reasons),
+                    "execution_reasons": list(row.execution_reasons),
+                    "financial_hash": row.financial_hash,
+                    "announcement_manifest_hash": row.announcement_manifest_hash,
+                    "execution_hash": row.execution_hash,
+                    "retrieved_at": row.retrieved_at,
+                    "financial_period": row.financial_period,
+                    "publication_dates": list(row.publication_dates),
+                }
+                for row in batch.results
+            ]
+            return {identities[key]: item for key, item in batch.metadata.items() if key in identities}
+
+        result = _portfolio_builder(
+            *args, **kwargs, continuous_entry_policy=True,
+            candidate_evidence_resolver=resolve_evidence,
+        )
         captured["result"] = result
         return result
 
@@ -97,13 +145,16 @@ def build_continuous_research_digest(
         "holding_based": False,
         "status_note": "数据或市场证据不足，暂不生成新买计划。",
         "search_scope": (
-            "initial_target_3_to_5_max_5_with_0_to_2_transition;"
+            "initial_compare_all_0_to_5_under_joint_risk;"
             "single_replacement_all_admitted_plus_cash;one_stock_per_industry"
         ),
     }
     result = captured.get("result")
     snapshot = captured.get("snapshot")
+    plan["candidate_evidence"] = captured.get("evidence_diagnostics", {})
+    plan["candidate_evidence_records"] = captured.get("candidate_evidence_records", [])
     plan["screening_candidates"] = _screening_candidates(result)
+    _describe_candidate_evidence(plan["screening_candidates"], plan["candidate_evidence_records"])
     plan["screening_candidate_count"] = getattr(result, "horizon_candidate_count", 0)
     # Independent daily audit only: its cap/state NEVER feeds selection, the
     # holding ledger, protective stops, or the externally rendered plan.
@@ -144,6 +195,24 @@ def build_continuous_research_digest(
         # Absence of a registered portfolio means an illustrative initial plan,
         # NOT a claim that the user actually holds 100% cash.
         plan.update(_initial_plan(result))
+        evidence = plan["candidate_evidence"]
+        if evidence and not plan["entries"]:
+            plan["status_note"] = (
+                f"本轮核验{evidence.get('requested_count', 0)}只周线候选："
+                f"财务通过{evidence.get('financial_pass_count', 0)}只，"
+                f"双重确认{evidence.get('double_confirmation_count', 0)}只，"
+                f"待核验{evidence.get('unknown_count', 0)}只，"
+                f"排除{evidence.get('veto_count', 0)}只。"
+                + (
+                    "证据尚未齐备，暂不新买。"
+                    if evidence.get("unknown_count", 0)
+                    else (
+                        "财务或公告核验未通过，暂不新买。"
+                        if not evidence.get("double_confirmation_count", 0)
+                        else "可买性、买入位置或组合风险未通过，暂不新买。"
+                    )
+                )
+            )
         plan["status_note"] += " 未登记持仓时仅为初建研究方案。" if portfolio is None else ""
     else:
         try:
@@ -199,8 +268,14 @@ def _entry(
         "name": name,
         "account_weight": weight,
         "entry_qualified": True,
+        "initial_risk_policy": price_plan.initial_risk_policy,
         "entry_label": label,
-        "protection_line": price_plan.invalidation_price,
+        "protection_line": (
+            price_plan.effective_initial_protection_price or price_plan.invalidation_price
+        ),
+        "structural_invalidation_price": price_plan.invalidation_price,
+        "planned_cost_stop_price": price_plan.planned_cost_stop_price,
+        "cost_stop_basis": "recalculate_from_user_confirmed_actual_cost_after_fill",
         "maximum_entry_price": price_plan.maximum_entry_price,
     }
 
@@ -214,7 +289,7 @@ def _initial_plan(result) -> dict[str, Any]:
         elif count:
             note = f"已找到{count}只确认形态候选；买点风险、证据或组合门尚未全部通过，暂不新买。"
         else:
-            note = "本轮未找到同时通过周线方向和日线确认的股票，暂不新买。"
+            note = "本轮没有通过已完成周线突破及后续核验的股票，暂不新买。"
         return {
             "entries": [],
             "cash_weight": None if result.status is MidtermPortfolioStatus.DATA_NOT_READY else 1.0,
@@ -249,8 +324,8 @@ def _initial_plan(result) -> dict[str, Any]:
     count = len(entries)
     state = continuous_count_state(count)
     note = "初建成型组合；次日仍需核对可成交性，超过买价上限不追。"
-    if state == "concentrated_transition":
-        note = "初建过渡组合；合格股票不足时保留现金，不为凑数降低门槛。"
+    if state == "concentrated":
+        note = "初建低仓集中组合；已与其他数量方案比较，剩余资金留现金。"
     return {
         "entries": entries,
         "cash_weight": result.cash_weight,
@@ -261,6 +336,31 @@ def _initial_plan(result) -> dict[str, Any]:
 
 def _count_metadata(count: int) -> dict[str, Any]:
     return {"holding_count": count, "count_state": continuous_count_state(count)}
+
+
+def _describe_candidate_evidence(candidates, records) -> None:
+    """Name the missing evidence instead of calling a pipeline gap no signal."""
+    indexed = {row["symbol"].split(".")[0]: row for row in records}
+    for candidate in candidates:
+        record = indexed.get(candidate["symbol"].split(".")[0])
+        if record is None or candidate["reason"] != "财务、公告或可成交性待核验":
+            continue
+        parts = []
+        if record["fundamental_gate"] == "pass":
+            parts.append("财务初筛通过")
+        elif "FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED" in record["fundamental_reasons"]:
+            parts.append("金融行业财务待专项核验")
+        else:
+            parts.append("财务证据待补齐")
+        if record["announcement_gate"] != "pass":
+            parts.append(
+                "公告正文待审"
+                if "OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED" in record["announcement_reasons"]
+                else "公告证据待补齐"
+            )
+        if record["execution_gate"] != "pass":
+            parts.append("可交易性待核验")
+        candidate["reason"] = "；".join(parts)
 
 
 def _screening_candidates(result) -> list[dict[str, Any]]:
@@ -274,7 +374,10 @@ def _screening_candidates(result) -> list[dict[str, Any]]:
         risk = None if price is None else price.initial_risk_fraction
         if price is None:
             reason = "保护线证据不足"
-        elif risk is not None and math.isfinite(risk) and risk > 0.08 + 1e-12:
+        elif (
+            price.initial_risk_policy == "legacy_structure_distance_8pct"
+            and risk is not None and math.isfinite(risk) and risk > 0.08 + 1e-12
+        ):
             reason = f"结构风险{risk:.1%}，超过8%"
         elif price.initial_risk_qualified is not True:
             reason = "买价与保护线尚不匹配"

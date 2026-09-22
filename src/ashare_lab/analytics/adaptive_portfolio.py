@@ -23,14 +23,14 @@ remain the audit target.  Their limits are:
 * 5 stocks: 85% stock exposure, 8%--25% per stock.
 
 Those limits remain the legacy fixed-horizon contract.  The explicitly selected
-``continuous-count-policy-v3.0.0`` instead targets three through five names with
-one-to-two-name transition states, caps
-normal count-state stock exposure at 15%, 30%, 45%, 60%, 75%, 80%, 80% and 80%,
+``continuous-count-policy-v4.0.0`` instead compares all feasible one-to-five-name
+allocations with cash, caps normal count-state stock exposure at
+15%, 30%, 45%, 60% and 75%,
 and independently enforces a 20% total-account hard cap per new position.
 
 The operational stock sleeve is then selected by exhaustive search on a 10%
 integer grid.  Legacy three-stock sleeves permit 20%--50% per name, four-stock
-sleeves 10%--40%, and five-stock sleeves 10%--30%; continuous v3 supplies its
+sleeves 10%--40%, and five-stock sleeves 10%--30%; continuous v4 supplies its
 own count-specific sleeve box.  The grid must sum to 100% of the stock sleeve
 and must still respect the total-account industry cap.  All risk
 and return metrics use these operational weights, not the continuous target.
@@ -83,8 +83,8 @@ from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_COUNT_POLICY_VERSION,
     CONTINUOUS_OPERATION_STOCK_SLEEVE_LIMITS,
     CONTINUOUS_POSITION_LIMITS,
-    FORMED_PORTFOLIO_MIN_HOLDINGS,
     MAX_NEW_ACCOUNT_WEIGHT,
+    RISK_CONTRIBUTION_MIN_HOLDINGS,
 )
 from ashare_lab.analytics.weight_quantization import (
     WEIGHT_QUANTIZATION_METHOD_VERSION,
@@ -596,6 +596,10 @@ def _prepare_candidates(
     symbols = [item.symbol for item in prepared]
     if len(set(symbols)) != len(symbols):
         raise AdaptivePortfolioDataError("candidate symbols must be unique")
+    if count_policy == CONTINUOUS_COUNT_POLICY_VERSION and len(
+        {item.industry for item in prepared}
+    ) != len(prepared):
+        raise AdaptivePortfolioDataError("continuous portfolios require one stock per industry")
 
     reference_index = prepared[0].returns.index
     if reference_index.has_duplicates or not reference_index.is_monotonic_increasing:
@@ -995,7 +999,7 @@ def _evaluate_prepared(
     max_contribution = float(contributions.max())
     contribution_applicable = not (
         count_policy == CONTINUOUS_COUNT_POLICY_VERSION
-        and len(candidates) < FORMED_PORTFOLIO_MIN_HOLDINGS
+        and len(candidates) < RISK_CONTRIBUTION_MIN_HOLDINGS
     )
 
     holding_returns = _non_overlapping_portfolio_returns(

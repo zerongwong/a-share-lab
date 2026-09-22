@@ -1,6 +1,6 @@
 # A-share model contract
 
-Production uses [continuous-signal-v3](#current-production-mode-continuous-signal-v3),
+Production uses [continuous-signal-v4](#current-production-mode-continuous-signal-v4),
 whose section below takes precedence over all legacy horizon/default/output
 rules. The fixed-horizon sections, including every earlier 3–5-security search
 and output rule, are preserved as read-only historical research only.
@@ -374,16 +374,20 @@ review condition. A report declaring `multi-timeframe-contract-v0.2.0` must addi
 daily/weekly/monthly bar cutoffs, per-horizon structure/risk/LCB status, pairwise horizon overlap, and
 per-security difference attribution. The exact serialized field names may evolve, but these audit
 semantics may not be omitted.
-# Current production mode: continuous-signal-v3
+# Current production mode: continuous-signal-v4
 
-This section supersedes the **horizon/default/output** provisions of the legacy
-contract below; its evidence, privacy, point-in-time and no-order safeguards
+This section supersedes the **horizon/default/output** provisions of the earlier
+legacy contract; its evidence, privacy, point-in-time and no-order safeguards
 still apply. Do not silently reactivate six-horizon production recommendations.
 
-- One ongoing three-to-five-stock research target, maximum five, no forced holding deadline.
-  The separately versioned `continuous-count-policy-v3.0.0` first compares
-  qualified three-to-five-name sets. Only when none qualifies may one or two
-  be considered as reduced-exposure transitions; zero means cash.
+- One ongoing zero-to-five-stock research allocation, maximum five, no forced holding deadline.
+  The separately versioned `continuous-count-policy-v4.0.0` compares all
+  qualified one-to-five-name sets with cash. One or two names are genuine
+  low-exposure allocations, not fallbacks behind three-to-five-name sets.
+  The common objective is the historical total-account net-return lower confidence
+  bound, followed by downside volatility, drawdown, tail loss and applicable
+  concentration metrics; exposure-linked count preference is only a tie-break.
+  Zero means cash, which wins an exact zero-LCB tie.
   Every count is conditional on eligible evidence,
   so do not relax risk gates or add an inferior name merely to fill a slot.
   Before the cycle overlay, the count-specific stock-exposure ceilings for one
@@ -394,15 +398,42 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   `holding_weeks=4` transport field is not a sell date. Protect existing stops
   from downward movement, including same-day recomputation/model migration.
 - Every new entry requires a confirmed, non-extended uptrend: either
-  confirmed base/range reversal, EARLY_UPTREND or ORDERLY_UPTREND, completed-weekly direction, completed-daily
-  base breakout/healthy retest, and execution/evidence/risk gates. The
+  confirmed base/range reversal, EARLY_UPTREND or ORDERLY_UPTREND, completed-weekly direction
+  **and completed-weekly base breakout/healthy retest**, followed by completed-daily
+  execution evidence for that same weekly structure and all evidence/risk gates.
+  Daily evidence must not override a missing weekly breakout, nor require a second
+  independent daily breakout after weekly confirmation. The frozen v4 structure
+  uses 13 completed weekly bars, a four-bar recent window, eight-bar base and 22%
+  maximum base width, with weekly direction MA8/26; these are unvalidated research
+  defaults, not book-exact or empirically optimal settings. The
   120-session <=15% threshold only labels and modestly ranks earlier locations;
   it is not an eligibility veto or absolute-bottom identification. Incomplete
   weekly bars and intraday penetrations cannot confirm an entry. Do not reapply
   new-entry eligibility to intact existing holdings.
-- Keep the structural-stop/maximum-entry-price gate: prospective initial loss
-  distance <=8%, not a realized-loss guarantee. Unknown corporate-action
-  coverage (from entry through cutoff) blocks confirmed exit/stop persistence.
+- After the technical shortlist, verify the latest applicable publicly disclosed
+  financial results and official announcement evidence before portfolio construction.
+  Separate financial from nonfinancial firms, financial numeric quality from
+  announcement listing completeness and substantive content review. A returned list,
+  an absence of adverse keywords, a current balance-sheet rank, or a unit test alone
+  does not establish complete financial/announcement due diligence. Missing or stale
+  required evidence stays unknown and cannot be promoted to pass to produce a list.
+  Archive report period, ordinary publication date, correction date, retrieval and
+  decision knowledge times, source identifiers and review version separately. Do not
+  use report period as publication date, treat an older quarter as the latest without
+  checking current disclosures, or backfill current revised results into historical
+  decisions. Existing CSMAR snapshots retain their conservative retrieval-time gate.
+  Numeric-quality and official-manifest/content-review plumbing still needs real-data
+  acceptance; it is not a claim of fully automated professional due diligence, a
+  financially safe stock, or stable future returns.
+- Prospective structural-stop distance is recorded as risk information rather than
+  an independent <=8% veto. Preserve reasonable execution-price/extension limits,
+  structural invalidation and joint absolute risk gates; never move a structural
+  price artificially to satisfy an 8% number. The separate single-name actual-cost
+  rule is confirmed cost × 92%: structure failure may trigger earlier, cost loss 8%
+  is the backstop, and remembered protection lines may not move down. This is not an
+  8% whole-account rule or a guaranteed realised loss cap. Unknown corporate-action
+  coverage (from entry through cutoff) blocks confirmed exit/stop persistence and
+  requires an explicit priority review rather than silence or a false safe result.
 - Lock actual retained weights and compare every admitted replacement plus
   cash. Initial top36/beam128 search is approximate; single replacement is
   enumerated on the versioned operational grid. Do not round old weights.
@@ -411,7 +442,7 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   available cash and risk constraints permit. Existing drifted weights are facts,
   not permission to add or rebalance automatically. Pair correlation is explicitly
   not applicable to a one-name state. Normalized single-name downside-risk
-  contribution is explicitly not applicable to one-to-two-name transition states,
+  contribution is explicitly not applicable to one-to-two-name allocations,
   where it is mechanically high; reduced total exposure, the 20% account cap and
   all absolute path/tail/data gates remain binding. Three through five names restore
   the normalized contribution hard gate. Never fabricate a passing value for an
@@ -444,9 +475,12 @@ still apply. Do not silently reactivate six-horizon production recommendations.
   optimisation. Mark observations explicitly, without new-buy weights; distinguish
   missing financial/announcement/execution evidence from a market with no qualifying
   formations. Never synthesize a passing evidence flag to produce a list.
-- Only authorized ServerChan summaries/images may leave the local machine.
-  Verify exact holding version before disclosure; R2 secrets and raw financial
-  data are never report content. Provider acceptance is not end-device delivery.
+- Production delivery uses only authorized concise ServerChan text and holding
+  warnings, not images or R2 uploads. Verify exact holding version before
+  disclosure; raw licensed financial/price data, private account amounts and
+  credentials are never report content or open-source repository material.
+  Provider acceptance is not end-device delivery, and local scheduling still
+  depends on a running networked host unless a separate cloud deployment is verified.
 
 All earlier six-horizon 3–5-name objective, weight-grid and final-report clauses
 remain read-only compatibility rules. They may be used to interpret immutable

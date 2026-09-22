@@ -11,8 +11,8 @@ from current entry permission:
   never stops an otherwise data-complete full-market screen;
 * price/turnover structure is a hard candidate gate;
 * fundamentals and official announcements can veto, never boost ranking;
-* legacy horizons evaluate 3--5 names; the current continuous path evaluates
-  every feasible 1--8-name set with the same downside-risk engine;
+* legacy horizons evaluate 3--5 names; the current continuous path compares
+  feasible 1--5-name sets with cash under the same downside-risk engine;
 * a bounded beam is a documented computational approximation;
 * only risk-budget-passing sets with a positive historical holding-period lower
   bound may be returned, and the result remains ``RESEARCH_ONLY`` until genuine
@@ -22,7 +22,7 @@ from current entry permission:
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from enum import StrEnum
@@ -85,10 +85,10 @@ from ashare_lab.analytics.multi_timeframe import (
 )
 from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_COUNT_POLICY_VERSION,
-    FORMED_PORTFOLIO_MIN_HOLDINGS,
     MAX_CONTINUOUS_HOLDINGS,
     MAX_NEW_ACCOUNT_WEIGHT,
     continuous_count_preference,
+    continuous_portfolio_selection_key,
 )
 from ashare_lab.services.review_active_holdings import HOLDING_TREE_METHOD_VERSION, _candidate_stop
 
@@ -169,6 +169,9 @@ class ConditionalEntryPlan:
     initial_protection_evidence_date: str | None = None
     initial_protection_atr_cutoff: str | None = None
     initial_protection_method_version: str | None = None
+    initial_risk_policy: str = "legacy_structure_distance_8pct"
+    planned_cost_stop_price: float | None = None
+    effective_initial_protection_price: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +408,7 @@ def build_midterm_portfolio(
     minimum_balance_sheet_strength: float = 0.10,
     minimum_historical_return_lcb: float = 0.0,
     continuous_entry_policy: bool = False,
+    candidate_evidence_resolver: Callable | None = None,
 ) -> MidtermPortfolioResult:
     """Return one risk-budget-passing research portfolio.
 
@@ -531,7 +535,7 @@ def build_midterm_portfolio(
         hard_reasons = _metadata_hard_gate(
             symbol,
             item,
-            minimum_balance_sheet_strength=minimum_balance_sheet_strength,
+            minimum_balance_sheet_strength=(0.0 if continuous_entry_policy else minimum_balance_sheet_strength),
         )
         if hard_reasons:
             exclusions.append(CandidateExclusion(symbol, hard_reasons))
@@ -632,10 +636,43 @@ def build_midterm_portfolio(
                 holding_weeks=holding_weeks,
                 timeframe=candidate.timeframe,
                 entry_pattern=_observation_entry_pattern(candidate),
+                continuous_policy=continuous_entry_policy,
             ),
         )
         for candidate in candidates
     ]
+    # Evidence is requested only AFTER the deterministic technical screen.
+    # A resolver may enrich public facts, never prices, identities, ranking,
+    # holdings or quantities. Missing/unreviewed evidence remains unknown.
+    if continuous_entry_policy and candidate_evidence_resolver is not None and candidates:
+        candidate_metadata = {
+            candidate.symbol: dict(normalized_metadata[candidate.symbol])
+            for candidate in candidates[:candidate_pool_size]
+        }
+        enriched = candidate_evidence_resolver(candidate_metadata, cutoff=cutoff.date())
+        if not isinstance(enriched, Mapping):
+            raise ValueError("candidate evidence resolver must return a mapping")
+        reviewed_candidates = []
+        evidence_keys = {
+            "fundamental_gate", "announcement_gate", "fundamental_veto",
+            "announcement_veto", "is_buyable_at_cutoff", "is_suspended",
+            "is_limit_up_at_cutoff",
+        }
+        for candidate in candidates:
+            item = dict(normalized_metadata[candidate.symbol])
+            evidence = enriched.get(candidate.symbol, {})
+            if not isinstance(evidence, Mapping):
+                raise ValueError("candidate evidence record must be a mapping")
+            item.update({key: value for key, value in evidence.items() if key in evidence_keys})
+            vetoes = _metadata_hard_gate(
+                candidate.symbol, item,
+                minimum_balance_sheet_strength=0.0,
+            )
+            if vetoes:
+                exclusions.append(CandidateExclusion(candidate.symbol, vetoes))
+                continue
+            reviewed_candidates.append(replace(candidate, evidence_unknown=_unknown_evidence(item)))
+        candidates = reviewed_candidates
     candidate_actions = {
         candidate.symbol: _candidate_action(candidate, price_cycle) for candidate in candidates
     }
@@ -664,6 +701,16 @@ def build_midterm_portfolio(
         holding_weeks=holding_weeks,
         histories=normalized_histories,
         cutoff=cutoff,
+        preferred_symbols=(
+            tuple(candidate.symbol for candidate in sorted(
+                candidates,
+                key=lambda item: (
+                    "fundamental_evidence_unknown" in item.evidence_unknown,
+                    len(item.evidence_unknown),
+                ),
+            ))
+            if continuous_entry_policy else None
+        ),
         default_candidate_count=shortlist_default_count,
         maximum_candidates=shortlist_maximum_count,
     )
@@ -721,11 +768,12 @@ def build_midterm_portfolio(
             ),
         )
 
-    # Research-set optimisation is independent from current deployment
-    # permission.  This lets a defensive market or incomplete review evidence
-    # retain a diversified, risk-evaluated 3--5-name research set while the
-    # action layer correctly stays at 100% cash.
-    research_pool = risk_eligible_candidates[:candidate_pool_size]
+    # In v4, financial/announcement confirmation precedes every weighted
+    # portfolio search. Unreviewed technical names remain an unweighted watch
+    # list only. Preserve the separate legacy fixed-horizon research path.
+    research_pool = list(
+        qualified_entry_universe if continuous_entry_policy else risk_eligible_candidates
+    )[:candidate_pool_size]
     research_viable, research_rejected, research_evaluated = _search_candidate_portfolios(
         research_pool,
         budget=budget,
@@ -838,13 +886,18 @@ def build_midterm_portfolio(
             ),
             evidence_review_required=evidence_blocks_action,
         )
-    viable_by_count, _action_rejected, action_evaluated = _search_candidate_portfolios(
-        search_pool,
-        budget=budget,
-        beam_width=beam_width,
-        minimum_historical_return_lcb=minimum_historical_return_lcb,
-        continuous_policy=continuous_entry_policy,
-    )
+    if continuous_entry_policy:
+        # The same verified pool was already evaluated; don't repeat an
+        # expensive search on the pre-open critical path.
+        viable_by_count, action_evaluated = research_viable, research_evaluated
+    else:
+        viable_by_count, _action_rejected, action_evaluated = _search_candidate_portfolios(
+            search_pool,
+            budget=budget,
+            beam_width=beam_width,
+            minimum_historical_return_lcb=minimum_historical_return_lcb,
+            continuous_policy=False,
+        )
 
     if not any(viable_by_count.values()):
         return MidtermPortfolioResult(
@@ -874,12 +927,12 @@ def build_midterm_portfolio(
             observation_evaluation=observation_best,
             observation_rejection_reasons=observation_rejection_reasons,
             reasons=(
-                "no_1_to_8_stock_set_passed_grid_industry_and_risk_budgets"
+                "no_1_to_5_stock_set_passed_grid_industry_and_risk_budgets"
                 if continuous_entry_policy
                 else "no_3_to_5_stock_set_passed_grid_industry_and_risk_budgets",
             ),
             warnings=(
-                "研究候选已经生成，但没有1至8股组合同时通过10%操作档、"
+                "研究候选已经生成，但没有1至5股组合同时通过10%操作档、"
                 "单股上限、行业集中度与当前周期的下行风险预算。"
                 if continuous_entry_policy
                 else "研究候选已经生成，但没有3至5股组合同时通过10%操作档、"
@@ -1647,6 +1700,7 @@ def _build_horizon_price_observation_plan(
     holding_weeks: int,
     timeframe: MultiTimeframeAssessment,
     entry_pattern: EntryPattern,
+    continuous_policy: bool = False,
 ) -> ConditionalEntryPlan | None:
     """Build the daily execution condition for one independently assessed horizon.
 
@@ -1698,8 +1752,10 @@ def _build_horizon_price_observation_plan(
     except (MultiTimeframeDataError, ValueError, TypeError, KeyError):
         return None
     entry_line = execution_line if execution_line is not None else primary_structure_line
+    execution_source = getattr(timeframe.execution, "reference_timeframe", None)
     price_source_timeframe = (
-        "daily" if execution_line is not None else timeframe.structure.timeframe.value
+        getattr(execution_source, "value", execution_source) or "daily"
+        if execution_line is not None else timeframe.structure.timeframe.value
     )
     risk_reference_line = (
         primary_structure_line if primary_structure_line is not None else entry_line
@@ -1746,16 +1802,22 @@ def _build_horizon_price_observation_plan(
                 price_high=round(entry_line + 0.15 * atr, 4),
                 confirmation_rule=f"回踩{reference_label}附近且完整日线未失效",
                 **common,
-            )
+            ), continuous_policy=continuous_policy,
         )
-    if entry_pattern is EntryPattern.BREAKOUT_RECLAIM:
+    if entry_pattern is EntryPattern.BREAKOUT_RECLAIM or continuous_policy:
         return _with_initial_entry_risk(
             ConditionalEntryPlan(
                 kind=ConditionalEntryPlanKind.RECLAIM,
                 trigger_price=round(entry_line + 0.05 * atr, 4),
-                confirmation_rule="完整日线收盘重新站回期限执行线",
+                maximum_entry_price=(
+                    float(prepared.iloc[-1]["close"]) if continuous_policy else None
+                ),
+                confirmation_rule=(
+                    "已完成周线确认突破；日线维持关键位，次日不高于已验证收盘价追买"
+                    if continuous_policy else "完整日线收盘重新站回期限执行线"
+                ),
                 **common,
-            )
+            ), continuous_policy=continuous_policy,
         )
     activity_confirmation = _activity_confirmation_threshold(prepared)
     if activity_confirmation is None:
@@ -1772,11 +1834,13 @@ def _build_horizon_price_observation_plan(
                 f"完整日线收盘越过期限执行线，且{activity_label}达到20日中位数1.2倍"
             ),
             **common,
-        )
+        ), continuous_policy=continuous_policy,
     )
 
 
-def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan:
+def _with_initial_entry_risk(
+    plan: ConditionalEntryPlan, *, continuous_policy: bool = False
+) -> ConditionalEntryPlan:
     """Assess a structural stop without moving it to force an eight-percent fit.
 
     For a range the upper bound is the worst permitted buy price.  For a
@@ -1789,6 +1853,8 @@ def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan
     is_range = plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK
     reference = _finite_optional(plan.price_high if is_range else plan.trigger_price)
     low = _finite_optional(plan.price_low) if is_range else reference
+    if continuous_policy and plan.maximum_entry_price is not None:
+        reference = _finite_optional(plan.maximum_entry_price)
     maximum = (
         float(
             (Decimal(str(stop)) / Decimal("0.92")).quantize(Decimal("0.0001"), rounding=ROUND_FLOOR)
@@ -1797,6 +1863,15 @@ def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan
         else None
     )
     risk = None if reference is None or stop is None else (reference - stop) / reference
+    if continuous_policy and reference is not None:
+        # V4: structural distance remains visible, but is not the cost-loss
+        # limit. Keep a bounded, non-chasing entry price; actual fills establish
+        # the separate 92%-of-cost line only after explicit holding registration.
+        maximum = float(Decimal(str(reference)).quantize(
+            Decimal("0.01"), rounding=(
+                ROUND_FLOOR if is_range or plan.maximum_entry_price is not None else ROUND_CEILING
+            )
+        ))
     if (
         stop is None
         or _finite_optional(plan.primary_structure_reference_price) is None
@@ -1808,14 +1883,18 @@ def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan
         qualified, reason = False, "initial_entry_risk_buy_price_unavailable_or_invalid"
     elif stop >= low:
         qualified, reason = False, "initial_entry_risk_structure_stop_not_below_buy_price"
-    elif risk is not None and risk > MAX_INITIAL_ENTRY_RISK + 1e-12:
+    elif not continuous_policy and risk is not None and risk > MAX_INITIAL_ENTRY_RISK + 1e-12:
         qualified, reason = False, "initial_entry_risk_exceeds_8pct_wait_for_better_setup"
     elif Decimal(str(low)).quantize(Decimal("0.01"), rounding=ROUND_CEILING) > Decimal(
         str(min(reference, maximum) if is_range else maximum)
     ).quantize(Decimal("0.01"), rounding=ROUND_FLOOR):
         qualified, reason = False, "initial_entry_risk_no_executable_price_tick"
     else:
-        qualified, reason = True, "initial_entry_risk_within_8pct_of_planned_buy_price"
+        qualified, reason = True, (
+            "structure_assessed_cost_loss_8pct_separate"
+            if continuous_policy else "initial_entry_risk_within_8pct_of_planned_buy_price"
+        )
+    cost_stop = None if reference is None else float(Decimal(str(reference)) * Decimal("0.92"))
     return replace(
         plan,
         initial_risk_reference_price=reference,
@@ -1823,6 +1902,14 @@ def _with_initial_entry_risk(plan: ConditionalEntryPlan) -> ConditionalEntryPlan
         maximum_entry_price=maximum,
         initial_risk_qualified=qualified,
         initial_risk_reason=reason,
+        initial_risk_policy=(
+            "actual_cost_loss_8pct_v1" if continuous_policy else "legacy_structure_distance_8pct"
+        ),
+        planned_cost_stop_price=cost_stop if continuous_policy else None,
+        effective_initial_protection_price=(
+            max(stop, cost_stop) if continuous_policy and stop is not None and cost_stop is not None
+            else stop
+        ),
     )
 
 
@@ -2332,9 +2419,8 @@ def _select_stock_count(
 ) -> tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]]:
     """Choose one count under the applicable versioned policy.
 
-    Continuous mode compares feasible three-to-five-name sets first and uses
-    one/two names only when no formed set survives. Within the selected group,
-    conservative historical return ranks first and joint risk breaks ties.
+    Continuous mode compares all feasible one-to-five-name sets. Conservative
+    historical account return ranks first; joint risk and then count break ties.
 
     In legacy fixed-horizon mode, a viable four-stock set is the baseline. A five-stock set may replace it
     only when it has a higher conservative return lower bound, does not worsen
@@ -2347,10 +2433,6 @@ def _select_stock_count(
     """
 
     if continuous_policy:
-        count_rank = {
-            count: rank
-            for rank, count in enumerate(continuous_count_preference(maximum_stock_exposure))
-        }
         rows = [
             row
             for count, count_rows in viable_by_count.items()
@@ -2360,16 +2442,27 @@ def _select_stock_count(
         ]
         if not rows:
             raise RuntimeError("at least one viable 1-to-5 stock set is required")
-        formed = [row for row in rows if len(row[2]) >= FORMED_PORTFOLIO_MIN_HOLDINGS]
-        # One/two names are a fallback for an insufficient qualified portfolio,
-        # not a competitor that can displace a feasible three-to-five-name set.
-        rows = formed or rows
-
         def continuous_key(
             row: tuple[float, AdaptivePortfolioEvaluation, tuple[MidtermCandidate, ...]],
-        ) -> tuple[float, float, float, float, int, float, float, tuple[str, ...]]:
-            base = _viable_sort_key(row)
-            return (*base[:4], count_rank[len(row[2])], *base[4:])
+        ) -> tuple:
+            objective, evaluation, selected = row
+            metrics = evaluation.metrics
+            return continuous_portfolio_selection_key(
+                historical_return_lcb=objective,
+                annual_downside_volatility=metrics.annual_downside_volatility,
+                horizon_drawdown=metrics.horizon_rolling_max_drawdown_p90,
+                es95_5d=metrics.es95_5d,
+                max_down_period_correlation=(
+                    metrics.max_down_period_correlation
+                    if getattr(metrics, "correlation_applicable", True) else None
+                ),
+                max_position_downside_risk_contribution=(
+                    metrics.max_position_downside_risk_contribution
+                    if getattr(metrics, "position_risk_contribution_applicable", True) else None
+                ),
+                symbols=tuple(item.symbol for item in selected),
+                maximum_stock_exposure=maximum_stock_exposure,
+            )
 
         return min(rows, key=continuous_key)
 

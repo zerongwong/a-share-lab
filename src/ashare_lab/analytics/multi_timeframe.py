@@ -100,6 +100,10 @@ class HorizonContract:
     daily_anchor_sessions: int
     relative_strength_sessions: int
     minimum_daily_sessions: int
+    # Opt-in continuous policy: daily execution must respect an independently
+    # confirmed higher-timeframe breakout, not demand a second daily breakout.
+    # Legacy six-horizon behavior stays unchanged when false.
+    execution_uses_structure: bool = False
 
     @property
     def audit_signature(self) -> tuple[object, ...]:
@@ -119,6 +123,7 @@ class HorizonContract:
             self.daily_anchor_sessions,
             self.relative_strength_sessions,
             self.minimum_daily_sessions,
+            self.execution_uses_structure,
         )
 
 
@@ -308,6 +313,7 @@ class ExecutionAssessment:
     post_breakout_floor_held: bool | None = None
     latest_retest_touched: bool = False
     latest_retest_reclaimed: bool = False
+    reference_timeframe: BarTimeframe = BarTimeframe.DAILY
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,7 +465,11 @@ def _assess_completed_timeframes(
         structure_frame,
         contract,
     )
-    execution = _assess_execution(bars.daily, contract)
+    execution = (
+        _assess_structure_execution(bars.daily, structure_frame, structure, contract)
+        if contract.execution_uses_structure
+        else _assess_execution(bars.daily, contract)
+    )
     anchor = _daily_anchor(bars.daily, contract.daily_anchor_sessions)
     latest_close = float(bars.daily.iloc[-1]["close"])
     above_anchor = None if anchor is None else latest_close >= anchor
@@ -489,9 +499,22 @@ def _assess_completed_timeframes(
     if contract.holding_weeks == 52:
         reasons.append("one_year_contract_uses_completed_monthly_ma12_ma24_and_daily_ma252")
 
-    candidate_qualified = bool(
-        minimum_history_ok and slow.qualified and structure.qualified and above_anchor is True
+    confirmed_structure = (
+        structure.state in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}
+        if contract.execution_uses_structure
+        else True
     )
+    candidate_qualified = bool(
+        minimum_history_ok
+        and slow.qualified
+        and structure.qualified
+        and confirmed_structure
+        and above_anchor is True
+    )
+    if contract.execution_uses_structure:
+        reasons.append("daily_execution_references_confirmed_primary_structure")
+        if not confirmed_structure:
+            reasons.append("completed_primary_breakout_or_healthy_retest_required")
     if not candidate_qualified:
         reasons.append("candidate_structure_not_qualified_for_this_horizon")
     execution_ready = candidate_qualified and execution.ready
@@ -1020,6 +1043,115 @@ def _assess_execution(
         post_breakout_floor_held=path_intact,
         latest_retest_touched=touched,
         latest_retest_reclaimed=reclaimed,
+    )
+
+
+def _assess_structure_execution(
+    daily: pd.DataFrame,
+    structure_frame: pd.DataFrame,
+    structure: StructureAssessment,
+    contract: HorizonContract,
+) -> ExecutionAssessment:
+    """Use complete daily bars to execute an already-confirmed weekly setup.
+
+    This opt-in path does not rediscover the base on daily bars.  Its reference
+    is the confirmed weekly breakout line and its event clock starts only at
+    the close of the confirming weekly bar.  A later daily floor breach cannot
+    be erased by an intraday recovery or a new daily breakout.  The existing
+    two-percent retest tolerance and 15-percent daily-average extension guard
+    are retained as research defaults, not newly calibrated parameters.
+    """
+
+    minimum = contract.execution_ma_sessions
+    line = structure.breakout_line
+    moving_average = float(daily["close"].tail(minimum).mean()) if len(daily) >= minimum else None
+    latest_close = float(daily.iloc[-1]["close"])
+    distance = None if moving_average is None else latest_close / moving_average - 1.0
+    activity = _activity_series(daily)
+    ratio = None
+    if activity is not None and len(activity) > minimum:
+        reference = float(activity.iloc[-minimum - 1 : -1].median())
+        if reference > 0:
+            ratio = float(activity.iloc[-1]) / reference
+
+    qualified_structure = bool(
+        contract.structure_timeframe is BarTimeframe.WEEKLY
+        and structure.timeframe is BarTimeframe.WEEKLY
+        and structure.qualified
+        and structure.state in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}
+        and structure.base_qualified_at_breakout is True
+        and line is not None
+        and isfinite(line)
+        and line > 0
+        and structure.days_or_bars_since_breakout is not None
+    )
+    since = None
+    path_intact = None
+    touched = False
+    reclaimed = False
+    if qualified_structure:
+        event_index = len(structure_frame) - 1 - int(structure.days_or_bars_since_breakout)
+        if event_index < 0 or event_index >= len(structure_frame):
+            qualified_structure = False
+        else:
+            event_date = pd.Timestamp(structure_frame.iloc[event_index]["trade_date"])
+            path = daily.loc[daily["trade_date"] > event_date]
+            since = len(path)
+            path_intact = bool((path["low"].astype(float) >= line * 0.98).all())
+            # The confirmation bar itself is not a post-breakout retest.
+            if not path.empty:
+                latest = path.iloc[-1]
+                touched = bool(
+                    float(latest["low"]) <= line * 1.02 and float(latest["high"]) >= line * 0.98
+                )
+                reclaimed = latest_close >= line
+
+    if moving_average is None:
+        state, ready, score = ExecutionState.INSUFFICIENT, False, 0.0
+        reasons = (f"minimum_{minimum}_complete_daily_sessions_required",)
+    elif latest_close < moving_average * 0.97:
+        state, ready, score = ExecutionState.FAILED, False, 0.05
+        reasons = ("latest_close_below_execution_average_by_more_than_3pct",)
+    elif distance > 0.15:
+        state, ready, score = ExecutionState.EXTENDED, False, 0.15
+        reasons = ("latest_close_more_than_15pct_above_execution_average",)
+    elif not qualified_structure:
+        state, ready, score = ExecutionState.WAIT_CONFIRMATION, False, 0.0
+        reasons = ("completed_weekly_breakout_or_healthy_retest_not_confirmed",)
+    elif path_intact is False:
+        state, ready, score = ExecutionState.WAIT_RECLAIM, False, 0.30
+        reasons = ("post_weekly_breakout_daily_path_breached_2pct_floor",)
+    elif latest_close < line:
+        state, ready, score = ExecutionState.WAIT_CONFIRMATION, False, 0.42
+        reasons = ("latest_daily_close_below_confirmed_weekly_breakout_line",)
+    elif touched and reclaimed:
+        state, ready, score = ExecutionState.READY_PULLBACK, True, 0.88
+        reasons = (
+            "completed_weekly_breakout_confirmed",
+            "daily_retest_of_weekly_line_holds_2pct_floor_and_reclaims",
+        )
+    else:
+        state, ready, score = ExecutionState.READY_BREAKOUT, True, 0.90
+        reasons = (
+            "completed_weekly_breakout_confirmed",
+            "latest_daily_close_holds_weekly_line_without_extension",
+            "independent_daily_breakout_not_required",
+        )
+    return ExecutionAssessment(
+        state=state,
+        ready=ready,
+        breakout_line=line,
+        sessions_since_breakout=since,
+        activity_ratio=ratio,
+        moving_average=moving_average,
+        distance_to_average=distance,
+        score=score,
+        reasons=reasons,
+        base_qualified_at_breakout=structure.base_qualified_at_breakout,
+        post_breakout_floor_held=path_intact,
+        latest_retest_touched=touched,
+        latest_retest_reclaimed=reclaimed,
+        reference_timeframe=structure.timeframe,
     )
 
 

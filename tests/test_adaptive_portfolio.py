@@ -687,7 +687,18 @@ def test_continuous_count_policy_supports_up_to_five_without_weakening_gates(
 def test_continuous_policy_rejects_more_than_five_at_optimizer_boundary(count: int) -> None:
     with pytest.raises(AdaptivePortfolioDataError, match="one and five"):
         optimize_adaptive_portfolio(
-            _candidate_set(count), budget=_lax_budget(), count_policy=CONTINUOUS_COUNT_POLICY_VERSION
+            _candidate_set(count),
+            budget=_lax_budget(),
+            count_policy=CONTINUOUS_COUNT_POLICY_VERSION,
+        )
+
+
+@pytest.mark.parametrize("count", (2, 3, 5))
+def test_continuous_optimizer_itself_rejects_duplicate_industries(count: int) -> None:
+    candidates = _candidate_set(count, industries=["同一行业"] * count)
+    with pytest.raises(AdaptivePortfolioDataError, match="one stock per industry"):
+        optimize_adaptive_portfolio(
+            candidates, budget=_lax_budget(), count_policy=CONTINUOUS_COUNT_POLICY_VERSION
         )
 
 
