@@ -260,6 +260,26 @@ def list_review_status(
     for path in paths[:256]:
         code = path.stem
         try:
+            # A partially written worker receipt is a provider/coverage gap,
+            # not an invalid document review. Surface the precise next step.
+            cached = _json(path)
+            financial = cached.get("financials")
+            manifest = cached.get("announcements")
+            if not isinstance(financial, Mapping) or financial.get("error"):
+                rows.append({
+                    "symbol": code, "gate": "unknown",
+                    "reasons": [str(financial.get("error") if isinstance(financial, Mapping) else "FINANCIAL_RECEIPT_MISSING")],
+                    "next_step": "refresh_current_financials",
+                })
+                continue
+            if not isinstance(manifest, Mapping) or manifest.get("error"):
+                rows.append({
+                    "symbol": code, "gate": "unknown",
+                    "reasons": [str(manifest.get("error") if isinstance(manifest, Mapping) else "OFFICIAL_MANIFEST_MISSING")],
+                    "financial_period": financial.get("selected_period"),
+                    "next_step": "refresh_official_announcement_manifest",
+                })
+                continue
             receipt = _fresh_receipt(cache_dir, code, known_at)
             active = review_dir / f"{code}.json"
             if active.is_file():
@@ -281,6 +301,7 @@ def list_review_status(
                     "retrieved_at": receipt["retrieved_at"],
                     "financial_period": receipt["financials"].get("selected_period"),
                     "announcement_count": len(receipt["announcements"]["items"]),
+                    "next_step": "none" if gate in {"pass", "veto"} else "review_official_documents",
                 }
             )
         except ReviewWorkflowError as exc:

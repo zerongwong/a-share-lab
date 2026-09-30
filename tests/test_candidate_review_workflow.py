@@ -53,10 +53,14 @@ def workspace(tmp_path):
         "retrieved_at": (KNOWN - timedelta(minutes=5)).isoformat(),
         "financials": {"selected_period": "2026-06-30"},
         "announcements": {
+            "provider": "cninfo", "source_url": "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+            "symbol": SYMBOL,
+            "coverage_from": "2025-09-22",
             "complete": True,
+            "record_count": len(items), "total_provider_records": len(items),
             "items": items,
             "content_hash": content_hash(items),
-            "coverage_through": (KNOWN - timedelta(minutes=10)).isoformat(),
+            "coverage_through": KNOWN.isoformat(),
         },
     }
     _write(cache / f"{SYMBOL}.json", receipt)
@@ -116,6 +120,22 @@ def test_template_is_pending_and_does_not_register_or_claim_document_read(worksp
         register_review(**workspace, review_path=draft, confirm_reviewed=True)
 
 
+def test_status_identifies_partial_provider_receipts_without_approving_them(workspace):
+    path = workspace["cache_dir"] / f"{SYMBOL}.json"
+    receipt = json.loads(path.read_text())
+    receipt["announcements"] = {"error": "OFFICIAL_MANIFEST_PENDING"}
+    _write(path, receipt)
+    row = list_review_status(**workspace)["candidates"][0]
+    assert row["gate"] == "unknown"
+    assert row["reasons"] == ["OFFICIAL_MANIFEST_PENDING"]
+    assert row["next_step"] == "refresh_official_announcement_manifest"
+    receipt["financials"] = {"error": "FINANCIAL_PROVIDER_PENDING"}
+    _write(path, receipt)
+    row = list_review_status(**workspace)["candidates"][0]
+    assert row["gate"] == "unknown"
+    assert row["next_step"] == "refresh_current_financials"
+
+
 def test_template_never_overwrites_existing_draft(workspace):
     create_review_template(**workspace)
     with pytest.raises(ReviewWorkflowError, match="EXISTS_NOT_OVERWRITTEN"):
@@ -133,6 +153,12 @@ def test_real_review_registration_requires_confirmation_and_preserves_history(wo
     assert active.is_file() and registered["gate"] == "pass"
     assert len(list((workspace["review_dir"] / "history" / SYMBOL).glob("*.json"))) == 1
     later = workspace | {"known_at": KNOWN + timedelta(minutes=1)}
+    # A new decision time requires a freshly covered official listing; the
+    # reviewed document hashes themselves remain unchanged.
+    path = workspace["cache_dir"] / f"{SYMBOL}.json"
+    receipt = json.loads(path.read_text())
+    receipt["announcements"]["coverage_through"] = later["known_at"].isoformat()
+    _write(path, receipt)
     with pytest.raises(ReviewWorkflowError, match="EXPLICIT_REPLACEMENT"):
         register_review(**later, review_path=draft, confirm_reviewed=True)
     register_review(**later, review_path=draft, confirm_reviewed=True, replace_existing=True)

@@ -1,9 +1,10 @@
 """Evidence enrichment after technical screening and before portfolio search.
 
-The automatic financial gate is a deliberately narrow, versioned basic-quality
-screen, not a guarantee of "blue-chip" status or future returns. The official
-announcement gate requires a content-grounded review artifact; successful HTTP
-requests and an absence of alarming title words can never make it pass.
+The financial and official-announcement gates are narrow *basic risk screens*.
+A complete, current CNINFO manifest with matching full financial reports may
+pass an automatic title-risk screen when no potentially material title appears.
+That is not a review of PDF contents or proof of investment quality. Missing,
+ambiguous or potentially material disclosures remain unknown until reviewed.
 
 No current snapshot is usable for historical replay. Announcement publication
 time is distinct from the price cutoff and actual retrieval time is archived.
@@ -20,11 +21,13 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from ashare_lab.adapters.candidate_financial_evidence import (
     METHOD_VERSION,
     _validate_request,
+    announcement_window_start,
     content_hash,
     read_candidate_evidence,
     required_report_period,
@@ -38,6 +41,13 @@ _CHECKLIST = frozenset({
 })
 _FINANCIAL_INDUSTRIES = ("银行", "保险", "证券", "多元金融", "金融", "bank", "insurance", "financial")
 _MATERIAL_TITLE = re.compile("立案|调查|处罚|诉讼|仲裁|担保|债务|违约|减值|更正|会计差错|审计|退市|风险警示|业绩预|重大资产|重大事项|关联交易")
+_AUTO_RISK_TITLE = re.compile(
+    "立案|调查|处罚|监管措施|违规|警示函|关注函|问询函|诉讼|仲裁|担保|债务|"
+    "违约|减值|更正|修订|补充|会计差错|财务造假|非标|非标准|保留意见|否定意见|"
+    "无法表示|持续经营|审计意见|退市|风险警示|业绩预|重大资产|重大事项|"
+    "关联交易|停牌|冻结|质押|破产|清算|重组"
+)
+_REPORT_TITLE = re.compile(r"(?<!\d)(20\d{2})年\s*(第一季度|一季度|半年度|中期|第三季度|三季度|年度|年报|度)\s*报告?")
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,10 @@ class CandidateEvidenceResult:
     evidence_path: str | None
     method_version: str = METHOD_VERSION
     data_role: str = "current_candidate_evidence_not_historical_pit"
+    required_financial_period: str | None = None
+    latest_official_financial_period: str | None = None
+    valuation_asof: str | None = None
+    announcement_review_mode: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,74 @@ def _number(row: dict, field: str) -> float:
     return number
 
 
+def _official_report_periods(items: list[dict[str, Any]]) -> tuple[date, ...]:
+    """Identify dated issuer report titles, not publication dates or forecasts.
+
+    This only detects an obvious structured-source lag. It cannot certify that
+    an unparseable or missing official title means no newer report exists.
+    """
+    periods = set()
+    months = {
+        "第一季度": 3, "一季度": 3, "半年度": 6, "中期": 6,
+        "第三季度": 9, "三季度": 9, "年度": 12, "年报": 12, "度": 12,
+    }
+    for item in items:
+        title = str(item.get("title") or "")
+        if "摘要" in title or "预约" in title:
+            continue
+        match = _REPORT_TITLE.search(title)
+        if match:
+            month = months[match.group(2)]
+            periods.add(date(int(match.group(1)), month, {3: 31, 6: 30, 9: 30, 12: 31}[month]))
+    return tuple(sorted(periods))
+
+
+def _full_report_period(title: str) -> date | None:
+    """Recognise an issuer's full dated report, never its digest or correction."""
+    if any(word in title for word in ("摘要", "预约", "更正", "修订", "补充", "提示", "英文")):
+        return None
+    match = _REPORT_TITLE.search(title)
+    if (
+        match is None
+        or not any(word in match.group(0) for word in ("报告", "年报"))
+        or title[match.end():].strip() not in {"", "（全文）", "(全文)", "及审计报告"}
+    ):
+        return None
+    month = {
+        "第一季度": 3, "一季度": 3, "半年度": 6, "中期": 6,
+        "第三季度": 9, "三季度": 9, "年度": 12, "年报": 12, "度": 12,
+    }[match.group(2)]
+    return date(int(match.group(1)), month, {3: 31, 6: 30, 9: 30, 12: 31}[month])
+
+
+def _automatic_basic_announcement_review(
+    items: list[dict[str, Any]], *, financial_period: str | None, knowledge_time: datetime,
+) -> tuple[str, tuple[str, ...]]:
+    """A title-only risk filter; it cannot stand for reading disclosure PDFs."""
+    if financial_period is None:
+        return "unknown", ("LATEST_FINANCIAL_REPORT_PERIOD_REQUIRED",)
+    try:
+        selected = date.fromisoformat(financial_period)
+    except (TypeError, ValueError):
+        return "unknown", ("LATEST_FINANCIAL_REPORT_PERIOD_INVALID",)
+    full_reports = {_full_report_period(str(item["title"])) for item in items}
+    full_reports.discard(None)
+    if selected not in full_reports:
+        return "unknown", ("LATEST_FULL_OFFICIAL_FINANCIAL_REPORT_REQUIRED",)
+    known_date = knowledge_time.astimezone(_SHANGHAI).date()
+    latest_annual_year = known_date.year - (1 if known_date >= date(known_date.year, 5, 1) else 2)
+    if selected.month == 12:
+        latest_annual_year = max(latest_annual_year, selected.year)
+    if not any(
+        period.month == 12 and latest_annual_year <= period.year < known_date.year
+        for period in full_reports
+    ):
+        return "unknown", ("LATEST_FULL_OFFICIAL_ANNUAL_REPORT_REQUIRED",)
+    if any(_AUTO_RISK_TITLE.search(str(item["title"])) for item in items):
+        return "unknown", ("POTENTIALLY_MATERIAL_DOCUMENT_REQUIRES_CONTENT_REVIEW",)
+    return "pass", ("AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED",)
+
+
 def evaluate_financial_quality(
     payload: Mapping[str, Any], *, symbol: str, industry: str, knowledge_time: datetime
 ) -> tuple[str, tuple[str, ...], dict[str, float], tuple[str, ...]]:
@@ -94,15 +176,16 @@ def evaluate_financial_quality(
     Thresholds are unvalidated research controls: current and prior-year same-
     period net profits and current ROE > 0; 0 <= liabilities/assets < 1;
     assets/equity > 0; operating cash flow/net profit > 0. These are *not*
-    industry-relative valuation or a promise of stable profits. Banks/insurers
-    cannot inherit industrial cash-flow/debt thresholds and remain unsupported.
+    industry-relative valuation or a promise of stable profits. Financial
+    firms can be vetoed for a clear profit/ROE failure but cannot pass without
+    separate capital, asset-quality or solvency evidence. Industrial cash-flow
+    and leverage thresholds are never applied to them.
     """
     if not isinstance(payload, Mapping):
         return "unknown", ("FINANCIAL_FIELDS_INCOMPLETE_OR_INVALID",), {}, ()
     if payload.get("error"):
         return "unknown", (str(payload["error"]),), {}, ()
-    if any(token in industry.lower() for token in _FINANCIAL_INDUSTRIES):
-        return "unknown", ("FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED",), {}, ()
+    financial_sector = any(token in industry.lower() for token in _FINANCIAL_INDUSTRIES)
     if not industry or industry in {"未知", "unknown", "其他"}:
         return "unknown", ("INDUSTRY_CLASSIFICATION_REQUIRED_FOR_FINANCIAL_POLICY",), {}, ()
     try:
@@ -113,28 +196,44 @@ def evaluate_financial_quality(
         code, exchange = symbol.split(".")
         external = f"{exchange.lower()}.{code}"
         profit = payload["profit"]
-        others = [payload[field] for field in ("balance", "cash_flow", "prior_year_profit")]
-        if not isinstance(profit, dict) or any(not isinstance(rows, list) or len(rows) != 1 for rows in others):
+        prior_rows = payload["prior_year_profit"]
+        if not isinstance(profit, dict) or not isinstance(prior_rows, list) or len(prior_rows) != 1:
             return "unknown", ("FINANCIAL_PERIOD_ROWS_INCOMPLETE_OR_DUPLICATE",), {}, ()
-        balance, cash, prior = (rows[0] for rows in others)
-        rows = [profit, balance, cash, prior]
+        prior = prior_rows[0]
+        if not isinstance(prior, dict):
+            return "unknown", ("FINANCIAL_PERIOD_ROWS_INCOMPLETE_OR_DUPLICATE",), {}, ()
+        if financial_sector:
+            rows = [profit, prior]
+        else:
+            other_rows = [payload[field] for field in ("balance", "cash_flow")]
+            if any(not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict) for rows in other_rows):
+                return "unknown", ("FINANCIAL_PERIOD_ROWS_INCOMPLETE_OR_DUPLICATE",), {}, ()
+            balance, cash = (rows[0] for rows in other_rows)
+            rows = [profit, balance, cash, prior]
         publication_dates = []
         for index, row in enumerate(rows):
-            period = selected if index != 3 else selected.replace(year=selected.year - 1)
+            period = selected.replace(year=selected.year - 1) if index == len(rows) - 1 else selected
             published = date.fromisoformat(row["pubDate"])
             if row["code"] != external or row["statDate"] != period.isoformat():
                 return "unknown", ("FINANCIAL_IDENTITY_OR_PERIOD_MISMATCH",), {}, ()
             if not period <= published <= known_date:
                 return "unknown", ("FINANCIAL_PUBLICATION_OUTSIDE_KNOWLEDGE_BOUNDARY",), {}, ()
+            # BaoStock supplies a date, not a publication time. A report dated
+            # today might be disclosed after this pre-market decision.
+            if published == known_date:
+                return "unknown", ("FINANCIAL_PUBLICATION_TIME_UNVERIFIED_ON_DECISION_DATE",), {}, ()
             publication_dates.append(published.isoformat())
         metrics = {
             "net_profit": _number(profit, "netProfit"),
             "prior_year_same_period_net_profit": _number(prior, "netProfit"),
             "roe": _number(profit, "roeAvg"),
-            "liability_to_asset": _number(balance, "liabilityToAsset"),
-            "asset_to_equity": _number(balance, "assetToEquity"),
-            "operating_cash_flow_to_net_profit": _number(cash, "CFOToNP"),
         }
+        if not financial_sector:
+            metrics.update({
+                "liability_to_asset": _number(balance, "liabilityToAsset"),
+                "asset_to_equity": _number(balance, "assetToEquity"),
+                "operating_cash_flow_to_net_profit": _number(cash, "CFOToNP"),
+            })
     except (TypeError, ValueError, KeyError, AttributeError):
         return "unknown", ("FINANCIAL_FIELDS_INCOMPLETE_OR_INVALID",), {}, ()
     reasons = []
@@ -142,6 +241,10 @@ def evaluate_financial_quality(
         reasons.append("CURRENT_OR_PRIOR_YEAR_PERIOD_NOT_PROFITABLE")
     if metrics["roe"] <= 0:
         reasons.append("NONPOSITIVE_RETURN_ON_EQUITY")
+    if financial_sector:
+        if reasons:
+            return "veto", tuple(reasons), metrics, tuple(publication_dates)
+        return "unknown", ("FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED",), metrics, tuple(publication_dates)
     if metrics["asset_to_equity"] <= 0 or metrics["liability_to_asset"] >= 1:
         reasons.append("NONPOSITIVE_EQUITY_OR_EXCESS_BALANCE_SHEET_LEVERAGE")
     if metrics["liability_to_asset"] < 0:
@@ -168,21 +271,62 @@ def evaluate_announcement_review(
         items = manifest["items"]
         if manifest["complete"] is not True or not isinstance(items, list) or not items:
             return "unknown", ("OFFICIAL_MANIFEST_INCOMPLETE_OR_EMPTY",)
+        if manifest.get("provider") != "cninfo" or manifest.get("source_url") != "https://www.cninfo.com.cn/new/hisAnnouncement/query":
+            return "unknown", ("OFFICIAL_MANIFEST_SOURCE_UNVERIFIED",)
+        if manifest.get("symbol") != symbol:
+            return "unknown", ("OFFICIAL_MANIFEST_ISSUER_MISMATCH",)
+        known_date = knowledge_time.astimezone(_SHANGHAI).date()
+        started = date.fromisoformat(manifest["coverage_from"])
+        if started > announcement_window_start(known_date):
+            return "unknown", ("OFFICIAL_MANIFEST_WINDOW_INCOMPLETE",)
         through = _aware(manifest["coverage_through"])
-        if through > knowledge_time or knowledge_time - through > timedelta(hours=24):
+        # An 08:20 listing cannot certify that no new disclosure appeared by
+        # 08:50, even though both receipts are from the same calendar day.
+        if through != knowledge_time:
             return "unknown", ("OFFICIAL_MANIFEST_STALE_OR_FUTURE",)
+        record_count = manifest.get("record_count")
+        total_records = manifest.get("total_provider_records")
+        if (
+            isinstance(record_count, bool) or not isinstance(record_count, int)
+            or isinstance(total_records, bool) or not isinstance(total_records, int)
+            or record_count != len(items) or total_records != len(items)
+        ):
+            return "unknown", ("OFFICIAL_MANIFEST_COUNT_UNVERIFIED",)
         if manifest["content_hash"] != content_hash(items):
             return "unknown", ("OFFICIAL_MANIFEST_HASH_MISMATCH",)
         indexed = {item["announcement_id"]: item for item in items}
-        if len(indexed) != len(items) or any(_aware(item["published_at"]) > knowledge_time for item in items):
+        if len(indexed) != len(items) or any(
+            not isinstance(item["announcement_id"], str) or not item["announcement_id"]
+            or not isinstance(item["title"], str) or not item["title"].strip()
+            or urlparse(item["url"]).scheme != "https"
+            or urlparse(item["url"]).hostname != "static.cninfo.com.cn"
+            or not urlparse(item["url"]).path.lower().endswith(".pdf")
+            or not started <= _aware(item["published_at"]).astimezone(_SHANGHAI).date() <= known_date
+            or _aware(item["published_at"]) > knowledge_time
+            for item in items
+        ):
             return "unknown", ("OFFICIAL_MANIFEST_IDENTITY_OR_TIME_INVALID",)
+        if financial_period is not None:
+            selected = date.fromisoformat(financial_period)
+            official_periods = _official_report_periods(items)
+            if official_periods and official_periods[-1] > selected:
+                return "unknown", ("STRUCTURED_FINANCIAL_LAGS_LATEST_OFFICIAL_REPORT",)
         if review_dir is None:
-            return "unknown", ("OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED",)
+            return _automatic_basic_announcement_review(
+                items, financial_period=financial_period, knowledge_time=knowledge_time,
+            )
         root = Path(review_dir).resolve()
         path = Path(review_path).resolve() if review_path is not None else root / f"{symbol}.json"
         if not path.resolve().is_relative_to(root):
             return "unknown", ("OFFICIAL_REVIEW_PATH_OUTSIDE_REVIEW_DIRECTORY",)
-        if not path.is_file() or path.stat().st_size > 2_000_000:
+        if not path.is_file():
+            return (
+                ("unknown", ("OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED",)) if review_path is not None
+                else _automatic_basic_announcement_review(
+                    items, financial_period=financial_period, knowledge_time=knowledge_time,
+                )
+            )
+        if path.stat().st_size > 2_000_000:
             return "unknown", ("OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED",)
         review = json.loads(path.read_text())
         if (
@@ -316,6 +460,11 @@ def _valid_cached(path: Path, *, symbol: str, knowledge_time: datetime, cutoff: 
     announcements = payload.get("announcements")
     if not isinstance(announcements, Mapping) or announcements.get("error") or announcements.get("complete") is not True:
         return None
+    try:
+        if _aware(announcements["coverage_through"]) != knowledge_time:
+            return None
+    except (TypeError, ValueError, KeyError):
+        return None
     return payload
 
 
@@ -430,6 +579,26 @@ def enrich_candidate_evidence(
             execution_gate, execution_reasons = evaluate_execution_status(
                 execution, symbol=symbol, cutoff=cutoff, metadata=item,
             )
+        metrics = dict(metrics)
+        valuation_asof = None
+        if execution_gate == "pass":
+            valuation_asof = cutoff.isoformat()
+            valuation_row = execution["rows"][0]
+            for field, label in (("peTTM", "pe_ttm_at_price_cutoff"), ("pbMRQ", "pb_mrq_at_price_cutoff")):
+                try:
+                    if valuation_row.get(field) not in (None, ""):
+                        metrics[label] = _number(valuation_row, field)
+                except (TypeError, ValueError, KeyError, AttributeError):
+                    # A malformed optional multiple cannot create a pass or
+                    # hide another available dated multiple.
+                    continue
+        official_latest_period = None
+        if announcements.get("complete") is True and isinstance(announcements.get("items"), list):
+            try:
+                periods = _official_report_periods(announcements["items"])
+                official_latest_period = periods[-1].isoformat() if periods else None
+            except (TypeError, ValueError, AttributeError):
+                pass
         evidence_path = None
         if cache is not None and trusted_time:
             try:
@@ -453,6 +622,16 @@ def enrich_candidate_evidence(
             financial_period=financials.get("selected_period"), publication_dates=publication_dates,
             metrics=metrics, announcement_items=tuple(announcements.get("items") or ()),
             evidence_path=evidence_path,
+            required_financial_period=required_report_period(knowledge_time.astimezone(_SHANGHAI).date()).isoformat(),
+            latest_official_financial_period=official_latest_period,
+            valuation_asof=valuation_asof,
+            announcement_review_mode=(
+                "automatic_basic_title_screen" if announcement_gate == "pass"
+                and "AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED" in announcement_reasons
+                else "manual_content_review" if announcement_gate == "pass"
+                and "CONTENT_GROUNDED_OFFICIAL_REVIEW_CONFIRMED" in announcement_reasons
+                else "unknown"
+            ),
         )
         results.append(result)
         # Sticky explicit vetoes are never downgraded by an unavailable provider.
@@ -466,21 +645,45 @@ def enrich_candidate_evidence(
         item["candidate_evidence_reasons"] = (*reasons, *announcement_reasons, *execution_reasons)
         item["candidate_evidence_financial_hash"] = financial_hash
         item["candidate_evidence_announcement_manifest_hash"] = result.announcement_manifest_hash
+        item["candidate_evidence_announcement_review_mode"] = result.announcement_review_mode
         item["candidate_evidence_retrieved_at"] = result.retrieved_at
+        item["candidate_evidence_financial_period"] = result.financial_period
+        item["candidate_evidence_required_financial_period"] = result.required_financial_period
+        item["candidate_evidence_latest_official_financial_period"] = result.latest_official_financial_period
+        item["candidate_evidence_valuation_asof"] = result.valuation_asof
+        item["candidate_evidence_metrics"] = result.metrics
     return CandidateEvidenceBatch(
         metadata=metadata_copy, results=tuple(results),
         diagnostics={
             "method_version": METHOD_VERSION, "requested_count": len(requested),
+            "required_financial_period": required_report_period(knowledge_time.astimezone(_SHANGHAI).date()).isoformat(),
             "financial_pass_count": sum(r.fundamental_gate == "pass" for r in results),
             "announcement_pass_count": sum(r.announcement_gate == "pass" for r in results),
+            "automatic_basic_announcement_pass_count": sum(
+                r.announcement_review_mode == "automatic_basic_title_screen" for r in results
+            ),
+            "manual_content_review_pass_count": sum(
+                r.announcement_review_mode == "manual_content_review" for r in results
+            ),
             "execution_pass_count": sum(r.execution_gate == "pass" for r in results),
+            "structured_financial_lag_count": sum(
+                "STRUCTURED_FINANCIAL_LAGS_LATEST_OFFICIAL_REPORT" in r.announcement_reasons for r in results
+            ),
+            "financial_sector_special_review_count": sum(
+                "FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED" in r.fundamental_reasons for r in results
+            ),
+            # One user-facing review stage, retaining independently auditable
+            # financial and official-disclosure checks underneath it.
+            "fundamental_risk_review_pass_count": sum(
+                r.fundamental_gate == r.announcement_gate == "pass" for r in results
+            ),
             "double_confirmation_count": sum(r.fundamental_gate == r.announcement_gate == "pass" for r in results),
             "unknown_count": sum("unknown" in (r.fundamental_gate, r.announcement_gate) for r in results),
             "veto_count": sum("veto" in (r.fundamental_gate, r.announcement_gate) for r in results),
             "effective_knowledge_time": effective_knowledge_time.isoformat(),
             "price_cutoff": cutoff.isoformat(),
             "financial_policy_scope": "basic_profit_solvency_cash_quality_not_blue_chip_certification",
-            "official_review_scope": "annual_coverage_aware_manifest_and_explicit_content_review_not_all_risks_guaranteed",
+            "official_review_scope": "complete_current_manifest_title_screen_not_full_document_due_diligence",
             "historical_replay_allowed": False,
         },
     )

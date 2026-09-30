@@ -2072,6 +2072,7 @@ def test_unexpected_failure_never_copies_exception_or_secret(tmp_path: Path) -> 
         **_paths(tmp_path),
         decision_date=CUTOFF,
         _latest_cutoff=lambda _root: CUTOFF,
+        _next_trading_day=lambda _cutoff: FRIDAY,
         _build_digest=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
         _notifier=lambda _message: _accepted_summary(),
     )
@@ -2200,22 +2201,43 @@ def test_log_failure_does_not_turn_rejected_delivery_into_success(
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
 
 
-def test_held_account_morning_skips_full_market_selection(tmp_path, monkeypatch):
+def test_held_account_morning_also_builds_independent_market_model(tmp_path, monkeypatch):
     from ashare_lab.services import build_continuous_digest
     from ashare_lab.services.holding_ledger import get_active_holding_portfolio
 
     repository = _recommendation_repository(tmp_path)
     portfolio = _register_four_holding_channels(repository)
-    messages, reviews = [], []
+    messages, reviews, market_builds = [], [], []
 
-    def forbidden(**_kwargs):
-        pytest.fail("holding review must not wait for full-market or financial screening")
+    def full_market(**_kwargs):
+        market_builds.append(True)
+        plan = {
+            **_digest().continuous_plan,
+            "holding_based": True,
+            "holding_identity": [portfolio.id, portfolio.version],
+            "entries": [],
+            "cash_weight": None,
+            "status_note": "实际账户补位需另行确认。",
+            "market_model_portfolio": {
+                "entries": [{
+                    "symbol": "600999", "name": "合成市场优选", "account_weight": 0.2,
+                    "entry_qualified": True,
+                    "entry_label": "确认≥10，买≤10.20+量",
+                    "protection_line": 9.4,
+                }],
+                "cash_weight": 0.8,
+                "holding_count": 1,
+                "count_state": "concentrated",
+                "status_note": "独立全市场模型。",
+            },
+        }
+        return replace(_digest(), continuous_plan=plan)
 
     def review(*_args, **_kwargs):
         reviews.append(True)
         return _holding_review_for_portfolio(portfolio)
 
-    monkeypatch.setattr(build_continuous_digest, "build_continuous_research_digest", forbidden)
+    monkeypatch.setattr(build_continuous_digest, "build_continuous_research_digest", full_market)
     result = evening_report.run_evening_digest(
         **_paths(tmp_path),
         _repository=repository,
@@ -2225,12 +2247,11 @@ def test_held_account_morning_skips_full_market_selection(tmp_path, monkeypatch)
         _notifier=lambda message: messages.append(message) or _accepted_summary(),
     )
     assert result.event["status"] == "provider_accepted"
-    assert len(reviews) == len(messages) == 1
-    assert "持仓观察" in messages[0].body
-    assert "买卖后请确认更新" in messages[0].body
-    assert "建仓组合" not in messages[0].body
-    assert "候选" not in messages[0].body
-    assert "股票敞口上限0%" not in messages[0].body
+    assert len(market_builds) == len(reviews) == len(messages) == 1
+    assert "全市场模型组合" in messages[0].body
+    assert "合成市场优选(600999)" in messages[0].body
+    assert "模型现金：总资金80%" in messages[0].body
+    assert "实际账户补位需另行确认" not in messages[0].body
     assert get_active_holding_portfolio(repository).id == portfolio.id
 
 

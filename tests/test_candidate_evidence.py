@@ -12,8 +12,10 @@ import pytest
 
 from ashare_lab.adapters.candidate_financial_evidence import (
     METHOD_VERSION,
+    REPORTING_WINDOW_SOURCE,
     announcement_window_start,
     collect_announcements,
+    collect_execution_status,
     collect_financials,
     collect_worker_batch,
     content_hash,
@@ -50,8 +52,11 @@ def manifest():
         {"announcement_id": "latest", "title": "2026年半年度报告", "published_at": "2026-08-29T00:00:00+08:00", "url": "https://static.cninfo.com.cn/finalpage/2026-08-29/latest.PDF"},
     ]
     return {
+        "provider": "cninfo", "source_url": "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+        "symbol": SYMBOL,
         "coverage_from": "2025-09-22", "coverage_through": NOW.isoformat(),
-        "complete": True, "items": items, "content_hash": content_hash(items),
+        "complete": True, "record_count": len(items), "total_provider_records": len(items),
+        "items": items, "content_hash": content_hash(items),
     }
 
 
@@ -60,7 +65,7 @@ def payload():
 
 
 def execution():
-    rows = [{"date": CUTOFF.isoformat(), "code": "sh.601298", "tradestatus": "1", "isST": "0"}]
+    rows = [{"date": CUTOFF.isoformat(), "code": "sh.601298", "tradestatus": "1", "isST": "0", "peTTM": "12.5", "pbMRQ": "1.3"}]
     return {"cutoff": CUTOFF.isoformat(), "rows": rows, "content_hash": content_hash(rows)}
 
 
@@ -76,6 +81,11 @@ def check_financial(data=None, industry="港口"):
 ])
 def test_required_period_is_freshness_floor_not_publication(day, expected):
     assert required_report_period(day) == expected
+
+
+def test_reporting_rule_points_to_stock_listing_rule_not_convertible_bond_rule():
+    assert "/stocks/mainipo/" in REPORTING_WINDOW_SOURCE
+    assert "/bond/convertible/" not in REPORTING_WINDOW_SOURCE
 
 
 def test_financials_require_all_three_statement_families_and_prior_profit():
@@ -109,8 +119,24 @@ def test_missing_and_nonfinite_are_not_zero(value):
 
 
 def test_banks_do_not_inherit_industrial_cashflow_tests():
-    assert check_financial(industry="银行")[0:2] == ("unknown", ("FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED",))
+    gate, reasons, metrics, dates = check_financial(industry="银行")
+    assert (gate, reasons) == ("unknown", ("FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED",))
+    assert metrics == {"net_profit": 100.0, "prior_year_same_period_net_profit": 80.0, "roe": 0.05}
+    assert dates == ("2026-08-29", "2025-08-29")
     assert check_financial(industry="")[0] == "unknown"
+
+
+def test_financial_sector_clear_profit_failure_vetoes_but_positive_profit_does_not_auto_pass():
+    data = financials()
+    data["cash_flow"] = []  # industrial CFO ratio is not applicable
+    data["balance"] = []  # industrial liabilities/assets cutoff is not applicable
+    assert check_financial(data, industry="保险")[0] == "unknown"
+    data["profit"]["netProfit"] = "-1"
+    assert check_financial(data, industry="保险")[0:2] == (
+        "veto", ("CURRENT_OR_PRIOR_YEAR_PERIOD_NOT_PROFITABLE",)
+    )
+    data["profit"]["pubDate"] = "2026-09-23"
+    assert check_financial(data, industry="保险")[0] == "unknown"
 
 
 def test_future_publication_stale_period_and_identity_fail_closed():
@@ -123,14 +149,128 @@ def test_future_publication_stale_period_and_identity_fail_closed():
     assert check_financial(data)[0] == "unknown"
 
 
-def test_latest_publication_may_follow_price_cutoff_but_not_decision():
+def test_date_only_publication_on_decision_day_cannot_pass_premarket():
     data = financials()
     data["profit"]["pubDate"] = "2026-09-22"
-    assert check_financial(data)[0] == "pass"
+    assert check_financial(data)[0:2] == (
+        "unknown", ("FINANCIAL_PUBLICATION_TIME_UNVERIFIED_ON_DECISION_DATE",)
+    )
 
 
-def test_manifest_success_and_absence_of_title_keywords_never_pass():
-    assert evaluate_announcement_review(manifest(), symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW, review_dir=None) == ("unknown", ("OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED",))
+def test_complete_current_official_manifest_can_pass_narrow_auto_title_screen():
+    assert evaluate_announcement_review(
+        manifest(), symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    ) == ("pass", ("AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED",))
+
+
+@pytest.mark.parametrize(("mutation", "reason"), [
+    ("short_window", "OFFICIAL_MANIFEST_WINDOW_INCOMPLETE"),
+    ("count_mismatch", "OFFICIAL_MANIFEST_COUNT_UNVERIFIED"),
+    ("total_mismatch", "OFFICIAL_MANIFEST_COUNT_UNVERIFIED"),
+    ("wrong_source", "OFFICIAL_MANIFEST_SOURCE_UNVERIFIED"),
+    ("wrong_issuer", "OFFICIAL_MANIFEST_ISSUER_MISMATCH"),
+    ("missing_issuer", "OFFICIAL_MANIFEST_ISSUER_MISMATCH"),
+    ("stale_same_day", "OFFICIAL_MANIFEST_STALE_OR_FUTURE"),
+])
+def test_auto_screen_requires_complete_current_official_listing(mutation, reason):
+    data = manifest()
+    if mutation == "short_window":
+        data["coverage_from"] = "2026-01-01"
+    elif mutation == "count_mismatch":
+        data["record_count"] = 1
+    elif mutation == "total_mismatch":
+        data["total_provider_records"] = 3
+    elif mutation == "wrong_source":
+        data["source_url"] = "https://example.com/not-official"
+    elif mutation == "wrong_issuer":
+        data["symbol"] = "600000.SH"
+    elif mutation == "missing_issuer":
+        del data["symbol"]
+    else:
+        data["coverage_through"] = (NOW - timedelta(minutes=10)).isoformat()
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    ) == ("unknown", (reason,))
+
+
+@pytest.mark.parametrize(("title", "expected_reason"), [
+    ("2026年半年度报告摘要", "LATEST_FULL_OFFICIAL_FINANCIAL_REPORT_REQUIRED"),
+    ("2026年半年度报告更正公告", "LATEST_FULL_OFFICIAL_FINANCIAL_REPORT_REQUIRED"),
+    ("2026年半年度业绩预告", "LATEST_FULL_OFFICIAL_FINANCIAL_REPORT_REQUIRED"),
+])
+def test_summary_correction_or_forecast_cannot_replace_full_latest_report(title, expected_reason):
+    data = manifest()
+    data["items"][1]["title"] = title
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    ) == ("unknown", (expected_reason,))
+
+
+def test_title_screen_is_not_content_review_and_material_risk_remains_unknown():
+    data = manifest()
+    data["items"].append({
+        "announcement_id": "risk", "title": "关于收到立案告知书的公告",
+        "published_at": "2026-09-21T00:00:00+08:00",
+        "url": "https://static.cninfo.com.cn/finalpage/risk.PDF",
+    })
+    data["record_count"] = data["total_provider_records"] = len(data["items"])
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    ) == ("unknown", ("POTENTIALLY_MATERIAL_DOCUMENT_REQUIRES_CONTENT_REVIEW",))
+
+
+def test_ordinary_audit_title_is_not_a_nonstandard_audit_opinion():
+    data = manifest()
+    data["items"].append({
+        "announcement_id": "audit", "title": "2025年度审计报告",
+        "published_at": "2026-03-20T00:01:00+08:00",
+        "url": "https://static.cninfo.com.cn/finalpage/audit.PDF",
+    })
+    data["record_count"] = data["total_provider_records"] = len(data["items"])
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    )[0] == "pass"
+    data["items"][-1]["title"] = "2025年度非标准审计意见"
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    )[0] == "unknown"
+
+
+def test_combined_full_annual_and_audit_title_can_supply_annual_report_presence():
+    data = manifest()
+    data["items"][0]["title"] = "2025年度报告及审计报告"
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
+        review_dir=None, financial_period="2026-06-30",
+    )[0] == "pass"
+
+
+def test_newer_official_report_blocks_lagging_structured_financial_period():
+    known = datetime(2026, 10, 25, 8, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
+    data = manifest()
+    data["items"].append({
+        "announcement_id": "q3", "title": "2026年第三季度报告",
+        "published_at": "2026-10-23T17:00:00+08:00",
+        "url": "https://static.cninfo.com.cn/finalpage/q3.PDF",
+    })
+    data["coverage_through"] = known.isoformat()
+    data["content_hash"] = content_hash(data["items"])
+    data["record_count"] = data["total_provider_records"] = len(data["items"])
+    assert evaluate_announcement_review(
+        data, symbol=SYMBOL, financial_hash="abc", knowledge_time=known,
+        review_dir=None, financial_period="2026-06-30",
+    ) == ("unknown", ("STRUCTURED_FINANCIAL_LAGS_LATEST_OFFICIAL_REPORT",))
 
 
 def make_review(tmp_path, *, data=None):
@@ -213,7 +353,7 @@ def test_historical_current_snapshot_is_not_networked_or_backfilled():
     assert result.results[0].fundamental_reasons == ("CURRENT_SNAPSHOT_FORBIDDEN_IN_HISTORICAL_REPLAY",)
 
 
-def test_enrichment_is_copied_cached_and_clear_about_unknown_review(tmp_path):
+def test_enrichment_is_copied_cached_and_labels_narrow_auto_review(tmp_path):
     original = {SYMBOL: {"industry": "港口", "private_cost": 12}}
     seen = []
     def provider(symbols, **kwargs):
@@ -222,13 +362,36 @@ def test_enrichment_is_copied_cached_and_clear_about_unknown_review(tmp_path):
     batch = enrich_candidate_evidence(original, symbols=[SYMBOL], cutoff=CUTOFF, knowledge_time=NOW, cache_dir=tmp_path, provider=provider, clock=lambda: NOW)
     assert original == {SYMBOL: {"industry": "港口", "private_cost": 12}}
     assert batch.metadata[SYMBOL]["fundamental_gate"] == "pass"
-    assert batch.metadata[SYMBOL]["announcement_gate"] == "unknown"
-    assert batch.diagnostics["double_confirmation_count"] == 0
-    assert batch.diagnostics["unknown_count"] == 1
+    assert batch.metadata[SYMBOL]["announcement_gate"] == "pass"
+    assert batch.metadata[SYMBOL]["candidate_evidence_announcement_review_mode"] == "automatic_basic_title_screen"
+    assert batch.results[0].announcement_review_mode == "automatic_basic_title_screen"
+    assert batch.diagnostics["automatic_basic_announcement_pass_count"] == 1
+    assert batch.diagnostics["manual_content_review_pass_count"] == 0
+    assert batch.diagnostics["fundamental_risk_review_pass_count"] == 1
+    assert batch.diagnostics["unknown_count"] == 0
     again = enrich_candidate_evidence(original, symbols=[SYMBOL], cutoff=CUTOFF, knowledge_time=NOW, cache_dir=tmp_path, provider=provider, clock=lambda: NOW)
     assert len(seen) == 1
     assert again.results[0].financial_hash == batch.results[0].financial_hash
     assert "private_cost" not in (tmp_path / f"{SYMBOL}.json").read_text()
+
+
+def test_same_day_cached_official_manifest_is_refreshed_at_new_decision_time(tmp_path):
+    (tmp_path / f"{SYMBOL}.json").write_text(json.dumps(payload()))
+    later = NOW + timedelta(minutes=10)
+    calls = []
+    def provider(symbols, **kwargs):
+        calls.append(symbols)
+        fresh = payload()
+        fresh["retrieved_at"] = later.isoformat()
+        fresh["announcements"]["coverage_through"] = later.isoformat()
+        return {SYMBOL: fresh}
+    batch = enrich_candidate_evidence(
+        {SYMBOL: {"industry": "港口", "is_limit_up_at_cutoff": False}},
+        symbols=[SYMBOL], cutoff=CUTOFF, knowledge_time=later,
+        cache_dir=tmp_path, provider=provider, clock=lambda: later,
+    )
+    assert calls == [[SYMBOL]]
+    assert batch.results[0].announcement_gate == "pass"
 
 
 def test_provider_failure_is_unknown_not_no_eligible_and_explicit_veto_sticks():
@@ -310,6 +473,19 @@ def test_financial_collector_probes_newer_period_not_only_minimum():
     assert collect_financials(Module(), SYMBOL, NOW)["selected_period"] == "2026-06-30"
 
 
+def test_execution_receipt_collects_dated_valuation_context_without_using_it_as_a_gate():
+    requested = []
+    class Module:
+        def query_history_k_data_plus(self, symbol, fields, **kwargs):
+            requested.append((symbol, fields, kwargs))
+            return FakeRows(execution()["rows"])
+    result = collect_execution_status(Module(), SYMBOL, CUTOFF)
+    assert requested[0][0] == "sh.601298"
+    assert requested[0][1].endswith("peTTM,pbMRQ")
+    assert result["rows"][0]["peTTM"] == "12.5"
+    assert result["cutoff"] == CUTOFF.isoformat()
+
+
 def test_review_hash_is_based_on_financial_content_not_fetch_time():
     one = payload()
     two = copy.deepcopy(one)
@@ -348,6 +524,28 @@ def test_evidence_fills_only_verified_formation_execution_metadata():
     assert batch.results[0].execution_gate == "pass"
     assert batch.results[0].execution_hash == execution()["content_hash"]
     assert batch.diagnostics["execution_pass_count"] == 1
+    assert batch.results[0].required_financial_period == "2026-06-30"
+    assert batch.results[0].latest_official_financial_period == "2026-06-30"
+    assert batch.results[0].valuation_asof == CUTOFF.isoformat()
+    assert batch.results[0].metrics["pe_ttm_at_price_cutoff"] == 12.5
+    assert batch.results[0].metrics["pb_mrq_at_price_cutoff"] == 1.3
+    assert batch.metadata[SYMBOL]["candidate_evidence_valuation_asof"] == CUTOFF.isoformat()
+    assert batch.diagnostics["required_financial_period"] == "2026-06-30"
+
+
+def test_missing_or_bad_valuation_does_not_become_a_quality_pass():
+    data = payload()
+    data["execution"]["rows"][0]["peTTM"] = "NaN"
+    data["execution"]["content_hash"] = content_hash(data["execution"]["rows"])
+    batch = enrich_candidate_evidence(
+        {SYMBOL: {"industry": "银行", "is_limit_up_at_cutoff": False}},
+        symbols=[SYMBOL], cutoff=CUTOFF, knowledge_time=NOW,
+        provider=lambda *a, **k: {SYMBOL: data}, clock=lambda: NOW,
+    )
+    assert batch.results[0].execution_gate == "pass"
+    assert batch.results[0].fundamental_gate == "unknown"
+    assert "pe_ttm_at_price_cutoff" not in batch.results[0].metrics
+    assert batch.diagnostics["financial_sector_special_review_count"] == 1
 
 
 def test_malformed_nested_provider_payload_does_not_crash_report():
@@ -364,6 +562,7 @@ def test_material_announcement_cannot_be_triaged_away_as_routine(tmp_path):
     data = manifest()
     data["items"].append({"announcement_id": "risk", "title": "关于收到立案告知书的公告", "published_at": "2026-09-21T00:00:00+08:00", "url": "https://static.cninfo.com.cn/finalpage/risk.PDF"})
     data["content_hash"] = content_hash(data["items"])
+    data["record_count"] = data["total_provider_records"] = len(data["items"])
     review = make_review(tmp_path)
     review["manifest_hash"] = data["content_hash"]
     review["triage"].append({"announcement_id": "risk", "decision": "routine_nonmaterial", "reason": "Not important"})
@@ -445,7 +644,7 @@ def test_early_new_annual_report_requires_its_own_audit_not_statutory_old_floor(
     assert reasons == ("OFFICIAL_REVIEW_LATEST_ANNUAL_AUDIT_REQUIRED",)
 
 
-def test_worker_financial_phase_completes_before_any_announcement_request(monkeypatch):
+def test_worker_completes_first_candidate_before_starting_next(monkeypatch):
     import ashare_lab.adapters.candidate_financial_evidence as adapter
     events, receipts = [], []
     def financial(module, symbol, time):
@@ -456,13 +655,22 @@ def test_worker_financial_phase_completes_before_any_announcement_request(monkey
         return execution()
     def announcements(client, symbol, time, identities):
         events.append(("announcements", symbol))
+        if symbol == SYMBOL:
+            return manifest()
         raise TimeoutError("slow official source")
     monkeypatch.setattr(adapter, "collect_financials", financial)
     monkeypatch.setattr(adapter, "collect_execution_status", status)
     monkeypatch.setattr(adapter, "collect_announcements", announcements)
     client = SimpleNamespace(get=lambda *a: FakeResponse({"stockList": []}))
     collect_worker_batch([SYMBOL, "002292.SZ"], cutoff=CUTOFF, knowledge_time=NOW, module=object(), client=client, emit=lambda r: receipts.append(copy.deepcopy(r)))
-    assert events[:4] == [("financial", SYMBOL), ("execution", SYMBOL), ("financial", "002292.SZ"), ("execution", "002292.SZ")]
+    assert events[:4] == [
+        ("financial", SYMBOL), ("execution", SYMBOL),
+        ("announcements", SYMBOL), ("financial", "002292.SZ"),
+    ]
+    assert any(
+        r["symbol"] == SYMBOL and r.get("announcements", {}).get("complete") is True
+        for r in receipts
+    )
     assert any(r["symbol"] == "002292.SZ" and r.get("financials", {}).get("profit") and not r["announcement_attempted"] for r in receipts)
 
 

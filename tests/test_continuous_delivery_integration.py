@@ -247,6 +247,39 @@ def test_holding_based_details_cannot_escape_without_holding_authorization():
         assert forbidden not in body
 
 
+def test_independent_market_model_is_public_but_held_account_remains_private():
+    digest = _continuous_digest(holding_based=True)
+    model = {
+        "entries": [{
+            "symbol": "600999", "name": "合成市场优选", "account_weight": 0.2,
+            "entry_qualified": True, "entry_label": "确认≥10，买≤10.20+量",
+            "protection_line": 9.4,
+        }],
+        "cash_weight": 0.8,
+        "holding_count": 1,
+        "count_state": "concentrated",
+        "status_note": "独立全市场模型。",
+    }
+    digest = replace(
+        digest,
+        continuous_plan={**digest.continuous_plan, "market_model_portfolio": model},
+    )
+    public = render_evening_digest_markdown(
+        digest, _holding_review(), include_holding_summary=False
+    )
+    private = render_evening_digest_markdown(
+        digest, _holding_review(), include_holding_summary=True
+    )
+    assert "全市场模型组合" in public and "合成市场优选(600999)" in public
+    assert "模型现金：总资金80%" in public
+    assert "合成私有持仓" not in public and "600088" not in public
+    assert "合成私有持仓(600088)" in private
+    assert "合成市场优选(600999)" in private
+    assert "重合0只，模型独有1只" in private
+    assert "重合0只" not in public
+    assert "合成补位预案" not in public
+
+
 def test_authorized_holdings_keep_exit_priority_but_remove_legacy_horizon_and_cost():
     body = render_evening_digest_markdown(
         _continuous_digest(holding_based=True), _holding_review(), include_holding_summary=True

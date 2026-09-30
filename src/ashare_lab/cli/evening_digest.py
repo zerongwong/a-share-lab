@@ -444,17 +444,7 @@ def run_evening_digest(
                     )
                 )
 
-            registered_holdings = None
             if _build_digest is None:
-                # Membership is the user's confirmed fact, never an output of
-                # today's screen. A ledger error must not become an empty account.
-                registered_holdings = get_active_holding_portfolio(repository)
-            if registered_holdings is not None and registered_holdings.positions:
-                # Held accounts get a holding-only review. Do not wait for
-                # full-market selection / new-entry financial due diligence.
-                def digest_builder(**kwargs):
-                    return _holding_only_digest(registered_holdings, latest)
-            elif _build_digest is None:
                 from ashare_lab.services.build_continuous_digest import (
                     build_continuous_research_digest,
                 )
@@ -465,11 +455,10 @@ def run_evening_digest(
                     )
             else:
                 digest_builder = _build_digest
-            build_stage = (
-                "holding_only_build"
-                if registered_holdings is not None and registered_holdings.positions
-                else "full_market_build"
-            )
+            # A registered portfolio must not suppress the independent market
+            # screen. The builder reads the ledger separately and keeps actual
+            # holdings locked in its holding-based replacement branch.
+            build_stage = "full_market_build"
             progress(build_stage, common_cutoff=latest)
             digest = digest_builder(
                 dataset_root=resolved_csmar,

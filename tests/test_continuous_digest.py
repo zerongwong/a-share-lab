@@ -11,7 +11,10 @@ import pytest
 
 from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
 from ashare_lab.services import build_continuous_digest as service
-from ashare_lab.services.build_evening_digest import build_evening_research_digest
+from ashare_lab.services.build_evening_digest import (
+    EveningResearchDigest,
+    build_evening_research_digest,
+)
 from ashare_lab.services.build_midterm_portfolio import (
     ConditionalEntryPlan,
     ConditionalEntryPlanKind,
@@ -182,7 +185,7 @@ def test_candidate_message_identifies_financial_pass_and_real_remaining_review_g
         "announcement_reasons": ["OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED"],
         "execution_gate": "pass",
     }])
-    assert candidates[0]["reason"] == "财务初筛通过；公告正文待审"
+    assert candidates[0]["reason"] == "财务初筛通过；公告风险或证据待复核"
 
 
 @pytest.mark.parametrize(
@@ -420,6 +423,55 @@ def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_
     assert legacy.continuous_plan is None
 
 
+def test_registered_holdings_do_not_suppress_independent_market_model(monkeypatch):
+    args = _fixture(1)
+    candidate = SimpleNamespace(
+        symbol="600999", name="合成市场候选", industry="new-industry",
+        operational_account_weight=0.15, conditional_entry_plan=_price_plan(),
+    )
+    result = SimpleNamespace(
+        status=MidtermPortfolioStatus.RESEARCH_ONLY,
+        data_cutoff=pd.Timestamp(AS_OF), price_cycle=object(),
+        positions=(candidate,), cash_weight=0.85,
+        horizon_candidate_count=1, screening_candidates=(),
+        qualified_entry_universe=(),
+    )
+    monkeypatch.setattr(
+        service, "get_active_holding_portfolio", lambda _repo: args["portfolio"]
+    )
+
+    def fake_evening(*, _hybrid_loader, _portfolio_builder, **_kwargs):
+        hybrid = _hybrid_loader("synthetic", "synthetic", "synthetic")
+        _portfolio_builder(
+            hybrid.snapshot.histories, hybrid.snapshot.metadata, holding_weeks=4
+        )
+        return EveningResearchDigest(
+            common_cutoff=AS_OF, decision_date=AS_OF,
+            cycle_label="合成市场", entry_strictness="defensive",
+            max_stock_exposure=0.30, minimum_cash_weight=0.70,
+            cycle_rule_agreement=1.0, periods=(),
+        )
+
+    monkeypatch.setattr(service, "build_evening_research_digest", fake_evening)
+    digest = service.build_continuous_research_digest(
+        dataset_root="synthetic", overlay_root="synthetic",
+        reference_dataset_root="synthetic", decision_date=AS_OF,
+        repository=object(),
+        _hybrid_loader=lambda *_args, **_kwargs: SimpleNamespace(
+            snapshot=SimpleNamespace(
+                histories=args["histories"], metadata=args["metadata"]
+            )
+        ),
+        _portfolio_builder=lambda *_args, **_kwargs: result,
+        _holding_reviewer=lambda *_args, **_kwargs: args["review"],
+    )
+    plan = digest.continuous_plan
+    assert plan["holding_based"] is True
+    assert plan["market_model_portfolio"]["entries"][0]["symbol"] == "600999"
+    assert plan["market_model_portfolio"]["cash_weight"] == pytest.approx(0.85)
+    assert all(entry["symbol"] != "600999" for entry in plan["entries"])
+
+
 def test_unreadable_ledger_is_not_interpreted_as_an_empty_initial_account(monkeypatch):
     from test_evening_digest import CUTOFF, _hybrid, _result
 
@@ -472,6 +524,8 @@ def test_candidate_evidence_canonicalizes_csmar_codes_and_restores_internal_iden
     assert tuple(seen[0][0]) == ("000001.SZ", "601298.SH")
     assert seen[0][1]["symbols"] == ("000001.SZ", "601298.SH")
     assert "财务或公告核验未通过" in digest.continuous_plan["status_note"]
+    assert "基本面风险初筛通过0只" in digest.continuous_plan["status_note"]
+    assert "财务初筛0只、官方公告清单筛查0只" in digest.continuous_plan["status_note"]
 
 
 def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkeypatch):

@@ -20,8 +20,8 @@ from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-METHOD_VERSION = "candidate-evidence-v1.0.0"
-REPORTING_WINDOW_SOURCE = "https://www.sse.com.cn/lawandrules/sselawsrules2025/bond/convertible/listing/c/c_20260424_10817746.shtml"
+METHOD_VERSION = "candidate-evidence-v1.2.0"
+REPORTING_WINDOW_SOURCE = "https://www.sse.com.cn/lawandrules/sselawsrules2025/stocks/mainipo/c/c_20260424_10816589.shtml"
 MAX_CANDIDATES = 36
 MAX_ANNOUNCEMENT_PAGES = 16
 PAGE_SIZE = 30
@@ -234,7 +234,9 @@ def collect_execution_status(module, symbol: str, cutoff: date) -> dict:
         return {"error": "EXECUTION_EXCHANGE_UNSUPPORTED"}
     external = f"{exchange.lower()}.{code}"
     rows = _rows(module.query_history_k_data_plus(
-        external, "date,code,tradestatus,isST", start_date=cutoff.isoformat(),
+        # Valuation is dated price context, not proof of earnings quality.  It
+        # shares the same verified formation-close row as tradability.
+        external, "date,code,tradestatus,isST,peTTM,pbMRQ", start_date=cutoff.isoformat(),
         end_date=cutoff.isoformat(), frequency="d", adjustflag="3",
     ))
     return {
@@ -255,7 +257,7 @@ def collect_announcements(client, symbol: str, knowledge_time: datetime, identit
     code = symbol.split(".")[0]
     identity = identities.get(code)
     if identity is None:
-        return {"error": "OFFICIAL_ISSUER_IDENTITY_UNAVAILABLE"}
+        return {"symbol": symbol, "error": "OFFICIAL_ISSUER_IDENTITY_UNAVAILABLE"}
     known_date = knowledge_time.astimezone(_SHANGHAI).date()
     start = announcement_window_start(known_date)
     items, observed_ids = [], set()
@@ -275,25 +277,25 @@ def collect_announcements(client, symbol: str, knowledge_time: datetime, identit
         total = body.get("totalAnnouncement")
         raw = body.get("announcements") or []
         if isinstance(total, bool) or not isinstance(total, int) or total < 0 or not isinstance(raw, list):
-            return {"error": "OFFICIAL_MANIFEST_SCHEMA_INVALID"}
+            return {"symbol": symbol, "error": "OFFICIAL_MANIFEST_SCHEMA_INVALID"}
         if expected_total is not None and expected_total != total:
-            return {"error": "OFFICIAL_MANIFEST_CHANGED_DURING_READ"}
+            return {"symbol": symbol, "error": "OFFICIAL_MANIFEST_CHANGED_DURING_READ"}
         expected_total = total
         for row in raw:
             item_id = str(row.get("announcementId", ""))
             if not item_id or item_id in observed_ids or row.get("secCode") != code:
-                return {"error": "OFFICIAL_MANIFEST_IDENTITY_OR_PAGINATION_INVALID"}
+                return {"symbol": symbol, "error": "OFFICIAL_MANIFEST_IDENTITY_OR_PAGINATION_INVALID"}
             observed_ids.add(item_id)
             published = datetime.fromtimestamp(int(row["announcementTime"]) / 1000, UTC)
             if published > knowledge_time:
                 # The manifest query is date-granular; never use later same-day announcements.
                 continue
             if published.astimezone(_SHANGHAI).date() < start:
-                return {"error": "OFFICIAL_MANIFEST_OUT_OF_WINDOW"}
+                return {"symbol": symbol, "error": "OFFICIAL_MANIFEST_OUT_OF_WINDOW"}
             relative = str(row.get("adjunctUrl", ""))
             url = "https://static.cninfo.com.cn/" + relative.lstrip("/")
             if urlparse(url).hostname != "static.cninfo.com.cn" or not relative.endswith(".PDF") and not relative.endswith(".pdf"):
-                return {"error": "OFFICIAL_DOCUMENT_URL_UNSUPPORTED"}
+                return {"symbol": symbol, "error": "OFFICIAL_DOCUMENT_URL_UNSUPPORTED"}
             items.append({
                 "announcement_id": item_id,
                 "title": str(row.get("announcementTitle", "")),
@@ -306,7 +308,7 @@ def collect_announcements(client, symbol: str, knowledge_time: datetime, identit
             break
     items.sort(key=lambda item: (item["published_at"], item["announcement_id"]))
     return {
-        "provider": "cninfo", "source_url": "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+        "symbol": symbol, "provider": "cninfo", "source_url": "https://www.cninfo.com.cn/new/hisAnnouncement/query",
         "coverage_from": start.isoformat(), "coverage_through": knowledge_time.isoformat(),
         "complete": complete, "record_count": len(items), "total_provider_records": expected_total,
         "items": items, "content_hash": content_hash(items),
@@ -317,19 +319,19 @@ def collect_announcements(client, symbol: str, knowledge_time: datetime, identit
 def collect_worker_batch(
     symbols, *, cutoff, knowledge_time, module, client, skip_financial_symbols=(), emit=None,
 ):
-    """Finish financial/execution receipts for all candidates before disclosures.
+    """Finish one candidate before starting the next, emitting each phase.
 
-    The parent deadline is still authoritative. Started-phase receipts permit
-    the parent to rotate retries past an actually attempted slow symbol, while
-    successful financial snapshots can be reused independently of an outage in
-    CNINFO. No announcement failure discards the other candidates' financials.
+    A deadline must not strand all candidates after their financial phase but
+    before the first official-manifest read. Started-phase receipts let the
+    parent rotate retries after a slow provider; a completed receipt remains
+    available even when a later candidate times out. Unknown stays unknown.
     """
     emit = emit or (lambda value: print(json.dumps(value, ensure_ascii=False), flush=True))
-    results = {}
+    identities = None
     for symbol in symbols:
         result = {
             "symbol": symbol, "method_version": METHOD_VERSION,
-            "announcements": {"error": "OFFICIAL_MANIFEST_PENDING"},
+            "announcements": {"symbol": symbol, "error": "OFFICIAL_MANIFEST_PENDING"},
             "retrieved_at": datetime.now(UTC).isoformat(),
             "financial_attempted": symbol not in skip_financial_symbols,
             "announcement_attempted": False,
@@ -354,22 +356,20 @@ def collect_worker_batch(
                 result["execution"] = {"error": "EXECUTION_PROVIDER_UNAVAILABLE"}
             result["retrieved_at"] = datetime.now(UTC).isoformat()
             result["financial_retrieved_at"] = result["retrieved_at"]
-        results[symbol] = result
         emit(result.copy())
-    try:
-        master = _json_response(client.get("https://www.cninfo.com.cn/new/data/szse_stock.json"))
-        identities = {str(row["code"]): str(row["orgId"]) for row in master["stockList"]}
-    except Exception:
-        identities = {}
-    for symbol in symbols:
-        result = results[symbol]
         result["announcement_attempted"] = True
         result["retrieved_at"] = datetime.now(UTC).isoformat()
         emit(result.copy())
+        if identities is None:
+            try:
+                master = _json_response(client.get("https://www.cninfo.com.cn/new/data/szse_stock.json"))
+                identities = {str(row["code"]): str(row["orgId"]) for row in master["stockList"]}
+            except Exception:
+                identities = {}
         try:
             result["announcements"] = collect_announcements(client, symbol, knowledge_time, identities)
         except Exception:
-            result["announcements"] = {"error": "OFFICIAL_MANIFEST_UNAVAILABLE"}
+            result["announcements"] = {"symbol": symbol, "error": "OFFICIAL_MANIFEST_UNAVAILABLE"}
         result["retrieved_at"] = datetime.now(UTC).isoformat()
         emit(result.copy())
 

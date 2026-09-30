@@ -105,6 +105,11 @@ def build_continuous_research_digest(
                     "execution_hash": row.execution_hash,
                     "retrieved_at": row.retrieved_at,
                     "financial_period": row.financial_period,
+                    "required_financial_period": row.required_financial_period,
+                    "latest_official_financial_period": row.latest_official_financial_period,
+                    "valuation_asof": row.valuation_asof,
+                    "announcement_review_mode": row.announcement_review_mode,
+                    "metrics": row.metrics,
                     "publication_dates": list(row.publication_dates),
                 }
                 for row in batch.results
@@ -156,6 +161,35 @@ def build_continuous_research_digest(
     plan["screening_candidates"] = _screening_candidates(result)
     _describe_candidate_evidence(plan["screening_candidates"], plan["candidate_evidence_records"])
     plan["screening_candidate_count"] = getattr(result, "horizon_candidate_count", 0)
+    # An independent, hypothetical whole-market portfolio is always computed
+    # from the same verified screen. It is not the registered account, and its
+    # weights must never be interpreted as cash released from held shares.
+    if result is not None:
+        plan["market_model_portfolio"] = _initial_plan(result)
+        evidence = plan["candidate_evidence"]
+        model = plan["market_model_portfolio"]
+        if (
+            evidence.get("requested_count", 0) > 0
+            and result.status is not MidtermPortfolioStatus.DATA_NOT_READY
+            and not model["entries"]
+        ):
+            model["status_note"] = (
+                f"本轮核验{evidence.get('requested_count', 0)}只周线候选："
+                f"基本面风险初筛通过{evidence.get('fundamental_risk_review_pass_count', evidence.get('double_confirmation_count', 0))}只"
+                f"（财务初筛{evidence.get('financial_pass_count', 0)}只、"
+                f"官方公告清单筛查{evidence.get('announcement_pass_count', 0)}只），"
+                f"待核验{evidence.get('unknown_count', 0)}只，"
+                f"排除{evidence.get('veto_count', 0)}只。"
+                + (
+                    "证据不足或需人工复核，暂不新买。"
+                    if evidence.get("unknown_count", 0)
+                    else (
+                        "财务或公告核验未通过，暂不新买。"
+                        if not evidence.get("double_confirmation_count", 0)
+                        else "可买性、买入位置或组合风险未通过，暂不新买。"
+                    )
+                )
+            )
     # Independent daily audit only: its cap/state NEVER feeds selection, the
     # holding ledger, protective stops, or the externally rendered plan.
     try:
@@ -194,25 +228,7 @@ def build_continuous_research_digest(
     if portfolio is None or not portfolio.positions:
         # Absence of a registered portfolio means an illustrative initial plan,
         # NOT a claim that the user actually holds 100% cash.
-        plan.update(_initial_plan(result))
-        evidence = plan["candidate_evidence"]
-        if evidence and not plan["entries"]:
-            plan["status_note"] = (
-                f"本轮核验{evidence.get('requested_count', 0)}只周线候选："
-                f"财务通过{evidence.get('financial_pass_count', 0)}只，"
-                f"双重确认{evidence.get('double_confirmation_count', 0)}只，"
-                f"待核验{evidence.get('unknown_count', 0)}只，"
-                f"排除{evidence.get('veto_count', 0)}只。"
-                + (
-                    "证据尚未齐备，暂不新买。"
-                    if evidence.get("unknown_count", 0)
-                    else (
-                        "财务或公告核验未通过，暂不新买。"
-                        if not evidence.get("double_confirmation_count", 0)
-                        else "可买性、买入位置或组合风险未通过，暂不新买。"
-                    )
-                )
-            )
+        plan.update(plan["market_model_portfolio"])
         plan["status_note"] += " 未登记持仓时仅为初建研究方案。" if portfolio is None else ""
     else:
         try:
@@ -353,11 +369,7 @@ def _describe_candidate_evidence(candidates, records) -> None:
         else:
             parts.append("财务证据待补齐")
         if record["announcement_gate"] != "pass":
-            parts.append(
-                "公告正文待审"
-                if "OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED" in record["announcement_reasons"]
-                else "公告证据待补齐"
-            )
+            parts.append("公告风险或证据待复核")
         if record["execution_gate"] != "pass":
             parts.append("可交易性待核验")
         candidate["reason"] = "；".join(parts)

@@ -682,17 +682,34 @@ def _render_continuous_digest(digest, review, include_holdings):
                 "仅跟踪已登记持仓。退出建议不视为已卖出；买卖后请确认更新。",
             ]
         )
-    if private and not include_holdings:
+    model = plan.get("market_model_portfolio") if private else None
+    independent_market_model = isinstance(model, dict)
+    if independent_market_model:
+        # The market model is public research and must stay visible even when
+        # the private holding summary is not authorized for this channel.
+        entries, cash, note = model["entries"], model["cash_weight"], model["status_note"]
+    elif private and not include_holdings:
         entries, cash, note = [], None, "持仓授权待核验，组合补位信息暂不披露。"
     else:
         entries, cash, note = plan["entries"], plan["cash_weight"], plan["status_note"]
     if private and include_holdings and review is None:
-        entries, cash, note = (
-            [],
-            None,
-            "本次持仓复核未完成，暂停发布补位；不把未知状态当成正常持有。",
-        )
-    if plan.get("pending_exit_symbols"):
+        if independent_market_model:
+            note = "持仓复核未完成；不把未知状态当成正常持有。 " + note
+        else:
+            entries, cash, note = (
+                [],
+                None,
+                "本次持仓复核未完成，暂停发布补位；不把未知状态当成正常持有。",
+            )
+    if independent_market_model and include_holdings and review is not None and review.rows:
+        held_codes = {row.symbol for row in review.rows}
+        model_codes = {entry["symbol"] for entry in entries if entry.get("entry_qualified") is True}
+        if model_codes:
+            note += (
+                f" 与已登记持仓重合{len(model_codes & held_codes)}只，"
+                f"模型独有{len(model_codes - held_codes)}只；排名变化不自动换仓。"
+            )
+    if plan.get("pending_exit_symbols") and not independent_market_model:
         # Hypothetical released cash is not spendable until the user confirms
         # the exit and updates the snapshot. Keep the local comparison only.
         entries, cash = [], None
@@ -705,8 +722,9 @@ def _render_continuous_digest(digest, review, include_holdings):
     lines = [line.removeprefix("- ") for line in lines]
     for label in _HORIZON_LABELS.values():
         lines = [line.replace(f"｜{label}｜", "｜") for line in lines]
+    count_source = model if independent_market_model else plan
     count_summary = _continuous_count_summary(
-        plan.get("holding_count"), plan.get("count_state")
+        count_source.get("holding_count"), count_source.get("count_state")
     )
     return render_continuous_report(
         as_of=digest.common_cutoff,
@@ -719,8 +737,10 @@ def _render_continuous_digest(digest, review, include_holdings):
         entries=entries,
         cash_weight=cash,
         status_note=note,
+        independent_market_model=independent_market_model,
         screening_candidates=(
-            [] if private and not include_holdings else plan.get("screening_candidates", [])
+            [] if private and not include_holdings and not independent_market_model
+            else plan.get("screening_candidates", [])
         ),
     )
 

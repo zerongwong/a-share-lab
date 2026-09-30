@@ -5,6 +5,25 @@ strategy and data-schema versions are tracked separately in research archives.
 
 ## [Unreleased]
 
+- Add `candidate-evidence-v1.2.0` automatic **basic** fundamental-risk screening after
+  the technical shortlist. The current disclosed structured financial period and a
+  complete, fresh, hashed official announcement manifest are separate prerequisites;
+  routine titles may clear the narrow title-risk screen, while material or ambiguous
+  titles, stale/missing evidence and sector-specific gaps remain unknown for further
+  review. This is neither full PDF reading nor a claim of professional due diligence,
+  financial safety or future returns. Preserve the explicit content-grounded manual
+  review route for cases that require it, and show one concise outward-facing risk
+  column while retaining both internal evidence gates and provenance.
+- Keep the full-market 0–5-name research model independent of registered holdings in the
+  morning report. Authorized holding-risk conclusions and the hypothetical market model
+  appear separately, with overlap counts; model cash is never treated as spendable account
+  cash or an automatic rebalance. The 15:35–15:55 actual-holding P&L schedule is unchanged.
+- Version candidate evidence to `candidate-evidence-v1.1.0`: use the stock-listing-rule
+  reporting calendar, detect an official newer report than the structured financial
+  snapshot, preserve dated PE/PB as context only, and avoid applying industrial
+  leverage/cash-flow criteria to banks or insurers. Unknown official-content and
+  sector-specific evidence still cannot become a buy pass automatically.
+
 - Promote the live entry contract to `continuous-signal-v3`: the last completed
   weekly bars qualify direction, while a completed daily close confirms the
   breakout or healthy retest.  A confirmed base/range reversal, an

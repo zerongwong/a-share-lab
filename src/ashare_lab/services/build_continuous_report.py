@@ -29,6 +29,7 @@ def render_continuous_report(
     cash_weight: float | None,
     status_note: str,
     screening_candidates: Sequence[Mapping[str, Any]] = (),
+    independent_market_model: bool = False,
     chart_markdown: str | None = None,
     max_bytes: int = 4096,
 ) -> str:
@@ -119,15 +120,23 @@ def render_continuous_report(
             prefix.append("- 持仓信息未提供｜待核验")
     if status:
         prefix.extend(("", f"📌 {status}"))
-    suffix = ["", "## 🩵 条件新买"]
+    suffix = ["", "## 🩵 全市场模型组合" if independent_market_model else "## 🩵 条件新买"]
     if qualified:
         suffix.extend(qualified)
+        if independent_market_model:
+            suffix.append("模型权重仅供比较；不代表已卖出旧仓或可直接动用的现金。")
         if has_planned_cost_stop:
             suffix.append("计划保护线供建仓参考；成交登记后按实际成本重算8%，结构先失效先退出。")
         if rejected_count:
             suffix.append("其余未过门：暂不新买。")
     else:
-        suffix.append("⏸ 暂不新买｜等待合格信号")
+        if independent_market_model:
+            suffix.append(
+                "⏸ 模型尚未形成｜数据或审核未完成"
+                if cash is None else "⏸ 模型0只｜没有通过全部审核的新买标的"
+            )
+        else:
+            suffix.append("⏸ 暂不新买｜等待合格信号")
     observations = []
     for candidate in screening_candidates[:5]:
         if not isinstance(candidate, Mapping):
@@ -144,7 +153,8 @@ def render_continuous_report(
         suffix.extend(("", "## 重点候选 · 观察，不代表可以买", *observations))
     suffix.extend(
         (
-            "现金：未核定（不代表空仓）" if cash is None else f"计划现金：总资金{_percent(cash)}",
+            ("模型现金：未核定" if independent_market_model else "现金：未核定（不代表空仓）")
+            if cash is None else f"{'模型现金' if independent_market_model else '计划现金'}：总资金{_percent(cash)}",
             "",
             _FOOTNOTE,
         )
