@@ -138,7 +138,11 @@ def test_actual_quantity_cost_weighted_floating_pnl_not_daily_or_simple_mean(env
     assert report.pnl_amount == Decimal("-100")
     assert report.pnl_percent == Decimal("-2")
     body = render_holding_pnl_report(report)
-    assert "持仓合计：-2.00%｜-100.00元" in body
+    assert body.split("\n\n", 1)[0] == "2026-09-22"
+    assert "\n\n甲股票：+10.00% ｜ +100.00元\n\n" in body
+    assert "\n\n乙股票：-5.00% ｜ -200.00元\n\n" in body
+    assert "\n\n**组合总收益（浮动）：-2.00% ｜ -100.00元**\n\n" in body
+    assert "600919" not in body and "601298" not in body
     assert "非当日盈亏、非全账户" in body
     assert "未计未录入费用、分红及已清仓收益" in body
     assert "非交易所正式日线" in body
@@ -220,7 +224,10 @@ def test_missing_confirmed_quantity_allows_percent_only_not_partial_portfolio(en
     assert report.rows[0].pnl_percent == Decimal(10)
     assert report.rows[0].pnl_amount is None
     assert report.pnl_amount is None and report.pnl_percent is None
-    assert "股数待补齐" in render_holding_pnl_report(report)
+    body = render_holding_pnl_report(report)
+    assert "股数待补齐" in body
+    assert "**组合总收益（浮动）：待核验**" in body
+    assert "**组合总收益（浮动）：-" not in body
 
 
 def test_cost_missing_does_not_infer_from_prevclose_or_weight(env):
@@ -240,6 +247,9 @@ def test_success_deduplicates_without_changing_ledger_or_disclosing_capital(env)
     assert event["status"] == "provider_accepted"
     assert event["delivery_confirmed"] is False
     assert requests == [("600919", "601298")]
+    assert messages[0].body.startswith("2026-09-22\n\n甲股票：")
+    assert "\n\n**组合总收益（浮动）：-2.00% ｜ -100.00元**\n\n" in messages[0].body
+    assert "600919" not in messages[0].body and "601298" not in messages[0].body
     assert messages[0].holding_authorization_guard("serverchan") is True
     assert messages[0].holding_authorization_guard("bark") is False
     assert get_active_holding_portfolio(env[0]) == original

@@ -193,20 +193,27 @@ def _signed(value: Decimal) -> str:
 
 
 def render_holding_pnl_report(report: HoldingPnlReport) -> str:
-    lines = [f"{report.as_of:%Y-%m-%d}｜当前股票持仓累计浮盈亏"]
+    # Server酱以 Markdown 渲染正文；空行让日期、逐股结果和合计真正分段。
+    sections = [f"{report.as_of:%Y-%m-%d}"]
     for row in report.rows:
         percent = "—" if row.pnl_percent is None else f"{_signed(row.pnl_percent)}%"
         amount = "金额待核验" if row.pnl_amount is None else f"{_signed(row.pnl_amount)}元"
         name = " ".join(str(row.name).split())[:24]
         suffix = "；" + "、".join(row.issues) if row.issues else ""
-        lines.append(f"{name}({row.symbol})：{percent}｜{amount}{suffix}")
+        sections.append(f"{name}：{percent} ｜ {amount}{suffix}")
     if report.complete:
-        lines.append(f"持仓合计：{_signed(report.pnl_percent)}%｜{_signed(report.pnl_amount)}元")
+        sections.append(
+            f"**组合总收益（浮动）：{_signed(report.pnl_percent)}% ｜ "
+            f"{_signed(report.pnl_amount)}元**"
+        )
     else:
-        lines.append("持仓合计：待核验（不把部分股票收益当成整个组合）")
-    lines.append("估值：腾讯＋新浪今日15点后收盘快照，非交易所正式日线。")
-    lines.append("按登记成本累计；非当日盈亏、非全账户。未计未录入费用、分红及已清仓收益。")
-    return "\n".join(lines)
+        sections.append("**组合总收益（浮动）：待核验**（不把部分股票收益当成整个组合）")
+    sections.append(
+        "> 估值为腾讯＋新浪当日15点后收盘快照，非交易所正式日线；"
+        "按登记成本累计，非当日盈亏、非全账户。"
+        "未计未录入费用、分红及已清仓收益。"
+    )
+    return "\n\n".join(sections)
 
 
 def run_holding_pnl(
