@@ -11,7 +11,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from contextlib import suppress
-from datetime import datetime, time
+from datetime import date, datetime, time, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from time import monotonic
@@ -22,6 +22,9 @@ TOTAL_BUDGET_SECONDS = 90
 _EXIT_RESERVE_SECONDS = 2
 _FINAL_COMPUTE_SECONDS = 74
 _FALLBACK_SECONDS = 12
+_CALENDAR_LOOKBACK_DAYS = 14
+_SESSION_CACHE_VERSION = 1
+_AKSHARE_CALENDAR_TIMEOUT = 6.0
 
 
 def _root() -> Path:
@@ -93,6 +96,194 @@ def send_serverchan(message) -> bool:
     return receipt.accepted is True and receipt.provider_status == "provider_accepted"
 
 
+def _verified_calendar_window(values, start: date, end: date) -> tuple[date, ...]:
+    """Accept only a complete, ordered provider response ending on the report day."""
+    from ashare_lab.domain.errors import DataQualityError
+
+    try:
+        sessions = tuple(values)
+        if (
+            not sessions
+            or sessions != tuple(sorted(set(sessions)))
+            or any(type(day) is not date or not start <= day <= end for day in sessions)
+            or end not in sessions
+        ):
+            raise DataQualityError("交易日历区间未通过核验。")
+        return sessions
+    except (TypeError, ValueError):
+        raise DataQualityError("交易日历区间未通过核验。") from None
+
+
+def _read_session_cache(root: Path) -> tuple[date, date, tuple[date, ...]] | None:
+    """The cache contains public calendar dates only, never any account details."""
+    from ashare_lab.domain.errors import DataQualityError
+
+    path = root / "verified-trading-sessions.json"
+    try:
+        if path.stat().st_size > 100_000:
+            return None
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("version") != _SESSION_CACHE_VERSION:
+            return None
+        start = date.fromisoformat(document["verified_start"])
+        end = date.fromisoformat(document["verified_end"])
+        if start > end or (end - start).days > 3660:
+            return None
+        raw = document["sessions"]
+        if not isinstance(raw, list) or len(raw) > 3000:
+            return None
+        sessions = tuple(date.fromisoformat(item) for item in raw)
+        return start, end, _verified_calendar_window(sessions, start, end)
+    except (OSError, KeyError, TypeError, ValueError, DataQualityError):
+        # Corrupt or incompatible public metadata must never create a holding age.
+        return None
+
+
+def _cache_trading_sessions(
+    root: Path, start: date, end: date, fresh: tuple[date, ...]
+) -> tuple[date, ...]:
+    from ashare_lab.domain.errors import DataQualityError
+    from ashare_lab.services.intraday_stop_monitor import write_private_json
+
+    old = _read_session_cache(root)
+    verified_start, verified_end, sessions = start, end, fresh
+    if old is not None:
+        old_start, old_end, old_sessions = old
+        if old_end <= end and start <= old_end + timedelta(days=1):
+            overlap_start = max(start, old_start)
+            overlap_end = min(end, old_end)
+            if overlap_start <= overlap_end:
+                old_overlap = tuple(day for day in old_sessions if overlap_start <= day <= overlap_end)
+                new_overlap = tuple(day for day in fresh if overlap_start <= day <= overlap_end)
+                if old_overlap != new_overlap:
+                    raise DataQualityError("交易日历缓存与最新核验区间冲突。")
+            verified_start = min(old_start, start)
+            sessions = tuple(sorted(set(old_sessions) | set(fresh)))
+        # If a run was missed for longer than the verified lookback, the
+        # intervening dates are unknown. Reset instead of inventing coverage.
+    write_private_json(
+        root / "verified-trading-sessions.json",
+        {
+            "version": _SESSION_CACHE_VERSION,
+            "verified_start": verified_start.isoformat(),
+            "verified_end": verified_end.isoformat(),
+            "sessions": [day.isoformat() for day in sessions],
+        },
+    )
+    return sessions
+
+
+def _bounded_calendar_child(action: str, start: date, end: date, *, timeout: float):
+    from ashare_lab.domain.errors import DataQualityError, DataUnavailableError
+
+    try:
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "ashare_lab.cli.holding_pnl",
+                action,
+                "--start",
+                start.isoformat(),
+                "--end",
+                end.isoformat(),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise DataUnavailableError("免费交易日历未取得。") from None
+    if child.returncode:
+        raise DataUnavailableError("免费交易日历未取得。")
+    if len(child.stdout) > 8192:
+        raise DataQualityError("免费交易日历响应过大。")
+    try:
+        payload = json.loads(child.stdout)
+        if not isinstance(payload, dict) or not isinstance(payload.get("sessions"), list):
+            raise DataQualityError("免费交易日历响应结构异常。")
+        sessions = tuple(date.fromisoformat(value) for value in payload["sessions"])
+    except (ValueError, TypeError):
+        raise DataQualityError("免费交易日历响应结构异常。") from None
+    return _verified_calendar_window(sessions, start, end)
+
+
+def _akshare_trading_sessions(start: date, end: date) -> tuple[date, ...]:
+    """Validate the *whole* public Sina calendar before returning a small slice."""
+    from ashare_lab.domain.errors import DataUnavailableError
+
+    if start > end or (end - start).days > 30:
+        raise DataUnavailableError("交易日历请求区间无效。")
+    import akshare as ak
+    import pandas as pd
+
+    frame = ak.tool_trade_date_hist_sina()
+    if (
+        not isinstance(frame, pd.DataFrame)
+        or list(frame.columns) != ["trade_date"]
+        or len(frame) < 1000
+        or len(frame) > 20000
+    ):
+        raise DataUnavailableError("新浪交易日历结构不可用。")
+    values = tuple(frame["trade_date"].to_list())
+    if (
+        any(type(day) is not date for day in values)
+        or values != tuple(sorted(set(values)))
+        or values[0] > start
+        or values[-1] < end
+        or end not in values
+    ):
+        # A stale future horizon or a non-session report day can use backups.
+        raise DataUnavailableError("新浪交易日历未覆盖报告日。")
+    return _verified_calendar_window(
+        (day for day in values if start <= day <= end), start, end
+    )
+
+
+def _load_trading_sessions(
+    start: date, end: date, *, state_root: Path | None = None
+) -> tuple[date, ...]:
+    """Bounded AKShare→BaoStock→Tushare read plus contiguous local cache.
+
+    The provider sees a fixed recent public window, never a holding entry date.
+    A missing run or conflicting overlap cannot silently inflate held-day counts.
+    """
+    from ashare_lab.adapters.bounded_baostock import BoundedBaoStockEod
+    from ashare_lab.domain.errors import DataUnavailableError
+
+    if state_root is not None:
+        cached = _read_session_cache(state_root)
+        if cached is not None and cached[1] == end:
+            return cached[2]
+    request_start = (
+        end - timedelta(days=_CALENDAR_LOOKBACK_DAYS - 1) if state_root is not None else start
+    )
+    try:
+        verified = _bounded_calendar_child(
+            "calendar-range-akshare",
+            request_start,
+            end,
+            timeout=_AKSHARE_CALENDAR_TIMEOUT,
+        )
+    except DataUnavailableError:
+        try:
+            verified = _verified_calendar_window(
+                BoundedBaoStockEod(timeout=8.0).fetch_cn_trading_days(request_start, end),
+                request_start,
+                end,
+            )
+        except DataUnavailableError:
+            verified = _bounded_calendar_child(
+                "calendar-range", request_start, end, timeout=8.0
+            )
+    return (
+        _cache_trading_sessions(state_root, request_start, end, verified)
+        if state_root is not None
+        else verified
+    )
+
+
 def run_once(root: Path, *, log_root: Path | None = None, fallback: bool = False) -> dict:
     try:
         from ashare_lab.bootstrap import build_repository
@@ -121,6 +312,9 @@ def run_once(root: Path, *, log_root: Path | None = None, fallback: bool = False
                 now=datetime.now(CN),
                 quote_fetcher=fetch_intraday_quotes,
                 calendar=lambda day: calendar_for_day(root, day),
+                trading_sessions_loader=lambda start, end: _load_trading_sessions(
+                    start, end, state_root=root
+                ),
                 notifier=send_serverchan,
                 company_action_clearance_loader=refresh_and_load_company_action_clearances,
                 clock=lambda: datetime.now(CN),
@@ -261,11 +455,32 @@ def supervise(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Private post-close floating holding P&L report")
     parser.add_argument(
-        "action", nargs="?", choices=("run", "once", "failure-notice"), default="run"
+        "action",
+        nargs="?",
+        choices=("run", "once", "failure-notice", "calendar-range", "calendar-range-akshare"),
+        default="run",
     )
     parser.add_argument("--state-root", type=Path)
     parser.add_argument("--log-root", type=Path)
+    parser.add_argument("--start")
+    parser.add_argument("--end")
     args = parser.parse_args(argv)
+    if args.action in {"calendar-range", "calendar-range-akshare"}:
+        try:
+            start = date.fromisoformat(args.start)
+            end = date.fromisoformat(args.end)
+            if args.action == "calendar-range-akshare":
+                sessions = _akshare_trading_sessions(start, end)
+            else:
+                from ashare_lab.cli.evening_digest import _tushare_calendar_backup
+
+                sessions = _tushare_calendar_backup(start, end)
+            print(json.dumps({"sessions": [day.isoformat() for day in sessions]}))
+            return 0
+        except Exception:
+            # No raw provider exception, request details or credential-bearing text.
+            print(json.dumps({"status": "calendar_unavailable"}))
+            return 2
     root = (args.state_root or _root()).expanduser()
     if args.action in {"once", "failure-notice"}:
         event = run_once(root, log_root=args.log_root, fallback=args.action == "failure-notice")

@@ -1,8 +1,9 @@
 """Current-position floating P&L estimates, separate from account NAV and orders.
 
 Only explicit quantities/costs and same-day two-source closing snapshots may
-enter an amount. Company-action coverage is mandatory. The external report
-contains profit/loss only, not cost basis, quantities, market value or cash.
+enter an amount. Company-action coverage is mandatory. Invested principal is
+disclosed only with its own private authorization; quantities, market value,
+cash and whole-account profit are never disclosed by this report.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import json
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -22,7 +23,7 @@ from ashare_lab.services.holding_ledger import get_active_holding_portfolio
 from ashare_lab.services.intraday_stop_monitor import _corporate_clear, write_private_json
 
 CN = ZoneInfo("Asia/Shanghai")
-METHOD_VERSION = "holding-floating-pnl-v1"
+METHOD_VERSION = "holding-floating-pnl-v2"
 _CENT = Decimal("0.01")
 _FINAL_RETRY = time(15, 55)
 
@@ -42,6 +43,10 @@ class HoldingPnlReport:
     rows: tuple[HoldingPnlRow, ...]
     pnl_percent: Decimal | None
     pnl_amount: Decimal | None
+    invested_principal: Decimal | None
+    daily_percent: Decimal | None
+    daily_amount: Decimal | None
+    held_trading_days: int | None
     complete: bool
 
 
@@ -77,6 +82,23 @@ def _known_market_closed(root: Path, day: date) -> bool:
         return False
 
 
+def _known_previous_session(root: Path, day: date) -> date | None:
+    """Read only the already-verified current-day calendar receipt."""
+    try:
+        state = json.loads((root / "calendar.json").read_text(encoding="utf-8"))
+        if (
+            isinstance(state, dict)
+            and state.get("date") == day.isoformat()
+            and state.get("open") is True
+        ):
+            prior = date.fromisoformat(state["previous_session"])
+            if day - timedelta(days=20) <= prior < day:
+                return prior
+    except (OSError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _positive_decimal(value) -> Decimal | None:
     if isinstance(value, bool):
         return None
@@ -87,8 +109,10 @@ def _positive_decimal(value) -> Decimal | None:
         return None
 
 
-def _closing_snapshot(symbol: str, batches: Mapping, now: datetime) -> Decimal | None:
-    """Not intraday tolerance: both completed-session prices agree to a cent."""
+def _closing_snapshot(
+    symbol: str, batches: Mapping, now: datetime
+) -> tuple[Decimal, Decimal] | None:
+    """Both completed-session closes and previous closes must agree."""
     prices, previous = [], []
     try:
         for source in ("tencent", "sina"):
@@ -119,15 +143,75 @@ def _closing_snapshot(symbol: str, batches: Mapping, now: datetime) -> Decimal |
             return None
         if previous[0] != previous[1]:
             return None
-        return prices[0].quantize(_CENT, rounding=ROUND_HALF_UP)
+        return prices[0].quantize(_CENT, rounding=ROUND_HALF_UP), previous[0]
     except (KeyError, AttributeError, TypeError, ValueError, InvalidOperation):
         return None
 
 
-def build_holding_pnl_report(portfolio, *, batches: Mapping, clearances: Mapping, now: datetime):
+def _verified_sessions(values, *, start: date, end: date) -> tuple[date, ...] | None:
+    try:
+        sessions = tuple(values)
+        if (
+            not sessions
+            or any(type(day) is not date or not start <= day <= end for day in sessions)
+            or sessions != tuple(sorted(set(sessions)))
+            or end not in sessions
+        ):
+            return None
+        return sessions
+    except (TypeError, ValueError):
+        return None
+
+
+def _calendar_start(_as_of: date) -> date:
+    # Public A-share era lower bound, independent of the private entry date.
+    # The production loader queries only a recent fixed window and extends a
+    # locally verified calendar cache; this is only the validation lower bound.
+    return date(1990, 1, 1)
+
+
+def build_holding_pnl_report(
+    portfolio,
+    *,
+    batches: Mapping,
+    clearances: Mapping,
+    now: datetime,
+    trading_sessions: tuple[date, ...] | None = None,
+    previous_session: date | None = None,
+    previous_portfolio=None,
+):
     now = now.astimezone(CN)
     rows = []
     total_amount, total_cost = Decimal(0), Decimal(0)
+    daily_amount, prior_value = Decimal(0), Decimal(0)
+    common_entry = max((holding.entry_date for holding in portfolio.positions), default=None)
+    sessions = (
+        _verified_sessions(
+            trading_sessions,
+            start=_calendar_start(now.date()),
+            end=now.date(),
+        )
+        if common_entry is not None and trading_sessions is not None
+        else None
+    )
+    held_days = (
+        sum(day >= common_entry for day in sessions)
+        if sessions is not None and common_entry in sessions
+        else None
+    )
+    if previous_session is None:
+        previous_session = max((day for day in (sessions or ()) if day < now.date()), default=None)
+    elif type(previous_session) is not date or not previous_session < now.date():
+        previous_session = None
+    unchanged_since_previous_close = bool(
+        previous_session is not None
+        and previous_portfolio is not None
+        and (previous_portfolio.id, previous_portfolio.version)
+        == (portfolio.id, portfolio.version)
+        and portfolio.effective_at.astimezone(CN)
+        <= datetime.combine(previous_session, time(15), tzinfo=CN)
+        and all(holding.entry_date <= previous_session for holding in portfolio.positions)
+    )
     for holding in portfolio.positions:
         issues = []
         cost = _positive_decimal(holding.cost_price)
@@ -137,12 +221,12 @@ def build_holding_pnl_report(portfolio, *, batches: Mapping, clearances: Mapping
             and quantity > 0
             and holding.metadata.get("quantity_user_confirmed") is True
         )
-        close = _closing_snapshot(holding.symbol, batches, now)
+        snapshot = _closing_snapshot(holding.symbol, batches, now)
         if cost is None:
             issues.append("成本待补齐")
         if not quantity_confirmed:
             issues.append("股数待补齐")
-        if close is None:
+        if snapshot is None:
             issues.append("今日双源收盘快照待核验")
         evidence = clearances.get(holding.symbol)
         corporate_clear = False
@@ -165,15 +249,19 @@ def build_holding_pnl_report(portfolio, *, batches: Mapping, clearances: Mapping
             issues.append("入场日期待核验")
         can_value = (
             cost is not None
-            and close is not None
+            and snapshot is not None
             and corporate_clear
             and holding.entry_date <= now.date()
         )
+        close, previous_close = snapshot if snapshot is not None else (None, None)
         percent = ((close - cost) / cost * Decimal(100)) if can_value else None
         amount = (close - cost) * quantity if can_value and quantity_confirmed else None
         if amount is not None:
             total_amount += amount
             total_cost += cost * quantity
+            if unchanged_since_previous_close:
+                daily_amount += (close - previous_close) * quantity
+                prior_value += previous_close * quantity
         rows.append(HoldingPnlRow(holding.symbol, holding.name, percent, amount, tuple(issues)))
     complete = bool(rows) and all(not row.issues for row in rows)
     return HoldingPnlReport(
@@ -181,6 +269,12 @@ def build_holding_pnl_report(portfolio, *, batches: Mapping, clearances: Mapping
         tuple(rows),
         total_amount / total_cost * Decimal(100) if complete and total_cost > 0 else None,
         total_amount if complete else None,
+        total_cost if complete else None,
+        daily_amount / prior_value * Decimal(100)
+        if complete and unchanged_since_previous_close and prior_value > 0
+        else None,
+        daily_amount if complete and unchanged_since_previous_close else None,
+        held_days,
         complete,
     )
 
@@ -192,27 +286,40 @@ def _signed(value: Decimal) -> str:
     return f"{rounded:+,.2f}"
 
 
-def render_holding_pnl_report(report: HoldingPnlReport) -> str:
-    # Server酱以 Markdown 渲染正文；空行让日期、逐股结果和合计真正分段。
-    sections = [f"{report.as_of:%Y-%m-%d}"]
+def render_holding_pnl_report(
+    report: HoldingPnlReport, *, include_principal: bool = False
+) -> str:
+    # Server酱仅支持 Markdown；彩色 emoji、加粗和空行无需 HTML/CSS。
+    sections = [f"🌷 {report.as_of:%Y-%m-%d} · 收盘"]
+    days = "待核验" if report.held_trading_days is None else f"{report.held_trading_days} 个交易日"
+    sections.append(f"⏳ 现组合共同持有：{days}")
+    if include_principal:
+        principal = (
+            "待核验"
+            if report.invested_principal is None
+            else f"{report.invested_principal.quantize(_CENT, rounding=ROUND_HALF_UP):,.2f} 元"
+        )
+        sections.append(f"💼 持仓投入本金：{principal}")
+    daily = (
+        "待核验（持仓变动或昨收基准不足）"
+        if report.daily_percent is None or report.daily_amount is None
+        else f"{_signed(report.daily_percent)}% ｜ {_signed(report.daily_amount)} 元"
+    )
+    cumulative = (
+        "待核验"
+        if report.pnl_percent is None or report.pnl_amount is None
+        else f"{_signed(report.pnl_percent)}% ｜ {_signed(report.pnl_amount)} 元"
+    )
+    sections.append(f"🩵 **当日收益（价差）**：{daily}")
+    sections.append(f"💜 **累计收益（价差）**：{cumulative}")
+    sections.append("🌸 持仓明细 · 累计价差")
     for row in report.rows:
         percent = "—" if row.pnl_percent is None else f"{_signed(row.pnl_percent)}%"
-        amount = "金额待核验" if row.pnl_amount is None else f"{_signed(row.pnl_amount)}元"
+        amount = "金额待核验" if row.pnl_amount is None else f"{_signed(row.pnl_amount)} 元"
         name = " ".join(str(row.name).split())[:24]
         suffix = "；" + "、".join(row.issues) if row.issues else ""
         sections.append(f"{name}：{percent} ｜ {amount}{suffix}")
-    if report.complete:
-        sections.append(
-            f"**组合总收益（浮动）：{_signed(report.pnl_percent)}% ｜ "
-            f"{_signed(report.pnl_amount)}元**"
-        )
-    else:
-        sections.append("**组合总收益（浮动）：待核验**（不把部分股票收益当成整个组合）")
-    sections.append(
-        "> 估值为腾讯＋新浪当日15点后收盘快照，非交易所正式日线；"
-        "按登记成本累计，非当日盈亏、非全账户。"
-        "未计未录入费用、分红及已清仓收益。"
-    )
+    sections.append("🌱 数据来源：腾讯＋新浪收盘快照 · AKShare等交易日历")
     return "\n\n".join(sections)
 
 
@@ -223,6 +330,7 @@ def run_holding_pnl(
     now: datetime,
     quote_fetcher: Callable,
     calendar: Callable,
+    trading_sessions_loader: Callable[[date, date], tuple[date, ...]] | None = None,
     notifier: Callable,
     company_action_clearance_loader: Callable,
     clock: Callable[[], datetime] | None = None,
@@ -241,8 +349,10 @@ def run_holding_pnl(
     def finish(status):
         return {**event, "status": status}
 
-    if read_pnl_config(root) is None:
+    config = read_pnl_config(root)
+    if config is None:
         return event
+    principal_authorized = config.get("allow_invested_principal") is True
     if not in_report_hours(now):
         return finish("outside_report_window")
     with daily_update_lock(root / "report.lock") as acquired:
@@ -266,9 +376,14 @@ def run_holding_pnl(
             try:
                 fresh = clock().astimezone(CN)
                 current = get_active_holding_portfolio(repository)
+                fresh_config = read_pnl_config(root)
                 return (
                     channel == "serverchan"
-                    and read_pnl_config(root) is not None
+                    and fresh_config is not None
+                    and (
+                        not principal_authorized
+                        or fresh_config.get("allow_invested_principal") is True
+                    )
                     and fresh.date() == now.date()
                     and in_report_hours(fresh)
                     and fresh.time() < time(15, 59)
@@ -312,8 +427,34 @@ def run_holding_pnl(
                 batches = {}
             if not allowed():
                 return finish("holding_or_authorization_changed")
+            sessions = None
+            if trading_sessions_loader is not None:
+                start = _calendar_start(now.date())
+                try:
+                    sessions = _verified_sessions(
+                        trading_sessions_loader(start, now.date()), start=start, end=now.date()
+                    )
+                except Exception:
+                    sessions = None
+            if not allowed():
+                return finish("holding_or_authorization_changed")
+            previous_session = max(
+                (day for day in (sessions or ()) if day < now.date()), default=None
+            )
+            previous_session = previous_session or _known_previous_session(root, now.date())
+            previous_portfolio = (
+                get_active_holding_portfolio(repository, as_of=previous_session)
+                if previous_session is not None
+                else None
+            )
             report = build_holding_pnl_report(
-                portfolio, batches=batches, clearances=clearances, now=clock()
+                portfolio,
+                batches=batches,
+                clearances=clearances,
+                now=clock(),
+                trading_sessions=sessions,
+                previous_session=previous_session,
+                previous_portfolio=previous_portfolio,
             )
         fresh = clock().astimezone(CN)
         if (report is None or not report.complete) and fresh.time() < _FINAL_RETRY:
@@ -325,8 +466,8 @@ def run_holding_pnl(
             title = "A股收盘收益核验未完成"
             body = "交易日及收盘数据核验尚未完成；暂无法提供可靠收益。本条仅为系统状态提醒，不代表今日一定开市。"
         else:
-            title = "A股持仓累计浮盈亏" if report.complete else "A股收盘盈亏待核验"
-            body = render_holding_pnl_report(report)
+            title = "A股持仓收盘日报" if report.complete else "A股收盘盈亏待核验"
+            body = render_holding_pnl_report(report, include_principal=principal_authorized)
         message = NotificationMessage(
             title=title,
             body=body,

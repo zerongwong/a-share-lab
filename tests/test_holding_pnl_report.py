@@ -41,6 +41,7 @@ def env(tmp_path):
             "enabled": True,
             "authorized_channels": ["serverchan"],
             "allow_pnl_amounts": True,
+            "allow_invested_principal": True,
         },
     )
     replace_active_holdings(
@@ -60,7 +61,7 @@ def env(tmp_path):
             ]
         ],
         holding_weeks=4,
-        effective_at=NOW - timedelta(days=1),
+        effective_at=NOW - timedelta(days=1, hours=1),
     )
     return repo, root
 
@@ -98,16 +99,33 @@ def clearances(now=NOW):
     }
 
 
+def sessions(now=NOW):
+    return (date(2026, 9, 21), now.date())
+
+
 def build(env, *, quotes=None, evidence=None, portfolio=None):
+    current = portfolio or get_active_holding_portfolio(env[0])
     return build_holding_pnl_report(
-        portfolio or get_active_holding_portfolio(env[0]),
+        current,
         now=NOW,
         batches=batches() if quotes is None else quotes,
         clearances=clearances() if evidence is None else evidence,
+        trading_sessions=sessions(),
+        previous_portfolio=current,
     )
 
 
-def run(env, *, now=NOW, quotes=None, evidence=None, notifier=None, calendar=None, clock=None):
+def run(
+    env,
+    *,
+    now=NOW,
+    quotes=None,
+    evidence=None,
+    notifier=None,
+    calendar=None,
+    clock=None,
+    session_loader=None,
+):
     messages, requests = [], []
 
     def quote_fetcher(symbols):
@@ -121,6 +139,7 @@ def run(env, *, now=NOW, quotes=None, evidence=None, notifier=None, calendar=Non
         clock=clock or (lambda: now),
         quote_fetcher=quote_fetcher,
         calendar=calendar or (lambda _: True),
+        trading_sessions_loader=session_loader or (lambda *_: sessions(now)),
         notifier=notifier or (lambda message: messages.append(message) or True),
         company_action_clearance_loader=lambda *_args, **_kwargs: (
             clearances(now) if evidence is None else evidence
@@ -137,16 +156,126 @@ def test_actual_quantity_cost_weighted_floating_pnl_not_daily_or_simple_mean(env
     assert report.rows[1].pnl_amount == Decimal("-200")
     assert report.pnl_amount == Decimal("-100")
     assert report.pnl_percent == Decimal("-2")
-    body = render_holding_pnl_report(report)
-    assert body.split("\n\n", 1)[0] == "2026-09-22"
-    assert "\n\n甲股票：+10.00% ｜ +100.00元\n\n" in body
-    assert "\n\n乙股票：-5.00% ｜ -200.00元\n\n" in body
-    assert "\n\n**组合总收益（浮动）：-2.00% ｜ -100.00元**\n\n" in body
+    assert report.invested_principal == Decimal("5000.0")
+    assert report.daily_amount == Decimal("-50.0")
+    assert report.daily_percent == Decimal("-50") / Decimal("4950") * Decimal(100)
+    assert report.held_trading_days == 2
+    body = render_holding_pnl_report(report, include_principal=True)
+    assert body.split("\n\n", 1)[0] == "🌷 2026-09-22 · 收盘"
+    assert "⏳ 现组合共同持有：2 个交易日" in body
+    assert "💼 持仓投入本金：5,000.00 元" in body
+    assert "🩵 **当日收益（价差）**：-1.01% ｜ -50.00 元" in body
+    assert "💜 **累计收益（价差）**：-2.00% ｜ -100.00 元" in body
+    assert "\n\n甲股票：+10.00% ｜ +100.00 元\n\n" in body
+    assert "\n\n乙股票：-5.00% ｜ -200.00 元\n\n" in body
+    assert body.endswith("🌱 数据来源：腾讯＋新浪收盘快照 · AKShare等交易日历")
     assert "600919" not in body and "601298" not in body
-    assert "非当日盈亏、非全账户" in body
-    assert "未计未录入费用、分红及已清仓收益" in body
-    assert "非交易所正式日线" in body
-    assert "5,000" not in body and "100股" not in body and "成本10" not in body
+    assert "分红、费用" not in body
+    assert "100股" not in body and "成本10" not in body
+
+
+def test_common_holding_days_use_verified_sessions_from_latest_entry(env):
+    now = NOW.replace(day=28)
+    current = get_active_holding_portfolio(env[0])
+    mixed = replace(
+        current,
+        positions=(
+            current.positions[0],
+            replace(current.positions[1], entry_date=date(2026, 9, 24)),
+        ),
+    )
+    report = build_holding_pnl_report(
+        mixed,
+        now=now,
+        batches=batches(now),
+        clearances=clearances(now),
+        trading_sessions=tuple(
+            date(2026, 9, day) for day in (21, 22, 23, 24, 25, 28)
+        ),
+        previous_portfolio=mixed,
+    )
+    assert report.held_trading_days == 3  # 24、25、28日，周末不计入。
+    assert report.daily_amount == Decimal("-50.0")
+
+
+def test_invalid_or_missing_calendar_never_guesses_holding_days_or_daily_return(env):
+    current = get_active_holding_portfolio(env[0])
+    report = build_holding_pnl_report(
+        current,
+        now=NOW,
+        batches=batches(),
+        clearances=clearances(),
+        trading_sessions=(ENTRY, ENTRY),
+        previous_portfolio=current,
+    )
+    assert report.complete and report.pnl_amount == Decimal("-100")
+    assert report.held_trading_days is None
+    assert report.daily_amount is None
+    assert "现组合共同持有：待核验" in render_holding_pnl_report(report)
+
+
+def test_same_day_holding_revision_does_not_claim_an_account_daily_return(env):
+    current = get_active_holding_portfolio(env[0])
+    replace_active_holdings(
+        env[0],
+        [
+            HoldingPositionInput(
+                symbol=holding.symbol,
+                name=holding.name,
+                entry_date=holding.entry_date,
+                cost_price=holding.cost_price,
+                stock_sleeve_weight=holding.stock_sleeve_weight,
+                metadata=holding.metadata,
+            )
+            for holding in current.positions
+        ],
+        holding_weeks=4,
+        effective_at=NOW.replace(hour=10),
+    )
+    report = build(env)
+    assert report.complete and report.pnl_amount == Decimal("-100")
+    assert report.daily_amount is None and report.daily_percent is None
+    assert "当日收益（价差）**：待核验" in render_holding_pnl_report(report)
+
+
+def test_cached_previous_session_keeps_daily_change_when_range_calendar_is_unavailable(env):
+    write_private_json(
+        env[1] / "calendar.json",
+        {"date": NOW.date().isoformat(), "open": True, "previous_session": ENTRY.isoformat()},
+    )
+
+    def unavailable(*_args):
+        raise OSError("synthetic calendar outage")
+
+    event, messages, _ = run(env, session_loader=unavailable)
+    assert event["status"] == "provider_accepted"
+    assert "现组合共同持有：待核验" in messages[0].body
+    assert "当日收益（价差）**：-1.01% ｜ -50.00 元" in messages[0].body
+
+
+def test_principal_requires_separate_explicit_authorization(env):
+    write_private_json(
+        env[1] / "config.json",
+        {"enabled": True, "authorized_channels": ["serverchan"], "allow_pnl_amounts": True},
+    )
+    event, messages, _ = run(env)
+    assert event["status"] == "provider_accepted"
+    assert "持仓投入本金" not in messages[0].body
+    assert "5,000.00" not in messages[0].body
+
+
+def test_principal_grant_revoked_before_submission_blocks_sensitive_body(env):
+    def notifier(message):
+        write_private_json(
+            env[1] / "config.json",
+            {"enabled": True, "authorized_channels": ["serverchan"], "allow_pnl_amounts": True},
+        )
+        assert message.holding_authorization_guard("serverchan") is False
+        safe = prepare_notification_for_channel(message, channel_name="serverchan")
+        assert "5,000.00" not in safe.body
+        return True
+
+    assert run(env, notifier=notifier)[0]["status"] == "holding_or_authorization_changed"
 
 
 @pytest.mark.parametrize(
@@ -226,8 +355,8 @@ def test_missing_confirmed_quantity_allows_percent_only_not_partial_portfolio(en
     assert report.pnl_amount is None and report.pnl_percent is None
     body = render_holding_pnl_report(report)
     assert "股数待补齐" in body
-    assert "**组合总收益（浮动）：待核验**" in body
-    assert "**组合总收益（浮动）：-" not in body
+    assert "💜 **累计收益（价差）**：待核验" in body
+    assert "🩵 **当日收益（价差）**：待核验" in body
 
 
 def test_cost_missing_does_not_infer_from_prevclose_or_weight(env):
@@ -247,8 +376,9 @@ def test_success_deduplicates_without_changing_ledger_or_disclosing_capital(env)
     assert event["status"] == "provider_accepted"
     assert event["delivery_confirmed"] is False
     assert requests == [("600919", "601298")]
-    assert messages[0].body.startswith("2026-09-22\n\n甲股票：")
-    assert "\n\n**组合总收益（浮动）：-2.00% ｜ -100.00元**\n\n" in messages[0].body
+    assert messages[0].body.startswith("🌷 2026-09-22 · 收盘\n\n⏳")
+    assert "💼 持仓投入本金：5,000.00 元" in messages[0].body
+    assert "💜 **累计收益（价差）**：-2.00% ｜ -100.00 元" in messages[0].body
     assert "600919" not in messages[0].body and "601298" not in messages[0].body
     assert messages[0].holding_authorization_guard("serverchan") is True
     assert messages[0].holding_authorization_guard("bark") is False
