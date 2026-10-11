@@ -881,6 +881,21 @@ def run_evening_digest(
             _record_evening_delivery_events(
                 repository, archive=archive, notification=notification
             )
+            try:
+                from ashare_lab.services.run_recommendation_tracking import (
+                    ingest_published_recommendations,
+                )
+
+                # Register the actual accepted decision locally; price/action
+                # retrieval belongs to the later daily sync, never this send.
+                tracking = ingest_published_recommendations(
+                    repository, report_id=archive.report_id
+                )
+                notification_event["recommendation_tracking_reports_ingested"] = (
+                    tracking["reports_ingested"]
+                )
+            except Exception:
+                notification_event["recommendation_tracking_status"] = "retry_on_daily_sync"
             return finish(
                 EveningDigestOutcome(
                     EXIT_OK,

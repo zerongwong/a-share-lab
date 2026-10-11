@@ -12,6 +12,7 @@ import math
 from collections.abc import Mapping
 from dataclasses import asdict, replace
 from datetime import UTC, date, datetime
+from enum import Enum
 from typing import Any
 
 import pandas as pd
@@ -293,7 +294,55 @@ def _entry(
         "planned_cost_stop_price": price_plan.planned_cost_stop_price,
         "cost_stop_basis": "recalculate_from_user_confirmed_actual_cost_after_fill",
         "maximum_entry_price": price_plan.maximum_entry_price,
+        "entry_rule": _archived_entry_rule(price_plan),
     }
+
+
+def _archived_entry_rule(price_plan) -> dict[str, Any]:
+    """Freeze executable evidence separately from its human-readable label.
+
+    The rule records the decision's evidence, not an assumed fill.  Keeping
+    the original plan fields allows a separately versioned shadow evaluator
+    to reproduce the condition without parsing translated notification text.
+    """
+
+    def json_value(value):
+        if value is None:
+            return None
+        if isinstance(value, Enum):
+            return json_value(value.value)
+        if isinstance(value, (pd.Timestamp, datetime, date)):
+            return None if pd.isna(value) else pd.Timestamp(value).date().isoformat()
+        if isinstance(value, Mapping):
+            return {str(key): json_value(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [json_value(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        if isinstance(value, (str, bool, int, float)):
+            return value
+        raise TypeError("entry rule contains unsupported evidence type")
+
+    rule = json_value(asdict(price_plan))
+    rule.update(
+        {
+            "schema_version": "recommendation-entry-rule-v1",
+            "structural_invalidation_price": rule["invalidation_price"],
+            "signal_method_version": CONTINUOUS_METHOD_VERSION,
+            "signal_profile": CONTINUOUS_SIGNAL_CONTRACT.label,
+            "execution_policy": {
+                "record_nature": "conditional_recommendation_not_execution",
+                "holding_deadline": None,
+                "structure_exit_confirmation": "completed_daily_close",
+                "cost_stop_loss_fraction": 0.08,
+                "cost_stop_basis": "simulated_entry_price_for_shadow_only",
+                "structural_exit_wait_for_rebound": False,
+                "entry_price_cap_required": True,
+                "simulated_fill_requires_verified_execution_evidence": True,
+            },
+        }
+    )
+    return rule
 
 
 def _initial_plan(result) -> dict[str, Any]:

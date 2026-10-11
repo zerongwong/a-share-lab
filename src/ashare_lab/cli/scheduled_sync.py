@@ -30,6 +30,7 @@ from ashare_lab.adapters.market_overlay_store import MarketOverlayStore
 from ashare_lab.adapters.notification_channels import ServerChanNotificationChannel
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.bootstrap import application_data_dir, project_root
+from ashare_lab.domain.data_sources import DEFAULT_MARKET_OVERLAY_SOURCE_ID
 from ashare_lab.domain.errors import AShareLabError
 from ashare_lab.ports.notifications import NotificationMessage, NotificationUrgency
 from ashare_lab.services.build_monthly_model_review import (
@@ -305,6 +306,8 @@ def run_scheduled_sync(
                     event,
                     scheduler_root=resolved_scheduler_root,
                     common_cutoff=report.common_cutoff,
+                    overlay_root=overlay_root,
+                    source_id=report.source_id,
                 )
                 if _performance_runner is None and _monthly_review_builder is None:
                     event.update(
@@ -447,7 +450,10 @@ def main(argv: list[str] | None = None) -> int:
     return outcome.exit_code
 
 
-def _run_continuous_accounting(event, *, scheduler_root, common_cutoff):
+def _run_continuous_accounting(
+    event, *, scheduler_root, common_cutoff, overlay_root=None,
+    source_id=DEFAULT_MARKET_OVERLAY_SOURCE_ID,
+):
     """Local-only explicit snapshots; no inference of trades from daily plans."""
     from ashare_lab.services.run_continuous_performance import run_continuous_performance
 
@@ -460,6 +466,27 @@ def _run_continuous_accounting(event, *, scheduler_root, common_cutoff):
         event["continuous_valuations_recorded"] = result["valuations_recorded"]
     except Exception:
         event["continuous_performance_status"] = "error_retry_later"
+    # Recommendation research is independent from explicit actual-account NAV.
+    # Neither missing holdings nor an unavailable account snapshot blocks it.
+    try:
+        from ashare_lab.services.run_recommendation_tracking import run_recommendation_tracking
+
+        repository = SQLiteRepository(
+            scheduler_root.parent / "research.db", project_root() / "migrations"
+        )
+        tracking = run_recommendation_tracking(
+            repository,
+            overlay_store=MarketOverlayStore(
+                overlay_root or application_data_dir() / "cache" / "market_overlay"
+            ),
+            through=common_cutoff,
+            source_id=source_id,
+        )
+        event["recommendation_tracking_status"] = tracking["status"]
+        event["recommendation_tracking_reports_ingested"] = tracking["reports_ingested"]
+        event["recommendation_tracking_archive_rejected"] = tracking["archive_rejected"]
+    except Exception:
+        event["recommendation_tracking_status"] = "error_retry_later"
 
 
 def _run_performance_reviews(
