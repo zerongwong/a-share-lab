@@ -112,3 +112,39 @@ def test_collected_manifest_binds_canonical_symbol_and_retains_full_pagination_c
     assert adapter.collect_announcements(
         SimpleNamespace(post=post), _FIRST, _NOW, {},
     ) == {"symbol": _FIRST, "error": "OFFICIAL_ISSUER_IDENTITY_UNAVAILABLE"}
+
+
+def test_spooled_worker_keeps_good_receipts_around_oversized_line(monkeypatch):
+    first = {"symbol": _FIRST, "method_version": adapter.METHOD_VERSION}
+    second = {"symbol": _SECOND, "method_version": adapter.METHOD_VERSION}
+
+    def process(command, *, stdin, stdout, stderr):
+        stdout.write(json.dumps(first).encode() + b"\n")
+        stdout.write(b"x" * 1000 + b"\n")
+        stdout.write(json.dumps(second).encode() + b"\n")
+        return SimpleNamespace(communicate=lambda **kwargs: None, returncode=0)
+
+    monkeypatch.setattr(adapter, "_MAX_RECEIPT_BYTES", 250)
+    monkeypatch.setattr(adapter.subprocess, "Popen", process)
+    result, _ = adapter._read_worker_receipts({}, (_FIRST, _SECOND), 1)
+    assert result == {_FIRST: first, _SECOND: second}
+
+
+def test_spooled_worker_timeout_retains_complete_receipt(monkeypatch):
+    first = {"symbol": _FIRST, "method_version": adapter.METHOD_VERSION}
+    calls = []
+
+    def process(command, *, stdin, stdout, stderr):
+        stdout.write(json.dumps(first).encode() + b"\n")
+
+        def communicate(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        return SimpleNamespace(communicate=communicate, kill=lambda: None, returncode=-9)
+
+    monkeypatch.setattr(adapter.subprocess, "Popen", process)
+    result, reason = adapter._read_worker_receipts({}, (_FIRST, _SECOND), 1)
+    assert result == {_FIRST: first}
+    assert reason == "PROVIDER_DEADLINE_EXCEEDED"

@@ -412,8 +412,9 @@ def build_midterm_portfolio(
 ) -> MidtermPortfolioResult:
     """Return one risk-budget-passing research portfolio.
 
-    Optional metadata keys ``fundamental_gate`` and ``announcement_gate`` use
-    ``pass``, ``veto`` or ``unknown``.  The boolean aliases
+    Versioned v2 receipts use one ``fundamental_risk_gate``; legacy metadata
+    retains ``fundamental_gate`` and ``announcement_gate``. All use
+    ``pass``, ``veto`` or ``unknown``. The boolean aliases
     ``fundamental_veto`` and ``announcement_veto`` are also accepted.  Vetoes
     exclude before ranking.  Missing evidence is recorded on the finalist and
     never translated into a neutral score.
@@ -656,14 +657,34 @@ def build_midterm_portfolio(
         evidence_keys = {
             "fundamental_gate", "announcement_gate", "fundamental_veto",
             "announcement_veto", "is_buyable_at_cutoff", "is_suspended",
-            "is_limit_up_at_cutoff",
+            "is_limit_up_at_cutoff", "fundamental_risk_gate",
+            "candidate_evidence_method_version",
         }
         for candidate in candidates:
             item = dict(normalized_metadata[candidate.symbol])
+            known_vetoes = {
+                key: value for key, value in item.items()
+                if key in {"fundamental_gate", "announcement_gate", "fundamental_risk_gate"}
+                and _gate_value(value) == "veto"
+            }
+            # A fresh receipt must supply its own positive facts. Empty or
+            # partial mappings must never inherit a prior run's passing gates.
+            item.update({
+                "fundamental_gate": "unknown", "announcement_gate": "unknown",
+                "fundamental_risk_gate": "unknown", "is_buyable_at_cutoff": None,
+                "candidate_evidence_method_version": None,
+            })
             evidence = enriched.get(candidate.symbol, {})
-            if not isinstance(evidence, Mapping):
-                raise ValueError("candidate evidence record must be a mapping")
+            if not isinstance(evidence, Mapping) or candidate.symbol not in enriched:
+                # A malformed receipt quarantines this name, not the whole
+                # shortlist. Do not fall back to old passing metadata.
+                evidence = {
+                    "fundamental_gate": "unknown", "announcement_gate": "unknown",
+                    "fundamental_risk_gate": "unknown", "is_buyable_at_cutoff": None,
+                    "candidate_evidence_method_version": "candidate-evidence-v2.0.0",
+                }
             item.update({key: value for key, value in evidence.items() if key in evidence_keys})
+            item.update(known_vetoes)
             vetoes = _metadata_hard_gate(
                 candidate.symbol, item,
                 minimum_balance_sheet_strength=0.0,
@@ -705,7 +726,9 @@ def build_midterm_portfolio(
             tuple(candidate.symbol for candidate in sorted(
                 candidates,
                 key=lambda item: (
-                    "fundamental_evidence_unknown" in item.evidence_unknown,
+                    any(reason in item.evidence_unknown for reason in (
+                        "fundamental_evidence_unknown", "fundamental_risk_evidence_unknown",
+                    )),
                     len(item.evidence_unknown),
                 ),
             ))
@@ -1124,6 +1147,8 @@ def _metadata_hard_gate(
         reasons.append("industry_missing")
     if item.get("fundamental_veto") is True or _gate_value(item.get("fundamental_gate")) == "veto":
         reasons.append("fundamental_veto")
+    if _has_combined_risk_review(item) and _gate_value(item.get("fundamental_risk_gate")) == "veto":
+        reasons.append("fundamental_risk_veto")
     if (
         item.get("announcement_veto") is True
         or _gate_value(item.get("announcement_gate")) == "veto"
@@ -1147,10 +1172,25 @@ def _gate_value(value: object) -> str:
     return str(value).strip().lower() if value is not None else "unknown"
 
 
+def _has_combined_risk_review(item: Mapping[str, Any]) -> bool:
+    """Only the versioned combined receipt replaces the legacy approval gate."""
+    return (
+        item.get("candidate_evidence_method_version") == "candidate-evidence-v2.0.0"
+        and "fundamental_risk_gate" in item
+    )
+
+
 def _unknown_evidence(item: Mapping[str, Any]) -> tuple[str, ...]:
     unknown: list[str] = []
     if item.get("is_buyable_at_cutoff") is not True:
         unknown.append("formation_execution_evidence_unknown")
+    if _has_combined_risk_review(item):
+        if (
+            _gate_value(item.get("fundamental_risk_gate")) != "pass"
+            or _gate_value(item.get("fundamental_gate")) != "pass"
+        ):
+            unknown.append("fundamental_risk_evidence_unknown")
+        return tuple(unknown)
     if (
         item.get("fundamental_veto") is not True
         and _gate_value(item.get("fundamental_gate")) != "pass"

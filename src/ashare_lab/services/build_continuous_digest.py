@@ -97,6 +97,9 @@ def build_continuous_research_digest(
                     "symbol": row.symbol,
                     "fundamental_gate": row.fundamental_gate,
                     "announcement_gate": row.announcement_gate,
+                    "fundamental_risk_gate": getattr(row, "fundamental_risk_gate", "unknown"),
+                    "fundamental_risk_reasons": list(getattr(row, "fundamental_risk_reasons", ())),
+                    "evidence_method_version": row.method_version,
                     "execution_gate": row.execution_gate,
                     "fundamental_reasons": list(row.fundamental_reasons),
                     "announcement_reasons": list(row.announcement_reasons),
@@ -174,23 +177,7 @@ def build_continuous_research_digest(
             and result.status is not MidtermPortfolioStatus.DATA_NOT_READY
             and not model["entries"]
         ):
-            model["status_note"] = (
-                f"本轮核验{evidence.get('requested_count', 0)}只周线候选："
-                f"基本面风险初筛通过{evidence.get('fundamental_risk_review_pass_count', evidence.get('double_confirmation_count', 0))}只"
-                f"（财务初筛{evidence.get('financial_pass_count', 0)}只、"
-                f"官方公告清单筛查{evidence.get('announcement_pass_count', 0)}只），"
-                f"待核验{evidence.get('unknown_count', 0)}只，"
-                f"排除{evidence.get('veto_count', 0)}只。"
-                + (
-                    "证据不足或需人工复核，暂不新买。"
-                    if evidence.get("unknown_count", 0)
-                    else (
-                        "财务或公告核验未通过，暂不新买。"
-                        if not evidence.get("double_confirmation_count", 0)
-                        else "可买性、买入位置或组合风险未通过，暂不新买。"
-                    )
-                )
-            )
+            model["status_note"] = _evidence_status_note(evidence)
     # Independent daily audit only: its cap/state NEVER feeds selection, the
     # holding ledger, protective stops, or the externally rendered plan.
     try:
@@ -403,12 +390,52 @@ def _count_metadata(count: int) -> dict[str, Any]:
     return {"holding_count": count, "count_state": continuous_count_state(count)}
 
 
+def _evidence_status_note(evidence) -> str:
+    passed = evidence.get("fundamental_risk_review_pass_count", evidence.get("double_confirmation_count", 0))
+    unknown = evidence.get("unknown_count", 0)
+    note = (
+        f"技术候选{evidence.get('requested_count', 0)}只｜"
+        f"财务与重大风险核验：通过{passed}只、"
+        f"证据不足{unknown}只、排除{evidence.get('veto_count', 0)}只。"
+    )
+    if passed:
+        return note + "已通过者的可买性、买入位置或组合风险尚未满足，暂不新买。"
+    if unknown:
+        return note + "核验尚未完成，不等于市场没有机会；缺证据个股暂不新买。"
+    return note + "本轮候选未通过基本面风险核验，暂不新买。"
+
+
 def _describe_candidate_evidence(candidates, records) -> None:
     """Name the missing evidence instead of calling a pipeline gap no signal."""
     indexed = {row["symbol"].split(".")[0]: row for row in records}
     for candidate in candidates:
         record = indexed.get(candidate["symbol"].split(".")[0])
-        if record is None or candidate["reason"] != "财务、公告或可成交性待核验":
+        if record is None or candidate["reason"] not in {
+            "财务、公告或可成交性待核验", "基本面风险或可交易性证据不足",
+        }:
+            continue
+        if record.get("evidence_method_version") == "candidate-evidence-v2.0.0":
+            gate = record.get("fundamental_risk_gate", "unknown")
+            reasons = record.get("fundamental_risk_reasons", ())
+            if gate == "pass":
+                parts = ["财务与重大风险核验通过"]
+            elif gate == "veto":
+                parts = ["基本面风险不合格，不新买"]
+            elif any("MANIFEST" in reason or "PROVIDER" in reason for reason in reasons):
+                parts = ["官方资料获取或校验失败，暂不新买"]
+            elif "PDF_IMAGE_PAGE_REQUIRES_OCR" in reasons:
+                parts = ["关键文件含扫描页，正文未核验，暂不新买"]
+            elif "HISTORICAL_RISK_RESOLUTION_NEEDS_CONTENT_REVIEW" in reasons:
+                parts = ["历史风险解除情况未核实，暂不新买"]
+            elif "MATERIAL_FACT_CONTENT_NEEDS_REVIEW" in reasons:
+                parts = ["重大事项实质仍需复核，暂不新买"]
+            elif record.get("fundamental_gate") != "pass":
+                parts = ["财务专项证据不足，暂不新买"]
+            else:
+                parts = ["重大风险所需证据不足，暂不新买"]
+            if record["execution_gate"] != "pass":
+                parts.append("可交易性未确认")
+            candidate["reason"] = "；".join(parts)
             continue
         parts = []
         if record["fundamental_gate"] == "pass":
@@ -443,7 +470,7 @@ def _screening_candidates(result) -> list[dict[str, Any]]:
         elif price.initial_risk_qualified is not True:
             reason = "买价与保护线尚不匹配"
         elif candidate.evidence_unknown:
-            reason = "财务、公告或可成交性待核验"
+            reason = "基本面风险或可交易性证据不足"
         elif not candidate.risk_history_available:
             reason = "风险计算历史不足"
         elif candidate.action.value != "conditional_entry":

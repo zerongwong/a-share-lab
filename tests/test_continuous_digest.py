@@ -148,7 +148,7 @@ def test_screen_preserves_preoptimisation_candidates_and_explains_risk_before_ev
     rows = service._screening_candidates(result)
     assert len(rows) == 2
     assert rows[0]["reason"] == "结构风险10.1%，超过8%"
-    assert rows[1]["reason"] == "财务、公告或可成交性待核验"
+    assert rows[1]["reason"] == "基本面风险或可交易性证据不足"
     assert all(row["entry_qualified"] is False for row in rows)
 
 
@@ -186,6 +186,38 @@ def test_candidate_message_identifies_financial_pass_and_real_remaining_review_g
         "execution_gate": "pass",
     }])
     assert candidates[0]["reason"] == "财务初筛通过；公告风险或证据待复核"
+
+
+@pytest.mark.parametrize("gate,reasons,expected", [
+    ("pass", [], "财务与重大风险核验通过"),
+    ("unknown", ["OFFICIAL_MANIFEST_UNAVAILABLE"], "官方资料获取或校验失败"),
+    ("unknown", ["MATERIAL_DOCUMENT_MISSING"], "重大风险所需证据不足"),
+    ("unknown", ["PDF_IMAGE_PAGE_REQUIRES_OCR"], "关键文件含扫描页，正文未核验"),
+    ("unknown", ["HISTORICAL_RISK_RESOLUTION_NEEDS_CONTENT_REVIEW"], "历史风险解除情况未核实"),
+    ("unknown", ["MATERIAL_FACT_CONTENT_NEEDS_REVIEW"], "重大事项实质仍需复核"),
+    ("veto", ["CONFIRMED_MATERIAL_RISK"], "基本面风险不合格"),
+])
+def test_combined_review_copy_distinguishes_data_failure_from_rejection(gate, reasons, expected):
+    candidates = [{"symbol": "600001", "reason": "基本面风险或可交易性证据不足"}]
+    service._describe_candidate_evidence(candidates, [{
+        "symbol": "600001.SH", "fundamental_gate": "pass", "fundamental_reasons": [],
+        "announcement_gate": "unknown", "announcement_reasons": [],
+        "execution_gate": "pass", "evidence_method_version": "candidate-evidence-v2.0.0",
+        "fundamental_risk_gate": gate, "fundamental_risk_reasons": reasons,
+    }])
+    assert expected in candidates[0]["reason"]
+
+
+def test_combined_review_summary_does_not_blame_other_unknowns_for_passed_names():
+    evidence = {"requested_count": 5, "fundamental_risk_review_pass_count": 2,
+                "unknown_count": 2, "veto_count": 1}
+    message = service._evidence_status_note(evidence)
+    assert "通过2只、证据不足2只、排除1只" in message
+    assert "已通过者的可买性、买入位置或组合风险" in message
+    assert "官方公告清单筛查" not in message
+    assert "双重确认" not in message
+    evidence["fundamental_risk_review_pass_count"] = 0
+    assert "不等于市场没有机会" in service._evidence_status_note(evidence)
 
 
 @pytest.mark.parametrize(
@@ -523,9 +555,9 @@ def test_candidate_evidence_canonicalizes_csmar_codes_and_restores_internal_iden
     )
     assert tuple(seen[0][0]) == ("000001.SZ", "601298.SH")
     assert seen[0][1]["symbols"] == ("000001.SZ", "601298.SH")
-    assert "财务或公告核验未通过" in digest.continuous_plan["status_note"]
-    assert "基本面风险初筛通过0只" in digest.continuous_plan["status_note"]
-    assert "财务初筛0只、官方公告清单筛查0只" in digest.continuous_plan["status_note"]
+    assert "未通过基本面风险核验" in digest.continuous_plan["status_note"]
+    assert "财务与重大风险核验：通过0只" in digest.continuous_plan["status_note"]
+    assert "官方公告清单筛查" not in digest.continuous_plan["status_note"]
 
 
 def test_marks_shadow_caps_cannot_change_production_plan_or_external_text(monkeypatch):

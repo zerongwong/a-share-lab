@@ -51,12 +51,25 @@ def manifest():
         {"announcement_id": "annual", "title": "2025年年度报告", "published_at": "2026-03-20T00:00:00+08:00", "url": "https://static.cninfo.com.cn/finalpage/2026-03-20/annual.PDF"},
         {"announcement_id": "latest", "title": "2026年半年度报告", "published_at": "2026-08-29T00:00:00+08:00", "url": "https://static.cninfo.com.cn/finalpage/2026-08-29/latest.PDF"},
     ]
+    documents = []
+    for item in items:
+        text = (
+            f"{item['title']} 财务报告 主要会计数据 合并资产负债表 合并利润表 合并现金流量表。"
+            "公司财务报表披露了本报告期的经营业绩、资产负债、经营活动产生的现金流量。"
+            "审计机构已出具标准无保留意见的审计报告。公司不存在债务违约，未发生重大资产冻结。"
+        )
+        documents.append({
+            **item, "symbol": SYMBOL, "retrieved_at": NOW.isoformat(),
+            "sha256": hashlib.sha256(b"%PDF-fixture").hexdigest(),
+            "text_sha256": hashlib.sha256(text.encode()).hexdigest(), "text": text,
+            "page_count": 3, "extraction_status": "complete", "extraction_complete": True,
+        })
     return {
         "provider": "cninfo", "source_url": "https://www.cninfo.com.cn/new/hisAnnouncement/query",
         "symbol": SYMBOL,
         "coverage_from": "2025-09-22", "coverage_through": NOW.isoformat(),
         "complete": True, "record_count": len(items), "total_provider_records": len(items),
-        "items": items, "content_hash": content_hash(items),
+        "items": items, "content_hash": content_hash(items), "documents": documents,
     }
 
 
@@ -157,11 +170,11 @@ def test_date_only_publication_on_decision_day_cannot_pass_premarket():
     )
 
 
-def test_complete_current_official_manifest_can_pass_narrow_auto_title_screen():
+def test_complete_current_targeted_content_can_pass_basic_material_risk_screen():
     assert evaluate_announcement_review(
         manifest(), symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
         review_dir=None, financial_period="2026-06-30",
-    ) == ("pass", ("AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED",))
+    ) == ("pass", ("TARGETED_FINANCIAL_AND_MATERIAL_RISK_CONTENT_CONFIRMED",))
 
 
 @pytest.mark.parametrize(("mutation", "reason"), [
@@ -222,7 +235,7 @@ def test_title_screen_is_not_content_review_and_material_risk_remains_unknown():
     assert evaluate_announcement_review(
         data, symbol=SYMBOL, financial_hash="abc", knowledge_time=NOW,
         review_dir=None, financial_period="2026-06-30",
-    ) == ("unknown", ("POTENTIALLY_MATERIAL_DOCUMENT_REQUIRES_CONTENT_REVIEW",))
+    ) == ("unknown", ("TARGETED_OFFICIAL_DOCUMENT_MISSING",))
 
 
 def test_ordinary_audit_title_is_not_a_nonstandard_audit_opinion():
@@ -353,7 +366,7 @@ def test_historical_current_snapshot_is_not_networked_or_backfilled():
     assert result.results[0].fundamental_reasons == ("CURRENT_SNAPSHOT_FORBIDDEN_IN_HISTORICAL_REPLAY",)
 
 
-def test_enrichment_is_copied_cached_and_labels_narrow_auto_review(tmp_path):
+def test_enrichment_is_copied_cached_and_labels_targeted_content_review(tmp_path):
     original = {SYMBOL: {"industry": "港口", "private_cost": 12}}
     seen = []
     def provider(symbols, **kwargs):
@@ -363,9 +376,11 @@ def test_enrichment_is_copied_cached_and_labels_narrow_auto_review(tmp_path):
     assert original == {SYMBOL: {"industry": "港口", "private_cost": 12}}
     assert batch.metadata[SYMBOL]["fundamental_gate"] == "pass"
     assert batch.metadata[SYMBOL]["announcement_gate"] == "pass"
-    assert batch.metadata[SYMBOL]["candidate_evidence_announcement_review_mode"] == "automatic_basic_title_screen"
-    assert batch.results[0].announcement_review_mode == "automatic_basic_title_screen"
-    assert batch.diagnostics["automatic_basic_announcement_pass_count"] == 1
+    assert batch.metadata[SYMBOL]["candidate_evidence_announcement_review_mode"] == "targeted_material_risk_content"
+    assert batch.results[0].announcement_review_mode == "targeted_material_risk_content"
+    assert batch.diagnostics["automatic_basic_announcement_pass_count"] == 0
+    assert batch.diagnostics["targeted_material_risk_review_pass_count"] == 1
+    assert batch.results[0].fundamental_risk_gate == "pass"
     assert batch.diagnostics["manual_content_review_pass_count"] == 0
     assert batch.diagnostics["fundamental_risk_review_pass_count"] == 1
     assert batch.diagnostics["unknown_count"] == 0

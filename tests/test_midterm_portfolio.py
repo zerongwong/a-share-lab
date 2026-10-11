@@ -374,7 +374,8 @@ def test_real_continuous_builder_accepts_current_five_name_shortlist_policy() ->
     assert len(result.positions) <= 5
 
 
-def test_continuous_search_only_runs_after_candidate_evidence_and_never_weights_unknown(monkeypatch):
+@pytest.mark.parametrize("receipt_mode", ["legacy", "combined", "malformed", "empty", "partial"])
+def test_continuous_search_only_runs_after_candidate_evidence_and_never_weights_unknown(monkeypatch, receipt_mode):
     import importlib
 
     from test_continuous_signals import _weekly_setup
@@ -392,14 +393,33 @@ def test_continuous_search_only_runs_after_candidate_evidence_and_never_weights_
     histories = {symbol: frame.copy() for symbol in symbols}
     metadata = {symbol: {**metadata[symbol], "fundamental_gate": "unknown",
                          "announcement_gate": "unknown"} for symbol in symbols}
+    if receipt_mode in {"empty", "partial"}:
+        metadata[symbols[2]].update({
+            "fundamental_gate": "pass", "announcement_gate": "pass",
+            "fundamental_risk_gate": "pass", "is_buyable_at_cutoff": True,
+            "candidate_evidence_method_version": "candidate-evidence-v2.0.0",
+        })
     stages, pools = [], []
 
     def resolve(items, *, cutoff):
         stages.append("evidence")
         assert set(items) == set(symbols)
-        return {symbols[0]: {"fundamental_gate": "pass", "announcement_gate": "pass",
-                             "name": "not allowed to overwrite identity"},
-                symbols[1]: {"fundamental_gate": "veto", "announcement_gate": "unknown"}}
+        receipts = {symbols[0]: {"fundamental_gate": "pass", "announcement_gate": "pass",
+                                "is_buyable_at_cutoff": True,
+                                "name": "not allowed to overwrite identity"},
+                    symbols[1]: {"fundamental_gate": "veto", "announcement_gate": "unknown"}}
+        if receipt_mode == "combined":
+            receipts[symbols[0]].update({
+                "announcement_gate": "unknown", "fundamental_risk_gate": "pass",
+                "candidate_evidence_method_version": "candidate-evidence-v2.0.0",
+            })
+        if receipt_mode == "malformed":
+            receipts[symbols[2]] = None
+        if receipt_mode == "empty":
+            receipts[symbols[2]] = {}
+        if receipt_mode == "partial":
+            receipts[symbols[2]] = {"fundamental_gate": "pass"}
+        return receipts
 
     def search(pool, **kwargs):
         assert stages == ["evidence"]

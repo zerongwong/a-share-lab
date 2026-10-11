@@ -1,10 +1,9 @@
 """Evidence enrichment after technical screening and before portfolio search.
 
-The financial and official-announcement gates are narrow *basic risk screens*.
-A complete, current CNINFO manifest with matching full financial reports may
-pass an automatic title-risk screen when no potentially material title appears.
-That is not a review of PDF contents or proof of investment quality. Missing,
-ambiguous or potentially material disclosures remain unknown until reviewed.
+One combined financial/material-risk screen uses current financial metrics and
+targeted official report/audit/risk document content. Routine governance filings
+do not create an independent manual approval queue. Missing or ambiguous
+material evidence remains unknown, never a fabricated pass.
 
 No current snapshot is usable for historical replay. Announcement publication
 time is distinct from the price cutoff and actual retrieval time is archived.
@@ -32,6 +31,10 @@ from ashare_lab.adapters.candidate_financial_evidence import (
     read_candidate_evidence,
     required_report_period,
 )
+from ashare_lab.services.material_risk_review import (
+    evaluate_targeted_material_review,
+    full_report_period,
+)
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _CHECKLIST = frozenset({
@@ -41,12 +44,6 @@ _CHECKLIST = frozenset({
 })
 _FINANCIAL_INDUSTRIES = ("银行", "保险", "证券", "多元金融", "金融", "bank", "insurance", "financial")
 _MATERIAL_TITLE = re.compile("立案|调查|处罚|诉讼|仲裁|担保|债务|违约|减值|更正|会计差错|审计|退市|风险警示|业绩预|重大资产|重大事项|关联交易")
-_AUTO_RISK_TITLE = re.compile(
-    "立案|调查|处罚|监管措施|违规|警示函|关注函|问询函|诉讼|仲裁|担保|债务|"
-    "违约|减值|更正|修订|补充|会计差错|财务造假|非标|非标准|保留意见|否定意见|"
-    "无法表示|持续经营|审计意见|退市|风险警示|业绩预|重大资产|重大事项|"
-    "关联交易|停牌|冻结|质押|破产|清算|重组"
-)
 _REPORT_TITLE = re.compile(r"(?<!\d)(20\d{2})年\s*(第一季度|一季度|半年度|中期|第三季度|三季度|年度|年报|度)\s*报告?")
 
 
@@ -74,6 +71,10 @@ class CandidateEvidenceResult:
     latest_official_financial_period: str | None = None
     valuation_asof: str | None = None
     announcement_review_mode: str = "unknown"
+    fundamental_risk_gate: str = "unknown"
+    fundamental_risk_reasons: tuple[str, ...] = ()
+    review_status: str = "evidence_unavailable"
+    retry_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -124,48 +125,7 @@ def _official_report_periods(items: list[dict[str, Any]]) -> tuple[date, ...]:
 
 def _full_report_period(title: str) -> date | None:
     """Recognise an issuer's full dated report, never its digest or correction."""
-    if any(word in title for word in ("摘要", "预约", "更正", "修订", "补充", "提示", "英文")):
-        return None
-    match = _REPORT_TITLE.search(title)
-    if (
-        match is None
-        or not any(word in match.group(0) for word in ("报告", "年报"))
-        or title[match.end():].strip() not in {"", "（全文）", "(全文)", "及审计报告"}
-    ):
-        return None
-    month = {
-        "第一季度": 3, "一季度": 3, "半年度": 6, "中期": 6,
-        "第三季度": 9, "三季度": 9, "年度": 12, "年报": 12, "度": 12,
-    }[match.group(2)]
-    return date(int(match.group(1)), month, {3: 31, 6: 30, 9: 30, 12: 31}[month])
-
-
-def _automatic_basic_announcement_review(
-    items: list[dict[str, Any]], *, financial_period: str | None, knowledge_time: datetime,
-) -> tuple[str, tuple[str, ...]]:
-    """A title-only risk filter; it cannot stand for reading disclosure PDFs."""
-    if financial_period is None:
-        return "unknown", ("LATEST_FINANCIAL_REPORT_PERIOD_REQUIRED",)
-    try:
-        selected = date.fromisoformat(financial_period)
-    except (TypeError, ValueError):
-        return "unknown", ("LATEST_FINANCIAL_REPORT_PERIOD_INVALID",)
-    full_reports = {_full_report_period(str(item["title"])) for item in items}
-    full_reports.discard(None)
-    if selected not in full_reports:
-        return "unknown", ("LATEST_FULL_OFFICIAL_FINANCIAL_REPORT_REQUIRED",)
-    known_date = knowledge_time.astimezone(_SHANGHAI).date()
-    latest_annual_year = known_date.year - (1 if known_date >= date(known_date.year, 5, 1) else 2)
-    if selected.month == 12:
-        latest_annual_year = max(latest_annual_year, selected.year)
-    if not any(
-        period.month == 12 and latest_annual_year <= period.year < known_date.year
-        for period in full_reports
-    ):
-        return "unknown", ("LATEST_FULL_OFFICIAL_ANNUAL_REPORT_REQUIRED",)
-    if any(_AUTO_RISK_TITLE.search(str(item["title"])) for item in items):
-        return "unknown", ("POTENTIALLY_MATERIAL_DOCUMENT_REQUIRES_CONTENT_REVIEW",)
-    return "pass", ("AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED",)
+    return full_report_period(title)
 
 
 def evaluate_financial_quality(
@@ -261,7 +221,7 @@ def evaluate_financial_quality(
 def evaluate_announcement_review(
     manifest: Mapping[str, Any], *, symbol: str, financial_hash: str,
     knowledge_time: datetime, review_dir: Path | None, financial_period: str | None = None,
-    review_path: Path | None = None,
+    review_path: Path | None = None, document_retrieval_time: datetime | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     if not isinstance(manifest, Mapping):
         return "unknown", ("OFFICIAL_MANIFEST_SCHEMA_INVALID",)
@@ -289,8 +249,23 @@ def evaluate_announcement_review(
         if (
             isinstance(record_count, bool) or not isinstance(record_count, int)
             or isinstance(total_records, bool) or not isinstance(total_records, int)
-            or record_count != len(items) or total_records != len(items)
+            or record_count != len(items)
         ):
+            return "unknown", ("OFFICIAL_MANIFEST_COUNT_UNVERIFIED",)
+        if "raw_record_count" in manifest:
+            counts = [manifest.get(key) for key in ("raw_record_count", "duplicate_provider_records", "future_unique_records")]
+            if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in counts):
+                return "unknown", ("OFFICIAL_MANIFEST_COUNT_UNVERIFIED",)
+            raw_count, duplicates, future = counts
+            duplicate_records = manifest.get("duplicate_records", [])
+            if (
+                raw_count != total_records or raw_count != record_count + duplicates + future
+                or not isinstance(duplicate_records, list)
+                or any(not isinstance(row, Mapping) or not isinstance(row.get("duplicates"), int) or isinstance(row["duplicates"], bool) or row["duplicates"] < 1 or not re.fullmatch(r"[0-9a-f]{64}", str(row.get("identity_hash") or "")) for row in duplicate_records)
+                or sum(row["duplicates"] for row in duplicate_records) != duplicates
+            ):
+                return "unknown", ("OFFICIAL_MANIFEST_COUNT_UNVERIFIED",)
+        elif total_records != record_count:
             return "unknown", ("OFFICIAL_MANIFEST_COUNT_UNVERIFIED",)
         if manifest["content_hash"] != content_hash(items):
             return "unknown", ("OFFICIAL_MANIFEST_HASH_MISMATCH",)
@@ -312,8 +287,9 @@ def evaluate_announcement_review(
             if official_periods and official_periods[-1] > selected:
                 return "unknown", ("STRUCTURED_FINANCIAL_LAGS_LATEST_OFFICIAL_REPORT",)
         if review_dir is None:
-            return _automatic_basic_announcement_review(
-                items, financial_period=financial_period, knowledge_time=knowledge_time,
+            return evaluate_targeted_material_review(
+                manifest, symbol=symbol, financial_period=financial_period, knowledge_time=knowledge_time,
+                retrieval_time=document_retrieval_time,
             )
         root = Path(review_dir).resolve()
         path = Path(review_path).resolve() if review_path is not None else root / f"{symbol}.json"
@@ -322,8 +298,9 @@ def evaluate_announcement_review(
         if not path.is_file():
             return (
                 ("unknown", ("OFFICIAL_DOCUMENT_CONTENT_REVIEW_REQUIRED",)) if review_path is not None
-                else _automatic_basic_announcement_review(
-                    items, financial_period=financial_period, knowledge_time=knowledge_time,
+                else evaluate_targeted_material_review(
+                    manifest, symbol=symbol, financial_period=financial_period, knowledge_time=knowledge_time,
+                    retrieval_time=document_retrieval_time,
                 )
             )
         if path.stat().st_size > 2_000_000:
@@ -334,6 +311,13 @@ def evaluate_announcement_review(
             or review["manifest_hash"] != manifest["content_hash"]
             or review["financial_hash"] != financial_hash
         ):
+            if review_path is None and review.get("status") == "pass" and review.get("symbol") == symbol:
+                # A superseded pass provides no evidence, but also cannot keep
+                # blocking an independently complete current targeted review.
+                return evaluate_targeted_material_review(
+                    manifest, symbol=symbol, financial_period=financial_period,
+                    knowledge_time=knowledge_time, retrieval_time=document_retrieval_time,
+                )
             return "unknown", ("OFFICIAL_REVIEW_CONTENT_CHANGED_REVIEW_REQUIRED",)
         reviewed_at = _aware(review["reviewed_at"])
         if reviewed_at > knowledge_time or any(_aware(item["published_at"]) > reviewed_at for item in items) or not review.get("reviewer") or not review.get("reason"):
@@ -423,7 +407,7 @@ def evaluate_execution_status(
 
 def _cached_receipt(path: Path, *, symbol: str, knowledge_time: datetime) -> dict | None:
     try:
-        if path.stat().st_size > 2_000_000:
+        if path.stat().st_size > 8_000_000:
             return None
         payload = json.loads(path.read_text())
         fetched = _aware(payload["retrieved_at"])
@@ -575,7 +559,17 @@ def enrich_candidate_evidence(
                 announcements, symbol=symbol, financial_hash=financial_hash,
                 knowledge_time=knowledge_time, review_dir=review_dir,
                 financial_period=financials.get("selected_period"),
+                document_retrieval_time=fetched,
             )
+            if gate == "unknown" and reasons == ("FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED",) and announcement_gate == "pass":
+                from ashare_lab.services.sector_financial_review import (
+                    evaluate_sector_financial_risk,
+                )
+                gate, reasons, sector_metrics = evaluate_sector_financial_risk(
+                    announcements, industry=str(item.get("industry") or ""), symbol=symbol,
+                    period=financials.get("selected_period"), knowledge_time=fetched,
+                )
+                metrics = {**metrics, **sector_metrics}
             execution_gate, execution_reasons = evaluate_execution_status(
                 execution, symbol=symbol, cutoff=cutoff, metadata=item,
             )
@@ -610,6 +604,19 @@ def enrich_candidate_evidence(
                 evidence_path = str(path)
             except OSError:
                 pass
+        combined_gate = (
+            "veto" if "veto" in (gate, announcement_gate)
+            else "pass" if gate == announcement_gate == "pass"
+            else "unknown"
+        )
+        combined_reasons = tuple(dict.fromkeys((*reasons, *announcement_reasons)))
+        review_status = (
+            "passed" if combined_gate == "pass" else "excluded" if combined_gate == "veto"
+            else "substantive_review_required" if any(
+                word in reason for reason in combined_reasons
+                for word in ("CONTENT_NEEDS_REVIEW", "OPINION_UNCONFIRMED", "SECTOR_")
+            ) else "evidence_unavailable"
+        )
         result = CandidateEvidenceResult(
             symbol=symbol, fundamental_gate=gate, announcement_gate=announcement_gate,
             execution_gate=execution_gate,
@@ -620,23 +627,34 @@ def enrich_candidate_evidence(
             execution_hash=str(execution.get("content_hash") or ""),
             retrieved_at=payload.get("retrieved_at") if trusted_time else None,
             financial_period=financials.get("selected_period"), publication_dates=publication_dates,
-            metrics=metrics, announcement_items=tuple(announcements.get("items") or ()),
+            metrics=metrics, announcement_items=tuple(
+                row for row in announcements["items"] if isinstance(row, dict)
+            ) if isinstance(announcements.get("items"), list) else (),
             evidence_path=evidence_path,
             required_financial_period=required_report_period(knowledge_time.astimezone(_SHANGHAI).date()).isoformat(),
             latest_official_financial_period=official_latest_period,
             valuation_asof=valuation_asof,
             announcement_review_mode=(
-                "automatic_basic_title_screen" if announcement_gate == "pass"
-                and "AUTOMATIC_BASIC_OFFICIAL_TITLE_SCREEN_PASSED" in announcement_reasons
+                "targeted_material_risk_content" if announcement_gate == "pass"
+                and "TARGETED_FINANCIAL_AND_MATERIAL_RISK_CONTENT_CONFIRMED" in announcement_reasons
                 else "manual_content_review" if announcement_gate == "pass"
                 and "CONTENT_GROUNDED_OFFICIAL_REVIEW_CONFIRMED" in announcement_reasons
                 else "unknown"
             ),
+            fundamental_risk_gate=combined_gate, fundamental_risk_reasons=combined_reasons,
+            review_status=review_status,
+            retry_reason=";".join(combined_reasons) if combined_gate == "unknown" else None,
         )
         results.append(result)
         # Sticky explicit vetoes are never downgraded by an unavailable provider.
         item["fundamental_gate"] = "veto" if item.get("fundamental_gate") == "veto" else gate
         item["announcement_gate"] = "veto" if item.get("announcement_gate") == "veto" else announcement_gate
+        item["fundamental_risk_gate"] = "veto" if "veto" in (
+            item.get("fundamental_risk_gate"), item["fundamental_gate"], item["announcement_gate"],
+        ) else combined_gate
+        item["fundamental_risk_reasons"] = combined_reasons
+        item["candidate_evidence_review_status"] = review_status
+        item["candidate_evidence_retry_reason"] = result.retry_reason
         if execution_gate == "veto":
             item["is_buyable_at_cutoff"] = False
         elif item.get("is_buyable_at_cutoff") is not False:
@@ -665,25 +683,32 @@ def enrich_candidate_evidence(
             "manual_content_review_pass_count": sum(
                 r.announcement_review_mode == "manual_content_review" for r in results
             ),
+            "targeted_material_risk_review_pass_count": sum(
+                r.announcement_review_mode == "targeted_material_risk_content" for r in results
+            ),
             "execution_pass_count": sum(r.execution_gate == "pass" for r in results),
             "structured_financial_lag_count": sum(
                 "STRUCTURED_FINANCIAL_LAGS_LATEST_OFFICIAL_REPORT" in r.announcement_reasons for r in results
             ),
             "financial_sector_special_review_count": sum(
-                "FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED" in r.fundamental_reasons for r in results
+                r.fundamental_gate == "unknown" and any(
+                    reason == "FINANCIAL_SECTOR_SPECIFIC_REVIEW_REQUIRED" or reason.startswith("SECTOR_")
+                    or reason.startswith("BANK_") or reason.startswith("INSURANCE_")
+                    for reason in r.fundamental_reasons
+                ) for r in results
             ),
             # One user-facing review stage, retaining independently auditable
             # financial and official-disclosure checks underneath it.
             "fundamental_risk_review_pass_count": sum(
-                r.fundamental_gate == r.announcement_gate == "pass" for r in results
+                r.fundamental_risk_gate == "pass" for r in results
             ),
-            "double_confirmation_count": sum(r.fundamental_gate == r.announcement_gate == "pass" for r in results),
-            "unknown_count": sum("unknown" in (r.fundamental_gate, r.announcement_gate) for r in results),
-            "veto_count": sum("veto" in (r.fundamental_gate, r.announcement_gate) for r in results),
+            "double_confirmation_count": sum(r.fundamental_risk_gate == "pass" for r in results),
+            "unknown_count": sum(r.fundamental_risk_gate == "unknown" for r in results),
+            "veto_count": sum(r.fundamental_risk_gate == "veto" for r in results),
             "effective_knowledge_time": effective_knowledge_time.isoformat(),
             "price_cutoff": cutoff.isoformat(),
             "financial_policy_scope": "basic_profit_solvency_cash_quality_not_blue_chip_certification",
-            "official_review_scope": "complete_current_manifest_title_screen_not_full_document_due_diligence",
+            "official_review_scope": "targeted_latest_report_audit_material_risk_content_not_full_document_due_diligence",
             "historical_replay_allowed": False,
         },
     )
