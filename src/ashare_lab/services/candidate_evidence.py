@@ -113,7 +113,7 @@ def _official_report_periods(items: list[dict[str, Any]]) -> tuple[date, ...]:
         "第三季度": 9, "三季度": 9, "年度": 12, "年报": 12, "度": 12,
     }
     for item in items:
-        title = str(item.get("title") or "")
+        title = re.sub(r"_+", " ", str(item.get("title") or ""))
         if "摘要" in title or "预约" in title:
             continue
         match = _REPORT_TITLE.search(title)

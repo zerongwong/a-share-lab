@@ -269,11 +269,12 @@ def test_combined_full_annual_and_audit_title_can_supply_annual_report_presence(
     )[0] == "pass"
 
 
-def test_newer_official_report_blocks_lagging_structured_financial_period():
+@pytest.mark.parametrize("title", ["2026年第三季度报告", "601298_2026年_第三季度报告"])
+def test_newer_official_report_blocks_lagging_structured_financial_period(title):
     known = datetime(2026, 10, 25, 8, 40, tzinfo=ZoneInfo("Asia/Shanghai"))
     data = manifest()
     data["items"].append({
-        "announcement_id": "q3", "title": "2026年第三季度报告",
+        "announcement_id": "q3", "title": title,
         "published_at": "2026-10-23T17:00:00+08:00",
         "url": "https://static.cninfo.com.cn/finalpage/q3.PDF",
     })

@@ -32,6 +32,9 @@ _FACT_PATTERNS = (
 
 def full_report_period(title: str) -> date | None:
     """Recognise full reports, not their summaries, forecasts or corrections."""
+    # CNINFO also publishes filename-style issuer titles, for example the
+    # authentic ``600789_2025年_年度报告``. Separators carry no report semantics.
+    title = re.sub(r"_+", " ", title)
     if any(word in title for word in ("摘要", "预约", "更正", "修订", "补充", "提示", "英文", "业绩预")):
         return None
     match = _REPORT.search(title)
@@ -148,6 +151,14 @@ def _fact_findings(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
                 # earlier '不存在逾期担保，但...' cannot negate a later default.
                 if re.search(r"(?:不存在|没有|尚未|未|不曾)[^，,。；;]{0,6}$", prefix):
                     continue
+                if (
+                    reason == "OFFICIAL_DISCLOSURE_ILLEGAL_FUNDS_OCCUPATION"
+                    and re.search(r"(?:无|不存在)(?:(?:大股东|控股股东|实际控制人|其他关联方|关联方)(?:及|和|与|、)?)+$", prefix)
+                    and re.match(r"(?:情形|情况)", compact[match.end():])
+                ):
+                    # '公司无大股东及关联方非经营性占用公司资金情形' is an
+                    # explicit issuer denial, not a confirmed occupation fact.
+                    continue
                 if re.search(r"如果|若(?:本)?公司|倘若|假如|可能发生|一旦|防止|避免|防范", prefix):
                     continue
                 # Standard exchange report templates print adverse headings even
@@ -157,6 +168,15 @@ def _fact_findings(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
                     continue
                 if re.search(r"已(?:全部)?(?:解除|结清|偿还|撤销|结案)|现已解决|不再存在|(?:公司|发行人).{0,8}曾|20\d{2}年.{0,20}(?:结案|解除|结清)", compact):
                     uncertain.append("HISTORICAL_RISK_RESOLUTION_NEEDS_CONTENT_REVIEW")
+                    continue
+                if (
+                    reason == "OFFICIAL_DISCLOSURE_INVESTIGATION_OR_FRAUD"
+                    and re.search(r"实际控制人|控股股东|董事|高级管理人员", prefix)
+                    and not re.search(r"(?:本公司|上市公司|发行人)(?:自身|本身)?[^，,《》]{0,8}$", prefix)
+                ):
+                    # A person's case is material evidence to review, but cannot
+                    # be relabelled as an investigation of the listed issuer.
+                    uncertain.append("RELATED_PERSON_DISCLOSURE_REQUIRES_IMPACT_REVIEW")
                     continue
                 reasons.append(reason)
         if (

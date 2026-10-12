@@ -15,6 +15,7 @@ from ashare_lab.services.candidate_evidence import (
     evaluate_announcement_review,
 )
 from ashare_lab.services.material_risk_review import (
+    _fact_findings,
     classify_document_title,
     full_report_period,
     required_document_items,
@@ -249,3 +250,33 @@ def test_full_report_recognition_handles_year_suffix_without_accepting_summary()
     assert full_report_period("泉阳泉2026年半年度报告正文").isoformat() == "2026-06-30"
     assert full_report_period("2026年半年度报告摘要") is None
     assert full_report_period("2026年半年度报告更正公告") is None
+
+
+def test_filename_style_cninfo_annual_report_title_is_not_a_missing_report():
+    assert full_report_period("600789_2025年_年度报告").isoformat() == "2025-12-31"
+    assert full_report_period("600789_2025年_年度报告_摘要") is None
+    assert full_report_period("600789_2025年_年度报告_更正公告") is None
+    data = manifest()
+    data["items"][0]["title"] = "600789_2025年_年度报告"
+    data["content_hash"] = content_hash(data["items"])
+    assert evaluate(data)[0] == "pass"
+
+
+def test_explicit_no_shareholder_funds_occupation_is_not_an_affirmative_fact():
+    text = "报告期内，公司无大股东及关联方非经营性占用公司资金情形，亦不存在将资金直接或间接地提供给大股东及关联方使用的情形。"
+    assert _fact_findings(text) == ((), ())
+    text += "但本公司控股股东已违规占用公司资金100亿元。"
+    assert _fact_findings(text)[0] == ("OFFICIAL_DISCLOSURE_ILLEGAL_FUNDS_OCCUPATION",)
+
+
+@pytest.mark.parametrize("text", [
+    "报告期内，因涉嫌信息披露等违法违规，公司实际控制人某先生被中国证监会立案调查。",
+    "公司实际控制人收到中国证监会立案告知书，该人员随后收到行政处罚决定书。",
+])
+def test_controller_investigation_cannot_be_relabelled_as_issuer_investigation(text):
+    assert _fact_findings(text) == ((), ("RELATED_PERSON_DISCLOSURE_REQUIRES_IMPACT_REVIEW",))
+    assert evaluate(add_document(manifest(), "关于实际控制人收到行政处罚决定书的公告", text))[0] == "unknown"
+
+
+def test_issuer_investigation_remains_a_veto_not_related_person_clearance():
+    assert _fact_findings("本公司被中国证监会立案调查。") == (("OFFICIAL_DISCLOSURE_INVESTIGATION_OR_FRAUD",), ())
