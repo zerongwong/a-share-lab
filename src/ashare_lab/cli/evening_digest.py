@@ -242,7 +242,15 @@ def run_evening_digest(
     log_path = resolved_log_root / "evening-report.jsonl"
     notifier = _notifier or send_evening_digest
     latest_reader = _latest_cutoff or latest_verified_overlay_cutoff
-    next_trading_day = _next_trading_day or resolve_next_zero_budget_trading_day
+
+    def default_next_trading_day(cutoff: date) -> date:
+        return resolve_next_zero_budget_trading_day(
+            cutoff,
+            _cache_root=resolved_state_root / "calendar",
+            _clock=_clock,
+        )
+
+    next_trading_day = _next_trading_day or default_next_trading_day
     repository = _repository or SQLiteRepository(
         resolved_state_root.parent / "research.db",
         project_root() / "migrations",
@@ -1377,34 +1385,40 @@ def _tushare_calendar_backup(start: date, end: date) -> tuple[date, ...]:
 def resolve_next_zero_budget_trading_day(
     common_cutoff: date,
     *,
-    _provider_factory: Callable[..., Any] = BoundedBaoStockEod,
-    _calendar_backup: Callable = _tushare_calendar_backup,
+    _provider_factory: Callable[..., Any] | None = None,
+    _calendar_backup: Callable | None = None,
+    _cache_root: Path | None = None,
+    _clock: Callable[[], datetime] | None = None,
 ) -> date:
-    """Resolve the next official A-share session without a paid credential."""
+    """Bounded calendar verification with a private, expiring range receipt."""
+    from ashare_lab.services.preopen_trading_calendar import (
+        CALENDAR_TIMEOUT_SECONDS,
+        bounded_tushare_calendar,
+        resolve_verified_next_trading_day,
+    )
 
     if not isinstance(common_cutoff, date) or isinstance(common_cutoff, datetime):
         raise TypeError("common_cutoff must be a date")
-    start = common_cutoff + timedelta(days=1)
-    end = common_cutoff + timedelta(days=_TRADING_CALENDAR_LOOKAHEAD_DAYS)
-    provider = _provider_factory()
+    provider = (
+        _provider_factory()
+        if _provider_factory is not None
+        else BoundedBaoStockEod(timeout=CALENDAR_TIMEOUT_SECONDS)
+    )
+    cache_root = _cache_root
+    if cache_root is None and _provider_factory is None and _calendar_backup is None:
+        cache_root = application_data_dir() / "scheduler" / "calendar"
     try:
-        try:
-            sessions = tuple(provider.fetch_cn_trading_days(start, end))
-        except DataUnavailableError:
-            sessions = tuple(_calendar_backup(start, end))
+        return resolve_verified_next_trading_day(
+            common_cutoff,
+            primary=provider.fetch_cn_trading_days,
+            backup=_calendar_backup or bounded_tushare_calendar,
+            cache_root=cache_root,
+            clock=_clock,
+        )
     finally:
         close = getattr(provider, "close", None)
         if callable(close):
             close()
-    if not sessions:
-        raise DataUnavailableError("未能在14日窗口内确认下一个A股交易日")
-    if any(not isinstance(value, date) or isinstance(value, datetime) for value in sessions):
-        raise DataUnavailableError("免费CN交易日历包含无效日期")
-    if sessions != tuple(sorted(set(sessions))):
-        raise DataUnavailableError("免费CN交易日历顺序或唯一性异常")
-    if any(value < start or value > end for value in sessions):
-        raise DataUnavailableError("免费CN交易日历返回请求区间外日期")
-    return _validate_next_trading_day(common_cutoff, sessions[0])
 
 
 def latest_verified_overlay_cutoff(overlay_root: Path) -> date | None:

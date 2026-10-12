@@ -28,8 +28,64 @@ _NOTICE_START = time(8, 50)
 _WATCHDOG_START = time(8, 58)
 _SEND_END = time(9, 0)
 NOTICE_TIMEOUT_SECONDS = 12.0
+_MAX_CONNECT_ATTEMPTS = 2
 _NOTICE_LOCK = "preopen-notice.lock"
 _NOTICE_STATE = "evening-failure-notice-state.json"
+_SEND_FAILURE_STATUSES = frozenset(
+    {
+        "failure_notice_credentials_missing",
+        "failure_notice_credentials_unavailable",
+        "failure_notice_credentials_invalid",
+        "failure_notice_connection_failed",
+        "failure_notice_connect_timeout",
+        "failure_notice_send_timeout_unknown",
+        "failure_notice_request_failed_unknown",
+        "failure_notice_provider_http_error",
+        "failure_notice_provider_rejected_or_invalid",
+        "failure_notice_provider_response_invalid",
+    }
+)
+_FAILURE_STATUSES = _SEND_FAILURE_STATUSES | {
+    "failure_notice_provider_not_accepted",
+    "failure_notice_acceptance_state_write_failed",
+    "failure_notice_worker_failed",
+    "failure_notice_deadline_exceeded",
+}
+
+
+class _NoticeSendFailure(Exception):
+    """Only static, allowlisted categories can cross the sender boundary."""
+
+    def __init__(self, status: str):
+        self.status = status if status in _SEND_FAILURE_STATUSES else "failure_notice_worker_failed"
+        super().__init__(self.status)
+
+
+def _delivery_failure_category(error: Exception) -> tuple[str, bool]:
+    """Classify the channel's suppressed cause without logging its URL/body.
+
+    A connection failure occurs before HTTP submission. Read/write failures
+    and provider responses must not be retried here: their acceptance outcome
+    can be unknown. The normal channel intentionally hides exception text.
+    """
+    import httpx
+
+    cause = error.__context__
+    if isinstance(cause, httpx.ConnectTimeout):
+        return "failure_notice_connect_timeout", True
+    if isinstance(cause, httpx.ConnectError):
+        return "failure_notice_connection_failed", True
+    if isinstance(cause, httpx.TimeoutException):
+        return "failure_notice_send_timeout_unknown", False
+    if isinstance(cause, httpx.HTTPStatusError):
+        return "failure_notice_provider_http_error", False
+    if isinstance(cause, httpx.HTTPError):
+        return "failure_notice_request_failed_unknown", False
+    if isinstance(cause, ValueError):
+        return "failure_notice_provider_response_invalid", False
+    # The channel rejects nonzero/malformed application receipts without an
+    # underlying exception. Do not forward provider response fields.
+    return "failure_notice_provider_rejected_or_invalid", False
 
 
 def _now() -> datetime:
@@ -102,25 +158,40 @@ def _send_serverchan_notice(message, *, before_send: Callable[[], bool]) -> bool
 
     from ashare_lab.adapters.macos_keychain import load_serverchan_sendkey
     from ashare_lab.adapters.notification_channels import ServerChanNotificationChannel
+    from ashare_lab.domain.errors import NotificationDeliveryError
 
-    key = load_serverchan_sendkey()
+    try:
+        key = load_serverchan_sendkey()
+    except Exception:
+        raise _NoticeSendFailure("failure_notice_credentials_unavailable") from None
     if not key:
-        return False
-    with (
-        httpx.Client(
-            timeout=httpx.Timeout(3.0, connect=2.0),
-            transport=httpx.HTTPTransport(retries=0, trust_env=False),
-            follow_redirects=False,
-            trust_env=False,
-        ) as client,
-        ServerChanNotificationChannel(key, client=client) as channel,
-    ):
-        # This check is after credential and client setup, immediately
-        # before the sole provider attempt. The supervisor bounds it too.
-        if not before_send():
-            return False
-        receipt = channel.send(message)
-    return receipt.accepted is True and receipt.provider_status == "provider_accepted"
+        raise _NoticeSendFailure("failure_notice_credentials_missing")
+    with httpx.Client(
+        timeout=httpx.Timeout(3.0, connect=2.0),
+        transport=httpx.HTTPTransport(retries=0, trust_env=False),
+        follow_redirects=False,
+        trust_env=False,
+    ) as client:
+        try:
+            channel = ServerChanNotificationChannel(key, client=client)
+        except ValueError:
+            raise _NoticeSendFailure("failure_notice_credentials_invalid") from None
+        with channel:
+            for attempt in range(_MAX_CONNECT_ATTEMPTS):
+                # Recheck time, trading calendar and accepted receipts after
+                # setup and before *each* attempt. The supervisor retains the
+                # same 12-second total budget, ending before 09:00.
+                if not before_send():
+                    return False
+                try:
+                    receipt = channel.send(message)
+                except NotificationDeliveryError as error:
+                    status, retry_safe = _delivery_failure_category(error)
+                    if retry_safe and attempt + 1 < _MAX_CONNECT_ATTEMPTS:
+                        continue
+                    raise _NoticeSendFailure(status) from None
+                return receipt.accepted is True and receipt.provider_status == "provider_accepted"
+    return False
 
 
 def _notify_locked(
@@ -186,11 +257,17 @@ def _notify_locked(
             return last_guard_status
         if accepted is True:
             # Date is tied to the guarded submission, not the response time.
-            _write_notice_state(state_root / _NOTICE_STATE, now)
+            try:
+                _write_notice_state(state_root / _NOTICE_STATE, now)
+            except OSError:
+                # Submission succeeded: never call the provider again here.
+                return "failure_notice_acceptance_state_write_failed"
             return "failure_notice_provider_accepted"
         return "failure_notice_provider_not_accepted"
+    except _NoticeSendFailure as error:
+        return error.status
     except Exception:
-        return "failure_notice_provider_not_accepted"
+        return "failure_notice_worker_failed"
     finally:
         if descriptor is not None:
             if acquired:
@@ -257,7 +334,7 @@ def notify_incomplete_once(
         value = json.loads(stdout)
         status = value.get("status") if isinstance(value, dict) else None
         # Never propagate arbitrary child output or provider exceptions.
-        allowed = {
+        allowed = _FAILURE_STATUSES | {
             "plan_already_provider_accepted",
             "failure_notice_already_provider_accepted",
             "failure_notice_provider_accepted",
@@ -297,11 +374,7 @@ def run_preopen_deadline(
         status = notify_incomplete_once(
             state_root=state_root, now=now, clock=actual_clock, notifier=notifier
         )
-    failed = status in {
-        "failure_notice_provider_not_accepted",
-        "failure_notice_worker_failed",
-        "failure_notice_deadline_exceeded",
-    }
+    failed = status in _FAILURE_STATUSES
     return (2 if failed else 0), {
         "job": "ashare-preopen-deadline",
         "status": status,

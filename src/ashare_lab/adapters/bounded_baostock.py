@@ -44,23 +44,36 @@ class BoundedBaoStockEod:
             raise DataUnavailableError("BaoStock请求超过时限，隔离进程已停止。") from None
         except OSError:
             raise DataUnavailableError("BaoStock隔离进程不可用。") from None
+        if result.returncode and isinstance(result.stdout, str) and not result.stdout.strip():
+            # No calendar/data answer was claimed by an interpreter or import
+            # crash. An emitted but malformed answer is a quality failure below.
+            raise DataUnavailableError("BaoStock隔离进程未返回结果。")
         try:
             payload = json.loads(result.stdout)
         except (ValueError, TypeError):
-            raise DataUnavailableError("BaoStock隔离响应不可用。") from None
-        if not isinstance(payload, dict) or not ({"result", "error"} & payload.keys()):
-            raise DataUnavailableError("BaoStock隔离响应结构无效。")
+            raise DataQualityError("BaoStock隔离响应格式无效，禁止切源掩盖。") from None
+        if not isinstance(payload, dict) or set(payload) not in ({"result"}, {"error"}):
+            raise DataQualityError("BaoStock隔离响应结构无效，禁止切源掩盖。")
         if payload.get("error") == "quality":
             raise DataQualityError("BaoStock数据质量未通过，禁止切源掩盖。")
-        if result.returncode or payload.get("error"):
+        if payload.get("error") == "unavailable":
             raise DataUnavailableError("BaoStock数据请求不可用。")
+        if "error" in payload or result.returncode:
+            raise DataQualityError("BaoStock隔离响应状态无效，禁止切源掩盖。")
+        expected_type = dict if operation == "indices" else list
+        if not isinstance(payload["result"], expected_type):
+            raise DataQualityError("BaoStock隔离结果结构无效，禁止切源掩盖。")
         return payload["result"]
 
     def fetch_cn_trading_days(self, start: date, end: date):
-        return tuple(
-            date.fromisoformat(d)
-            for d in self._call("calendar", start=start.isoformat(), end=end.isoformat())
-        )
+        values = self._call("calendar", start=start.isoformat(), end=end.isoformat())
+        try:
+            sessions = tuple(date.fromisoformat(value) for value in values)
+            if any(parsed.isoformat() != raw for parsed, raw in zip(sessions, values, strict=True)):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise DataQualityError("BaoStock隔离交易日历日期无效，禁止切源掩盖。") from None
+        return sessions
 
     def fetch_cn_stock_symbols(self):
         return tuple(self._call("symbols"))

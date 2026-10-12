@@ -328,3 +328,187 @@ def test_stale_now_argument_does_not_override_fresh_clock(tmp_path):
         notifier=lambda _: pytest.fail("stale initial timestamp cannot permit late sending"),
     )
     assert status == "noop_outside_preopen_notice_window"
+
+
+def _offline_sender(monkeypatch, handler):
+    """Exercise the real channel/redaction path without any external send."""
+    import httpx
+
+    from ashare_lab.adapters import macos_keychain
+
+    monkeypatch.setattr(
+        macos_keychain, "load_serverchan_sendkey", lambda: "SCTsyntheticKeyForOfflineTests"
+    )
+    monkeypatch.setattr(httpx, "HTTPTransport", lambda **_: httpx.MockTransport(handler))
+
+
+def _locked_send(tmp_path, *, clock=lambda: NOW):
+    return deadline._notify_locked(
+        state_root=tmp_path,
+        expected_date=NOW.date().isoformat(),
+        clock=clock,
+        notifier=None,
+    )
+
+
+@pytest.mark.parametrize(
+    "key_case,status",
+    [
+        ("missing", "failure_notice_credentials_missing"),
+        ("error", "failure_notice_credentials_unavailable"),
+        ("invalid", "failure_notice_credentials_invalid"),
+    ],
+)
+def test_credential_failures_have_safe_distinct_categories(tmp_path, monkeypatch, key_case, status):
+    from ashare_lab.adapters import macos_keychain
+
+    _offline_sender(monkeypatch, lambda _: pytest.fail("credentials failed; must not send"))
+
+    def load_key():
+        if key_case == "error":
+            raise RuntimeError("SCT-secret-private-credential-context")
+        return None if key_case == "missing" else "invalid-private-key"
+
+    monkeypatch.setattr(macos_keychain, "load_serverchan_sendkey", load_key)
+    assert _locked_send(tmp_path) == status
+    assert not (tmp_path / "evening-failure-notice-state.json").exists()
+
+
+@pytest.mark.parametrize(
+    "error_kind,status,attempt_count",
+    [
+        ("ConnectError", "failure_notice_connection_failed", 2),
+        ("ConnectTimeout", "failure_notice_connect_timeout", 2),
+        ("ReadTimeout", "failure_notice_send_timeout_unknown", 1),
+        ("WriteTimeout", "failure_notice_send_timeout_unknown", 1),
+        ("ReadError", "failure_notice_request_failed_unknown", 1),
+        ("WriteError", "failure_notice_request_failed_unknown", 1),
+        ("http_error", "failure_notice_provider_http_error", 1),
+        ("rejected", "failure_notice_provider_rejected_or_invalid", 1),
+        ("malformed_receipt", "failure_notice_provider_rejected_or_invalid", 1),
+        ("invalid_json", "failure_notice_provider_response_invalid", 1),
+    ],
+)
+def test_transport_failure_categories_and_retries_are_bounded_and_redacted(
+    tmp_path, monkeypatch, capsys, error_kind, status, attempt_count
+):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if error_kind == "http_error":
+            return httpx.Response(503, text="private provider response SCT-secret")
+        if error_kind == "rejected":
+            return httpx.Response(200, json={"code": 40001, "message": "SCT-private quota"})
+        if error_kind == "malformed_receipt":
+            return httpx.Response(200, json={"code": "0", "message": "private malformed"})
+        if error_kind == "invalid_json":
+            return httpx.Response(200, text="SCT-private invalid JSON")
+        raise getattr(httpx, error_kind)(f"private response and URL {request.url}", request=request)
+
+    _offline_sender(monkeypatch, handler)
+    assert _locked_send(tmp_path) == status
+    assert len(calls) == attempt_count
+    assert not (tmp_path / "evening-failure-notice-state.json").exists()
+    assert capsys.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize("first_failure", [False, True])
+def test_connection_retry_stops_at_first_acceptance_and_receipt_deduplicates(
+    tmp_path, monkeypatch, first_failure
+):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if first_failure and len(calls) == 1:
+            raise httpx.ConnectError("private connection failure", request=request)
+        return httpx.Response(200, json={"code": 0, "message": "SUCCESS"})
+
+    _offline_sender(monkeypatch, handler)
+    assert _locked_send(tmp_path) == "failure_notice_provider_accepted"
+    assert _locked_send(tmp_path) == "failure_notice_already_provider_accepted"
+    assert len(calls) == (2 if first_failure else 1)
+
+
+@pytest.mark.parametrize("change", ["deadline", "accepted", "nontrading"])
+def test_connection_retry_rechecks_deadline_receipt_and_calendar(tmp_path, monkeypatch, change):
+    import httpx
+
+    current, calls = NOW, []
+
+    def handler(request):
+        nonlocal current
+        calls.append(request)
+        if change == "deadline":
+            current = NOW.replace(hour=9, minute=0)
+        elif change == "accepted":
+            (tmp_path / "evening-digest-state.json").write_text(
+                json.dumps(
+                    {"plan_for_date": NOW.date().isoformat(), "accepted_channels": ["serverchan"]}
+                )
+            )
+        else:
+            _state(tmp_path, trading=False)
+        raise httpx.ConnectError("connection could not be established", request=request)
+
+    _offline_sender(monkeypatch, handler)
+    status = _locked_send(tmp_path, clock=lambda: current)
+    assert status == {
+        "deadline": "noop_outside_preopen_notice_window",
+        "accepted": "plan_already_provider_accepted",
+        "nontrading": "noop_verified_nontrading_day",
+    }[change]
+    assert len(calls) == 1
+
+
+def test_acceptance_persistence_failure_never_immediately_resends(tmp_path, monkeypatch):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"code": 0, "message": "SUCCESS"})
+
+    def broken_state(*_):
+        raise OSError("private path should not enter output")
+
+    _offline_sender(monkeypatch, handler)
+    monkeypatch.setattr(deadline, "_write_notice_state", broken_state)
+    assert _locked_send(tmp_path) == "failure_notice_acceptance_state_write_failed"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("status", sorted(deadline._SEND_FAILURE_STATUSES))
+def test_supervisor_preserves_only_safe_diagnostics_and_marks_failure(tmp_path, monkeypatch, status):
+    class Process:
+        returncode = 0
+
+        def communicate(self, *, timeout):
+            assert timeout <= 12
+            return json.dumps({"status": status, "private": "SCT-not-forwarded"}), None
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(deadline.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+    code, event = deadline.run_preopen_deadline(state_root=tmp_path, clock=lambda: NOW)
+    assert code == 2
+    assert event == {
+        "job": "ashare-preopen-deadline",
+        "status": status,
+        "delivery_confirmed": False,
+    }
+
+
+def test_unexpected_sender_error_is_not_mislabelled_provider_rejection(tmp_path, monkeypatch):
+    def broken_sender(*_, **__):
+        raise RuntimeError("private application failure SCT-secret")
+
+    monkeypatch.setattr(deadline, "_send_serverchan_notice", broken_sender)
+    assert _locked_send(tmp_path) == "failure_notice_worker_failed"

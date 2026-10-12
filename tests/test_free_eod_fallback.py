@@ -401,11 +401,11 @@ def test_isolated_baostock_reads_dates_without_console_noise():
 
 
 @pytest.mark.parametrize("payload", ["null", "[]", "{}"])
-def test_invalid_child_protocol_is_unavailable(payload):
+def test_invalid_child_protocol_is_quality_failure(payload):
     def runner(*_, **__):
         return SimpleNamespace(returncode=0, stdout=payload)
 
-    with pytest.raises(DataUnavailableError):
+    with pytest.raises(DataQualityError):
         BoundedBaoStockEod(runner=runner).fetch_cn_stock_symbols()
 
 
@@ -432,9 +432,9 @@ def test_evening_calendar_uses_backup_only_after_unavailability():
 def test_evening_calendar_cannot_accept_a_date_outside_its_request():
     from ashare_lab.cli.evening_digest import resolve_next_zero_budget_trading_day
 
-    with pytest.raises(DataUnavailableError, match="区间外"):
+    with pytest.raises(DataQualityError, match="区间外"):
         resolve_next_zero_budget_trading_day(
             TARGET,
             _provider_factory=primary,
-            _calendar_backup=lambda *_: (date(2026, 10, 1),),
+            _calendar_backup=lambda *_: (date(2026, 11, 1),),
         )
