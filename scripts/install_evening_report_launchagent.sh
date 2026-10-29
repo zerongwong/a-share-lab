@@ -26,7 +26,7 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
     echo "未找到项目虚拟环境：$PYTHON_BIN" >&2
     exit 2
 fi
-if ! "$PYTHON_BIN" -c "import ashare_lab.cli.evening_report; import ashare_lab.cli.preopen_deadline; import ashare_lab.cli.holding_pnl"; then
+if ! "$PYTHON_BIN" -c "import ashare_lab.cli.scheduled_tick; import ashare_lab.cli.evening_report; import ashare_lab.cli.preopen_deadline; import ashare_lab.cli.holding_pnl"; then
     echo "盘前报告、独立截止提醒或持仓日报模块无法导入，请先完成项目更新与依赖安装。" >&2
     exit 2
 fi
@@ -124,10 +124,11 @@ for INDEX in "${!LABELS[@]}"; do
 done
 COMMITTED=true
 
+echo "以下时刻均为北京时间，与本机时区和夏令时无关；每60秒轻量检查，仅当前获准时段启动一次业务。"
 echo "周一至周五08:20盘前报告任务已登记，08:30、08:40、08:50重试；08:58关闭自动计算/提交窗口。"
 echo "独立截止提醒已登记：08:58、08:59检查，不受主报告运行锁阻塞；两者均核验当天是否交易日。"
 echo "持仓盈亏日报已登记：15:35、15:45、15:55有限尝试，仅15:30–16:00窗口并仅已登记持仓。"
-echo "RunAtLoad可能立即唤起；各入口自行校验发送窗口和去重，不重启网页或每日数据同步。"
+echo "RunAtLoad只补当前允许时段，不补过期任务；各任务独立锁和时段去重，不重启网页或每日数据同步。"
 echo "查看状态：launchctl print $DOMAIN/$LABEL"
 echo "查看截止提醒：launchctl print $DOMAIN/$DEADLINE_LABEL"
 echo "查看持仓日报：launchctl print $DOMAIN/$PNL_LABEL"

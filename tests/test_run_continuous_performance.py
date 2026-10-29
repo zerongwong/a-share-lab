@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date
 from types import SimpleNamespace
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -138,6 +139,70 @@ def test_explicit_snapshot_records_once_without_mutating_holdings_or_logging_amo
         assert private not in encoded
 
 
+@pytest.mark.parametrize("method", [f"continuous-signal-v{version}" for version in range(1, 6)])
+def test_supported_historical_stream_keeps_original_version_and_identity(
+    repository, monkeypatch, method
+):
+    snapshot = _snapshot(method_version=method)
+    portfolio = _portfolio(snapshot)
+    original = copy.deepcopy(portfolio.metadata)
+    _use_portfolio(monkeypatch, portfolio)
+    first = service.run_continuous_performance(repository, as_of=CUTOFF)
+    repeat = service.run_continuous_performance(repository, as_of=CUTOFF)
+    assert first["status"] == "recorded"
+    assert repeat["status"] == "already_recorded"
+    record = repository.db.execute(
+        "SELECT valuation_id, portfolio_id, method_version FROM continuous_strategy_valuations"
+    ).fetchone()
+    expected_id = str(
+        uuid5(
+            NAMESPACE_URL,
+            f"a-share-lab:continuous-actual-valuation:{method}:"
+            f"{snapshot['portfolio_id']}:{CUTOFF.isoformat()}",
+        )
+    )
+    assert record == (expected_id, snapshot["portfolio_id"], method)
+    assert portfolio.metadata == original
+
+
+def test_v4_account_cannot_be_silently_migrated_to_v5_after_upgrade(repository, monkeypatch):
+    portfolio = _portfolio(_snapshot(method_version="continuous-signal-v4"))
+    _use_portfolio(monkeypatch, portfolio)
+    assert service.run_continuous_performance(repository, as_of=CUTOFF)["status"] == "recorded"
+    before = repository.db.execute("SELECT * FROM continuous_strategy_valuations").fetchall()
+    next_date = date(2026, 9, 7)
+    snapshot = _snapshot(as_of=next_date.isoformat(), data_cutoff=next_date.isoformat())
+    snapshot["evidence"]["covered_through"] = next_date.isoformat()
+    portfolio.metadata["continuous_valuation_snapshots"][next_date.isoformat()] = snapshot
+    result = service.run_continuous_performance(repository, as_of=next_date)
+    assert result["status"] == "inputs_invalid"
+    assert (
+        repository.db.execute("SELECT * FROM continuous_strategy_valuations").fetchall() == before
+    )
+
+
+def test_v4_account_continues_original_nav_chain_under_v5_runner(repository, monkeypatch):
+    portfolio = _portfolio(_snapshot(method_version="continuous-signal-v4"))
+    _use_portfolio(monkeypatch, portfolio)
+    assert service.run_continuous_performance(repository, as_of=CUTOFF)["status"] == "recorded"
+    next_date = date(2026, 9, 7)
+    snapshot = _snapshot(
+        as_of=next_date.isoformat(),
+        data_cutoff=next_date.isoformat(),
+        method_version="continuous-signal-v4",
+    )
+    snapshot["evidence"]["covered_through"] = next_date.isoformat()
+    portfolio.metadata["continuous_valuation_snapshots"][next_date.isoformat()] = snapshot
+    assert service.run_continuous_performance(repository, as_of=next_date)["status"] == "recorded"
+    rows = repository.db.execute(
+        "SELECT method_version, result_json, record_hash FROM continuous_strategy_valuations "
+        "ORDER BY as_of"
+    ).fetchall()
+    assert len(rows) == 2
+    assert all(row[0] == "continuous-signal-v4" for row in rows)
+    assert json.loads(rows[1][1])["previous_record_hash"] == rows[0][2]
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -148,6 +213,8 @@ def test_explicit_snapshot_records_once_without_mutating_holdings_or_logging_amo
         {"holding_version": True},
         {"mode": "shadow"},
         {"method_version": "legacy-one-month"},
+        {"method_version": "continuous-signal-v6"},
+        {"method_version": []},
         {"portfolio_id": None},
         {"position_units": {"600002": 10}},
         {"position_units": {}},

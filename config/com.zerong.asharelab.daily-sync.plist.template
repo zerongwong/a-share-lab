@@ -11,7 +11,9 @@
         <string>-i</string>
         <string>__PYTHON_BIN__</string>
         <string>-m</string>
-        <string>ashare_lab.cli.scheduled_sync_worker</string>
+        <string>ashare_lab.cli.scheduled_tick</string>
+        <string>--job</string>
+        <string>daily-sync</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -20,51 +22,8 @@
     <key>RunAtLoad</key>
     <true/>
 
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict>
-            <key>Hour</key>
-            <integer>6</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>7</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>8</integer>
-            <key>Minute</key>
-            <integer>0</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>15</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>16</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>18</integer>
-            <key>Minute</key>
-            <integer>30</integer>
-        </dict>
-        <dict>
-            <key>Hour</key>
-            <integer>20</integer>
-            <key>Minute</key>
-            <integer>20</integer>
-        </dict>
-    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
 
     <key>ProcessType</key>
     <string>Background</string>

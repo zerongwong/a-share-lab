@@ -1749,13 +1749,13 @@ def _format_plan(
     actual_cost_policy = (
         getattr(plan, "initial_risk_policy", None) == "actual_cost_loss_8pct_v1"
     )
-    weekly_key = (
+    primary_key = (
         _positive_optional(getattr(plan, "primary_structure_reference_price", None))
         if actual_cost_policy
         else None
     )
-    if actual_cost_policy and (maximum is None or weekly_key is None):
-        # The v4 next-session condition requires both a verified weekly key
+    if actual_cost_policy and (maximum is None or primary_key is None):
+        # The next-session condition requires a verified primary structure key
         # and a bounded buying location; an upper price cap alone is unsafe.
         return None
     if maximum is not None:
@@ -1769,7 +1769,7 @@ def _format_plan(
         if lower is None:
             return None
         if actual_cost_policy:
-            lower = max(lower, weekly_key)
+            lower = max(lower, primary_key)
         lower = math.ceil(lower * 100 - 1e-9) / 100
         if plan.kind is ConditionalEntryPlanKind.HEALTHY_PULLBACK:
             high = _positive_optional(plan.price_high)

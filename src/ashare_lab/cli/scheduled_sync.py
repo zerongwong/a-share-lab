@@ -150,14 +150,22 @@ def render_launchagent_plist(
         raise ValueError("daily sync LaunchAgent template has an unexpected label")
     if "KeepAlive" in document:
         raise ValueError("daily sync LaunchAgent must not contain KeepAlive")
-    if document.get("StartCalendarInterval") != _DAILY_SYNC_SCHEDULE:
-        raise ValueError("daily sync LaunchAgent schedule is not the approved retry contract")
+    from ashare_lab.cli.scheduled_tick import SLOT_WINDOWS, TICK_MODULE, TICK_SECONDS
+
+    if "StartCalendarInterval" in document or document.get("StartInterval") != TICK_SECONDS:
+        raise ValueError("daily sync LaunchAgent must use the timezone-independent tick")
+    if {row["Hour"] * 60 + row["Minute"] for row in _DAILY_SYNC_SCHEDULE} != {
+        start for start, _ in SLOT_WINDOWS["daily-sync"]
+    }:
+        raise ValueError("scheduled tick does not match the approved sync slots")
     document["ProgramArguments"] = [
         "/usr/bin/caffeinate",
         "-i",
         interpreter,
         "-m",
-        _LAUNCHAGENT_MODULE,
+        TICK_MODULE,
+        "--job",
+        "daily-sync",
     ]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))
@@ -454,7 +462,7 @@ def _run_continuous_accounting(
     event, *, scheduler_root, common_cutoff, overlay_root=None,
     source_id=DEFAULT_MARKET_OVERLAY_SOURCE_ID,
 ):
-    """Local-only explicit snapshots; no inference of trades from daily plans."""
+    """Archive explicit snapshots and authorized reference-exit notices, never real trades."""
     from ashare_lab.services.run_continuous_performance import run_continuous_performance
 
     try:
@@ -485,8 +493,30 @@ def _run_continuous_accounting(
         event["recommendation_tracking_status"] = tracking["status"]
         event["recommendation_tracking_reports_ingested"] = tracking["reports_ingested"]
         event["recommendation_tracking_archive_rejected"] = tracking["archive_rejected"]
+        # An explicitly authorized exit event is not a recurring data-status
+        # push. It is independent of actual holdings and only runs after the
+        # verified reference replay has produced a complete new close.
+        _notify_reference_completions(
+            event, root=scheduler_root / "recommendation-tracking",
+            summary=tracking.get("reference_summary", {}),
+        )
     except Exception:
         event["recommendation_tracking_status"] = "error_retry_later"
+
+
+def _notify_reference_completions(event, *, root, summary, now=None):
+    from ashare_lab.cli.holding_pnl import send_serverchan
+    from ashare_lab.services.recommendation_exit_notifications import dispatch_reference_exits
+
+    try:
+        result = dispatch_reference_exits(
+            summary=summary, root=root, notifier=send_serverchan,
+            now=now or datetime.now(_SHANGHAI),
+        )
+        event["recommendation_reference_notice_status"] = result["status"]
+        event["recommendation_reference_notices_accepted"] = result["accepted"]
+    except Exception:
+        event["recommendation_reference_notice_status"] = "error_retry_later"
 
 
 def _run_performance_reviews(

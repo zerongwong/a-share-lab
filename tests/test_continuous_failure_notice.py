@@ -179,7 +179,7 @@ def test_earlier_error_slots_do_not_send_failure_notice(tmp_path, minute):
     result = _run(tmp_path, minute=minute, notifier=lambda msg: messages.append(msg))
     assert result.exit_code == cli.EXIT_ERROR
     assert not messages
-    assert not (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    assert not (tmp_path / "state" / "manual-evening-failure-notice-state.json").exists()
 
 
 def test_final_build_error_sends_generic_once_and_records_only_acceptance(tmp_path):
@@ -196,7 +196,7 @@ def test_final_build_error_sends_generic_once_and_records_only_acceptance(tmp_pa
     assert "未能生成或提交" in messages[0].body
     assert "请勿把旧报告当作今日买入依据" in messages[0].body
     assert "已送达" not in messages[0].body
-    state = json.loads((tmp_path / "state" / "evening-failure-notice-state.json").read_text())
+    state = json.loads((tmp_path / "state" / "manual-evening-failure-notice-state.json").read_text())
     assert state == {"accepted_date": TODAY.isoformat(), "delivery_confirmed": False}
     assert not (tmp_path / "state" / "evening-digest-state.json").exists()
     assert UNSAFE_DETAIL not in json.dumps(first.event)
@@ -211,6 +211,25 @@ def test_final_retry_lock_error_also_sends_one_generic_notice(tmp_path):
     assert result.exit_code == cli.EXIT_RETRY
     assert result.event["reason"] == "daily_data_lock_busy"
     assert len(messages) == 1
+
+
+def test_manual_failure_receipt_cannot_suppress_fixed_deadline_summary(tmp_path):
+    from ashare_lab.cli.preopen_deadline import run_preopen_deadline
+
+    messages = []
+    result = _run(tmp_path, notifier=lambda msg: messages.append(msg) or _accepted())
+    assert result.exit_code == cli.EXIT_ERROR
+    assert len(messages) == 1
+    assert (tmp_path / "state" / "manual-evening-failure-notice-state.json").exists()
+    assert not (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    code, event = run_preopen_deadline(
+        state_root=tmp_path / "state",
+        clock=lambda: datetime(2026, 8, 31, 0, 58, tzinfo=UTC),
+        notifier=lambda message: messages.append(message) or True,
+    )
+    assert code == 0 and event["status"] == "failure_notice_provider_accepted"
+    assert len(messages) == 2
+    assert "盘前部分结果" in messages[-1].body
 
 
 def test_full_market_failure_preserves_authorized_independent_risk_review(tmp_path):
@@ -362,7 +381,7 @@ def test_only_explicit_serverchan_acceptance_deduplicates(tmp_path, receipt):
     for _ in range(2):
         _run(tmp_path, notifier=lambda msg: (messages.append(msg), receipt)[1])
     assert len(messages) == 2
-    assert not (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    assert not (tmp_path / "state" / "manual-evening-failure-notice-state.json").exists()
 
 
 def test_provider_failure_does_not_recurse_or_replace_original_error(tmp_path):
@@ -377,7 +396,7 @@ def test_provider_failure_does_not_recurse_or_replace_original_error(tmp_path):
     assert result.event["reason"] == "digest_or_provider_submission_failed"
     assert len(calls) == 1
     assert UNSAFE_DETAIL not in json.dumps(result.event)
-    assert not (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    assert not (tmp_path / "state" / "manual-evening-failure-notice-state.json").exists()
 
 
 @pytest.mark.parametrize("with_old_state", [False, True])

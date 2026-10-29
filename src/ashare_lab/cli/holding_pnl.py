@@ -22,7 +22,7 @@ TOTAL_BUDGET_SECONDS = 90
 _EXIT_RESERVE_SECONDS = 2
 _FINAL_COMPUTE_SECONDS = 74
 _FALLBACK_SECONDS = 12
-_CALENDAR_LOOKBACK_DAYS = 14
+_CALENDAR_LOOKBACK_DAYS = 90
 _SESSION_CACHE_VERSION = 1
 _AKSHARE_CALENDAR_TIMEOUT = 6.0
 
@@ -213,7 +213,7 @@ def _akshare_trading_sessions(start: date, end: date) -> tuple[date, ...]:
     """Validate the *whole* public Sina calendar before returning a small slice."""
     from ashare_lab.domain.errors import DataUnavailableError
 
-    if start > end or (end - start).days > 30:
+    if start > end or (end - start).days >= _CALENDAR_LOOKBACK_DAYS:
         raise DataUnavailableError("交易日历请求区间无效。")
     import akshare as ak
     import pandas as pd
@@ -252,13 +252,15 @@ def _load_trading_sessions(
     from ashare_lab.adapters.bounded_baostock import BoundedBaoStockEod
     from ashare_lab.domain.errors import DataUnavailableError
 
-    if state_root is not None:
-        cached = _read_session_cache(state_root)
-        if cached is not None and cached[1] == end:
-            return cached[2]
     request_start = (
         end - timedelta(days=_CALENDAR_LOOKBACK_DAYS - 1) if state_root is not None else start
     )
+    if state_root is not None:
+        cached = _read_session_cache(state_root)
+        # Upgrade an old short-window cache even when it already contains
+        # today's date. Otherwise earlier entry dates stay unverified forever.
+        if cached is not None and cached[1] == end and cached[0] <= request_start:
+            return cached[2]
     try:
         verified = _bounded_calendar_child(
             "calendar-range-akshare",

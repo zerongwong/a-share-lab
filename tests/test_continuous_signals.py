@@ -8,6 +8,7 @@ import pytest
 from ashare_lab.analytics.continuous_signals import (
     CONTINUOUS_METHOD_VERSION,
     CONTINUOUS_SIGNAL_CONTRACT,
+    PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT,
     assess_continuous_entry,
     continuous_entry_stage_rank_score,
 )
@@ -16,6 +17,7 @@ from ashare_lab.analytics.multi_timeframe import (
     BarTimeframe,
     ExecutionState,
     StructureState,
+    TrendDirection,
     assess_multi_timeframe,
     horizon_contract,
 )
@@ -30,7 +32,8 @@ def _admit(
     candidate_qualified=True,
     execution_ready=True,
     stage_metrics=None,
-    structure_timeframe=BarTimeframe.WEEKLY,
+    structure_timeframe=BarTimeframe.DAILY,
+    weekly_direction=TrendDirection.UP,
 ):
     metrics = {
         "distance_ma20": 0.0,
@@ -45,7 +48,11 @@ def _admit(
             candidate_qualified=candidate_qualified,
             execution_ready=execution_ready,
             structure=SimpleNamespace(state=structure, timeframe=structure_timeframe),
-            slow_direction=SimpleNamespace(timeframe=BarTimeframe.WEEKLY, qualified=True),
+            slow_direction=SimpleNamespace(
+                timeframe=BarTimeframe.WEEKLY,
+                qualified=weekly_direction in {TrendDirection.UP, TrendDirection.MIXED},
+                direction=weekly_direction,
+            ),
             execution=SimpleNamespace(state=execution),
         ),
     )
@@ -116,8 +123,10 @@ def test_mixed_ma_reversal_with_actual_extended_history_is_rejected():
         SimpleNamespace(
             candidate_qualified=True,
             execution_ready=True,
-            structure=SimpleNamespace(state=StructureState.BREAKOUT, timeframe=BarTimeframe.WEEKLY),
-            slow_direction=SimpleNamespace(timeframe=BarTimeframe.WEEKLY, qualified=True),
+            structure=SimpleNamespace(state=StructureState.BREAKOUT, timeframe=BarTimeframe.DAILY),
+            slow_direction=SimpleNamespace(
+                timeframe=BarTimeframe.WEEKLY, qualified=True, direction=TrendDirection.UP
+            ),
             execution=SimpleNamespace(state=ExecutionState.READY_BREAKOUT),
         ),
     )
@@ -171,18 +180,32 @@ def test_every_hard_admission_gate_is_required(kwargs):
 def test_continuous_profile_is_independently_named_without_mutating_legacy_contract():
     legacy = horizon_contract(4)
     assert CONTINUOUS_SIGNAL_CONTRACT is not legacy
-    assert CONTINUOUS_SIGNAL_CONTRACT.label == "continuous_weekly_breakout_daily_execution_v4"
-    assert CONTINUOUS_SIGNAL_CONTRACT.structure_timeframe is BarTimeframe.WEEKLY
+    assert CONTINUOUS_SIGNAL_CONTRACT.label == "continuous_weekly_filter_daily_breakout_pullback_v5"
+    assert CONTINUOUS_SIGNAL_CONTRACT.structure_timeframe is BarTimeframe.DAILY
     assert CONTINUOUS_SIGNAL_CONTRACT.execution_uses_structure
+    assert CONTINUOUS_SIGNAL_CONTRACT.slow_direction_filter_only
+    assert CONTINUOUS_SIGNAL_CONTRACT.require_stabilized_retest
+    assert PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT.structure_timeframe is BarTimeframe.WEEKLY
+    assert not PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT.slow_direction_filter_only
     assert legacy.structure_timeframe is BarTimeframe.DAILY
     assert not legacy.execution_uses_structure
     assert legacy.label != CONTINUOUS_SIGNAL_CONTRACT.label
 
 
-def test_daily_breakout_cannot_be_passed_off_as_weekly_confirmation():
-    result = _admit(structure_timeframe=BarTimeframe.DAILY)
+def test_weekly_breakout_cannot_substitute_for_v5_daily_confirmation():
+    result = _admit(structure_timeframe=BarTimeframe.WEEKLY)
     assert not result.qualified
-    assert "completed_weekly_direction_and_structure_not_qualified" in result.reasons
+    assert "completed_weekly_filter_and_daily_structure_not_qualified" in result.reasons
+
+
+@pytest.mark.parametrize("direction", [TrendDirection.UP, TrendDirection.MIXED])
+def test_weekly_background_filter_allows_up_or_mixed_without_relabelling(direction):
+    assert _admit(weekly_direction=direction).qualified
+
+
+@pytest.mark.parametrize("direction", [TrendDirection.DOWN, TrendDirection.INSUFFICIENT])
+def test_weekly_adverse_or_missing_background_blocks_daily_entry(direction):
+    assert not _admit(weekly_direction=direction).qualified
 
 
 def _weekly_setup():
@@ -207,7 +230,7 @@ def _weekly_setup():
 
 def _weekly_assessment(frame, as_of="2026-09-18"):
     return assess_multi_timeframe(
-        frame, as_of=as_of, holding_weeks=4, signal_contract=CONTINUOUS_SIGNAL_CONTRACT
+        frame, as_of=as_of, holding_weeks=4, signal_contract=PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT
     )
 
 
@@ -224,7 +247,8 @@ def test_completed_weekly_breakout_needs_no_separate_daily_breakout():
     assert result.execution.breakout_line == result.structure.breakout_line
     assert "independent_daily_breakout_not_required" in result.execution.reasons
     assert not legacy.execution_ready
-    assert assess_continuous_entry(assess_medium_term_stage(frame["close"]), result).qualified
+    # Frozen v4 remains executable as v4 but cannot masquerade as a v5 signal.
+    assert not assess_continuous_entry(assess_medium_term_stage(frame["close"]), result).qualified
     payload = asdict(result)
     assert payload["structure"]["timeframe"] == payload["execution"]["reference_timeframe"]
 

@@ -257,8 +257,32 @@ def run_evening_digest(
     )
     archiver = _archive_digest or _archive_original_digest
     started_at = monotonic()
+    partial_cutoff: date | None = None
+
+    def partial_snapshot(*, stage=None, common_cutoff=None, missing_codes=()) -> None:
+        """Leave a bounded, non-actionable handoff for the independent deadline.
+
+        Snapshot I/O is never a prerequisite for the complete report. It has
+        no holdings, raw provider exceptions, prices or allocation weights.
+        """
+        nonlocal partial_cutoff
+        if common_cutoff is not None:
+            partial_cutoff = common_cutoff
+        with suppress(Exception):
+            from ashare_lab.services.preopen_partial_report import write_preopen_partial_snapshot
+
+            write_preopen_partial_snapshot(
+                resolved_state_root,
+                report_date=report_date,
+                generated_at=(_clock or (lambda: datetime.now(_SHANGHAI)))(),
+                data_cutoff=partial_cutoff,
+                method_version=CONTINUOUS_METHOD_VERSION,
+                stage=stage,
+                missing_codes=missing_codes,
+            )
 
     def progress(stage: str, *, common_cutoff: date | None = None) -> None:
+        partial_snapshot(stage=stage, common_cutoff=common_cutoff)
         fields: dict[str, Any] = {
             "stage": stage,
             "elapsed_seconds": round(monotonic() - started_at, 3),
@@ -276,9 +300,26 @@ def run_evening_digest(
         if (
             outcome.exit_code != EXIT_OK
             and finished_at.date() == report_date
+            and _AUTOMATIC_REPORT_START <= local_time < _MANUAL_REPORT_END
+        ):
+            # Translate only fixed categories; never persist provider text.
+            missing = {
+                "verified_market_data_unavailable": "market_data_unavailable",
+                "verified_market_data_stale_for_today": "market_data_stale",
+                "verified_market_data_cutoff_not_prior_session": "market_data_unavailable",
+                "decision_date_not_latest_verified_cutoff": "market_data_stale",
+                "next_trading_day_not_verified": "calendar_unverified",
+                "daily_data_lock_busy": "screening_incomplete",
+            }.get(outcome.event.get("reason"), "submission_unconfirmed")
+            partial_snapshot(missing_codes=(missing,))
+        if (
+            outcome.exit_code != EXIT_OK
+            and finished_at.date() == report_date
             and _FINAL_AUTOMATIC_RETRY <= local_time < _AUTOMATIC_REPORT_END
         ):
             if send_now:
+                # Explicit manual catch-up retains its independent holding
+                # warning, but may never consume the scheduled 08:58 receipt.
                 _send_final_failure_notice(
                     repository=repository,
                     notifier=notifier,
@@ -289,8 +330,6 @@ def run_evening_digest(
                     holding_reviewer=_build_holding_review,
                 )
             else:
-                # Deadline notices must never wait for a second market/holding
-                # review. The independent watchdog uses this same locked receipt.
                 from ashare_lab.cli.preopen_deadline import notify_incomplete_once
 
                 def injected_notice(message):
@@ -349,17 +388,18 @@ def run_evening_digest(
 
             prior_state = _read_state(state_path)
             last_sent = _state_cutoff(prior_state)
-            current_method_matches = (
-                (
-                    _build_digest is not None
-                    or prior_state.get("method_version") == CONTINUOUS_METHOD_VERSION
-                )
-                and prior_state.get("count_policy_version") == CONTINUOUS_COUNT_POLICY_VERSION
+            # Delivery identity is the already accepted plan date + verified
+            # cutoff, not the version of code currently installed.  A method
+            # upgrade must never resend an accepted plan for the same session.
+            # Count-policy upgrades remain a deliberate rebuild boundary.
+            current_delivery_policy_matches = (
+                prior_state.get("count_policy_version") == CONTINUOUS_COUNT_POLICY_VERSION
             )
             progress("verified_cutoff")
             latest = latest_reader(resolved_overlay)
             if latest is None:
                 return finish(_error("verified_market_data_unavailable"))
+            partial_snapshot(common_cutoff=latest)
             target_date = requested_decision_date or latest
             if requested_decision_date is not None and requested_decision_date != latest:
                 return finish(
@@ -379,7 +419,7 @@ def run_evening_digest(
                 and last_sent is not None
                 and latest <= last_sent
                 and not retry_chart
-                and current_method_matches
+                and current_delivery_policy_matches
                 and _state_plan_for_date(prior_state) == report_date.isoformat()
             ):
                 return finish(
@@ -501,14 +541,14 @@ def run_evening_digest(
                 )
             text_already_accepted = (
                 last_sent == digest.common_cutoff
-                and current_method_matches
+                and current_delivery_policy_matches
                 and _state_plan_for_date(prior_state) == report_date.isoformat()
             )
             if (
                 last_sent is not None
                 and digest.common_cutoff <= last_sent
                 and not retry_chart
-                and current_method_matches
+                and current_delivery_policy_matches
                 and _state_plan_for_date(prior_state) == report_date.isoformat()
             ):
                 return finish(
@@ -558,6 +598,14 @@ def run_evening_digest(
             # Freeze the exact derived report before submitting it. Provider
             # outcomes and later maturity observations are append-only and can
             # never rewrite this recommendation snapshot.
+            with suppress(Exception):
+                from ashare_lab.services.preopen_partial_report import write_preopen_partial_digest
+
+                write_preopen_partial_digest(
+                    resolved_state_root,
+                    digest,
+                    generated_at=(_clock or (lambda: datetime.now(_SHANGHAI)))(),
+                )
             holding_identity: tuple[str, int] | None = None
             progress("holding_review", common_cutoff=digest.common_cutoff)
             current_ledger_identity: tuple[str, int] | None = None
@@ -932,7 +980,7 @@ def _send_final_failure_notice(
     It uses the same per-provider authorization guard and exposes no credentials,
     amounts or raw data. Provider errors cannot recurse into this function.
     """
-    path = state_root / "evening-failure-notice-state.json"
+    path = state_root / "manual-evening-failure-notice-state.json"
     try:
         state = _read_state(path)
         if state.get("accepted_date") == now.date().isoformat():

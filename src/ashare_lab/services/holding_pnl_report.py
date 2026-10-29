@@ -9,6 +9,7 @@ cash and whole-account profit are never disclosed by this report.
 from __future__ import annotations
 
 import json
+import sqlite3
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
@@ -23,7 +24,7 @@ from ashare_lab.services.holding_ledger import get_active_holding_portfolio
 from ashare_lab.services.intraday_stop_monitor import _corporate_clear, write_private_json
 
 CN = ZoneInfo("Asia/Shanghai")
-METHOD_VERSION = "holding-floating-pnl-v2"
+METHOD_VERSION = "holding-floating-pnl-v3"
 _CENT = Decimal("0.01")
 _FINAL_RETRY = time(15, 55)
 
@@ -35,6 +36,11 @@ class HoldingPnlRow:
     pnl_percent: Decimal | None
     pnl_amount: Decimal | None
     issues: tuple[str, ...]
+    held_natural_days: int | None = None
+    held_trading_days: int | None = None
+    average_daily_percent: Decimal | None = None
+    average_daily_amount: Decimal | None = None
+    average_issue: str | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,10 @@ class HoldingPnlReport:
     daily_amount: Decimal | None
     held_trading_days: int | None
     complete: bool
+    held_natural_days: int | None = None
+    average_daily_percent: Decimal | None = None
+    average_daily_amount: Decimal | None = None
+    average_issue: str | None = None
 
 
 def in_report_hours(now: datetime) -> bool:
@@ -170,6 +180,67 @@ def _calendar_start(_as_of: date) -> date:
     return date(1990, 1, 1)
 
 
+def _unchanged_bases(repository, portfolio) -> frozenset[str]:
+    """Verify constant current-lot cost/quantity across explicit revisions.
+
+    A position key survives quantity and cost edits. Do not divide the current
+    residual lot's gain by its original age after such edits, even if its basis
+    was later changed back. Metadata/consent-only revisions do not reset age.
+    This is a read-only check, not an inferred transaction history.
+    """
+    try:
+        with repository.connection() as connection:
+            revisions = connection.execute(
+                "SELECT id, version, effective_at FROM holding_portfolio_revisions "
+                "WHERE version <= ? ORDER BY version",
+                (portfolio.version,),
+            ).fetchall()
+            raw = connection.execute(
+                "SELECT p.revision_id, p.position_key, p.cost_price, p.metadata_json "
+                "FROM holding_positions p JOIN holding_portfolio_revisions r "
+                "ON r.id = p.revision_id WHERE r.version <= ?",
+                (portfolio.version,),
+            ).fetchall()
+        snapshots = {revision["id"]: {} for revision in revisions}
+        for row in raw:
+            metadata = json.loads(row["metadata_json"])
+            snapshots[row["revision_id"]][row["position_key"]] = (
+                _positive_decimal(row["cost_price"]),
+                metadata.get("quantity"),
+                type(metadata.get("quantity")),
+                metadata.get("quantity_user_confirmed") is True,
+            )
+        unchanged = set()
+        for holding in portfolio.positions:
+            expected = (
+                _positive_decimal(holding.cost_price),
+                holding.metadata.get("quantity"),
+                type(holding.metadata.get("quantity")),
+                holding.metadata.get("quantity_user_confirmed") is True,
+            )
+            first = next(
+                (
+                    i
+                    for i, revision in enumerate(revisions)
+                    if holding.position_key in snapshots[revision["id"]]
+                ),
+                None,
+            )
+            if first is None:
+                continue
+            start = datetime.fromisoformat(revisions[first]["effective_at"])
+            if start.tzinfo is None or start.astimezone(CN).date() > holding.entry_date:
+                continue
+            if all(
+                snapshots[revision["id"]].get(holding.position_key) == expected
+                for revision in revisions[first:]
+            ):
+                unchanged.add(holding.position_key)
+        return frozenset(unchanged)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError, sqlite3.Error):
+        return frozenset()
+
+
 def build_holding_pnl_report(
     portfolio,
     *,
@@ -179,19 +250,23 @@ def build_holding_pnl_report(
     trading_sessions: tuple[date, ...] | None = None,
     previous_session: date | None = None,
     previous_portfolio=None,
+    unchanged_bases: frozenset[str] | None = None,
 ):
     now = now.astimezone(CN)
     rows = []
     total_amount, total_cost = Decimal(0), Decimal(0)
     daily_amount, prior_value = Decimal(0), Decimal(0)
-    common_entry = max((holding.entry_date for holding in portfolio.positions), default=None)
+    entry_dates = {holding.entry_date for holding in portfolio.positions}
+    # A portfolio average requires one actual common entry period. Using the
+    # latest entry to divide earlier positions' cumulative gain overstates it.
+    common_entry = next(iter(entry_dates)) if len(entry_dates) == 1 else None
     sessions = (
         _verified_sessions(
             trading_sessions,
             start=_calendar_start(now.date()),
             end=now.date(),
         )
-        if common_entry is not None and trading_sessions is not None
+        if portfolio.positions and trading_sessions is not None
         else None
     )
     held_days = (
@@ -199,6 +274,20 @@ def build_holding_pnl_report(
         if sessions is not None and common_entry in sessions
         else None
     )
+    natural_days = (
+        (now.date() - common_entry).days + 1
+        if common_entry is not None and common_entry <= now.date()
+        else None
+    )
+    if unchanged_bases is None:
+        # A pure caller has no revision history. Only the first registration on
+        # the declared entry day is sufficient evidence by itself.
+        unchanged_bases = frozenset(
+            holding.position_key
+            for holding in portfolio.positions
+            if portfolio.version == 1
+            and portfolio.effective_at.astimezone(CN).date() == holding.entry_date
+        )
     if previous_session is None:
         previous_session = max((day for day in (sessions or ()) if day < now.date()), default=None)
     elif type(previous_session) is not date or not previous_session < now.date():
@@ -206,8 +295,7 @@ def build_holding_pnl_report(
     unchanged_since_previous_close = bool(
         previous_session is not None
         and previous_portfolio is not None
-        and (previous_portfolio.id, previous_portfolio.version)
-        == (portfolio.id, portfolio.version)
+        and (previous_portfolio.id, previous_portfolio.version) == (portfolio.id, portfolio.version)
         and portfolio.effective_at.astimezone(CN)
         <= datetime.combine(previous_session, time(15), tzinfo=CN)
         and all(holding.entry_date <= previous_session for holding in portfolio.positions)
@@ -262,12 +350,48 @@ def build_holding_pnl_report(
             if unchanged_since_previous_close:
                 daily_amount += (close - previous_close) * quantity
                 prior_value += previous_close * quantity
-        rows.append(HoldingPnlRow(holding.symbol, holding.name, percent, amount, tuple(issues)))
+        row_days = (
+            sum(day >= holding.entry_date for day in sessions)
+            if sessions is not None and holding.entry_date in sessions
+            else None
+        )
+        row_natural_days = (
+            (now.date() - holding.entry_date).days + 1 if holding.entry_date <= now.date() else None
+        )
+        average_issue = None
+        if holding.position_key not in unchanged_bases:
+            average_issue = "成本/股数历程待核验"
+        elif row_days is None:
+            average_issue = "交易日历待核验"
+        can_average = average_issue is None
+        rows.append(
+            HoldingPnlRow(
+                holding.symbol,
+                holding.name,
+                percent,
+                amount,
+                tuple(issues),
+                row_natural_days,
+                row_days,
+                percent / row_days if can_average and percent is not None else None,
+                amount / row_days if can_average and amount is not None else None,
+                average_issue,
+            )
+        )
     complete = bool(rows) and all(not row.issues for row in rows)
+    aggregate_average_issue = None
+    if common_entry is None:
+        aggregate_average_issue = "非同批建仓，日均逐股列示"
+    elif any(row.average_issue for row in rows):
+        aggregate_average_issue = "持仓历程或交易日历待核验"
+    can_average_total = complete and held_days is not None and aggregate_average_issue is None
+    total_percent = (
+        total_amount / total_cost * Decimal(100) if complete and total_cost > 0 else None
+    )
     return HoldingPnlReport(
         now.date(),
         tuple(rows),
-        total_amount / total_cost * Decimal(100) if complete and total_cost > 0 else None,
+        total_percent,
         total_amount if complete else None,
         total_cost if complete else None,
         daily_amount / prior_value * Decimal(100)
@@ -276,6 +400,10 @@ def build_holding_pnl_report(
         daily_amount if complete and unchanged_since_previous_close else None,
         held_days,
         complete,
+        natural_days,
+        total_percent / held_days if can_average_total and total_percent is not None else None,
+        total_amount / held_days if can_average_total else None,
+        aggregate_average_issue,
     )
 
 
@@ -286,13 +414,20 @@ def _signed(value: Decimal) -> str:
     return f"{rounded:+,.2f}"
 
 
-def render_holding_pnl_report(
-    report: HoldingPnlReport, *, include_principal: bool = False
-) -> str:
+def render_holding_pnl_report(report: HoldingPnlReport, *, include_principal: bool = False) -> str:
     # Server酱仅支持 Markdown；彩色 emoji、加粗和空行无需 HTML/CSS。
     sections = [f"🌷 {report.as_of:%Y-%m-%d} · 收盘"]
-    days = "待核验" if report.held_trading_days is None else f"{report.held_trading_days} 个交易日"
-    sections.append(f"⏳ 现组合共同持有：{days}")
+    days = (
+        "交易日数待核验"
+        if report.held_trading_days is None
+        else f"{report.held_trading_days} 个交易日"
+    )
+    duration = (
+        "逐股见下（非同批建仓或入场日期待核验）"
+        if report.held_natural_days is None
+        else f"{report.held_natural_days} 个自然日 ｜ {days}"
+    )
+    sections.append(f"⏳ 累计持有：{duration}")
     if include_principal:
         principal = (
             "待核验"
@@ -312,6 +447,12 @@ def render_holding_pnl_report(
     )
     sections.append(f"🩵 **当日收益（价差）**：{daily}")
     sections.append(f"💜 **累计收益（价差）**：{cumulative}")
+    average = (
+        report.average_issue or "待核验"
+        if report.average_daily_percent is None or report.average_daily_amount is None
+        else f"{_signed(report.average_daily_percent)}% ｜ {_signed(report.average_daily_amount)} 元"
+    )
+    sections.append(f"🪻 **日均收益（累计÷交易日）**：{average}")
     sections.append("🌸 持仓明细 · 累计价差")
     for row in report.rows:
         percent = "—" if row.pnl_percent is None else f"{_signed(row.pnl_percent)}%"
@@ -319,6 +460,22 @@ def render_holding_pnl_report(
         name = " ".join(str(row.name).split())[:24]
         suffix = "；" + "、".join(row.issues) if row.issues else ""
         sections.append(f"{name}：{percent} ｜ {amount}{suffix}")
+        row_duration = (
+            "持有时间待核验" if row.held_natural_days is None else f"{row.held_natural_days} 自然日"
+        )
+        row_duration += (
+            " / 交易日待核验"
+            if row.held_trading_days is None
+            else f" / {row.held_trading_days} 交易日"
+        )
+        row_average = (
+            row.average_issue or "日均待核验"
+            if row.average_daily_percent is None
+            else f"日均 {_signed(row.average_daily_percent)}%"
+        )
+        if row.average_daily_amount is not None:
+            row_average += f" · {_signed(row.average_daily_amount)} 元"
+        sections.append(f"↳ {row_duration} ｜ {row_average}")
     sections.append("🌱 数据来源：腾讯＋新浪收盘快照 · AKShare等交易日历")
     return "\n\n".join(sections)
 
@@ -455,6 +612,7 @@ def run_holding_pnl(
                 trading_sessions=sessions,
                 previous_session=previous_session,
                 previous_portfolio=previous_portfolio,
+                unchanged_bases=_unchanged_bases(repository, portfolio),
             )
         fresh = clock().astimezone(CN)
         if (report is None or not report.complete) and fresh.time() < _FINAL_RETRY:

@@ -8,7 +8,7 @@ result: an unattended daily call must not create a broken unavailable NAV chain.
 
 Each snapshot must include as_of and data_cutoff (the exact ISO close date),
 holding_revision_id and holding_version (the current explicit revision),
-mode='actual', the current CONTINUOUS_METHOD_VERSION, and a stable portfolio_id
+mode='actual', an explicit supported continuous method, and a stable portfolio_id
 identifying this continuous accounting stream, NOT a legacy cohort or changing
 holding revision. Required inputs are position_units, close_prices,
 cash_before_fees_and_dividends, fees, dividend_cash, external_flow, and evidence.
@@ -16,6 +16,8 @@ Evidence follows continuous_strategy_journal's full-interval contract and must
 explicitly contain user_confirmed=True. Units must cover exactly the current
 holding symbols. The valuation id is deterministically derived, never supplied
 by a recommendation. All numbers and private evidence remain in the local DB.
+Old streams retain their explicitly supplied method and deterministic identity;
+an entry-method upgrade never migrates an actual-account accounting stream.
 
 This version cannot produce unattended actual NAV until the caller supplies
 confirmed trades/units, full cash and fee information, verified close prices,
@@ -35,7 +37,9 @@ from uuid import NAMESPACE_URL, uuid5
 
 from ashare_lab.ports.market_data import normalize_symbol
 from ashare_lab.services.continuous_strategy_journal import (
-    CONTINUOUS_METHOD_VERSION,
+    CONTINUOUS_METHOD_VERSION as CONTINUOUS_METHOD_VERSION,
+)
+from ashare_lab.services.continuous_strategy_journal import (
     record_continuous_valuation,
 )
 from ashare_lab.services.holding_ledger import get_active_holding_portfolio
@@ -48,6 +52,18 @@ _REQUIRED = (
     "dividend_cash",
     "external_flow",
     "evidence",
+)
+
+# These are historical continuous streams, not fixed-horizon cohorts. An
+# upgrade must not stop v1-v4 bookkeeping or relabel it as current performance.
+_SUPPORTED_METHOD_VERSIONS = frozenset(
+    {
+        "continuous-signal-v1",
+        "continuous-signal-v2",
+        "continuous-signal-v3",
+        "continuous-signal-v4",
+        "continuous-signal-v5",
+    }
 )
 
 
@@ -74,7 +90,7 @@ def run_continuous_performance(repository, *, as_of: date) -> dict[str, Any]:
         valuation_id = str(
             uuid5(
                 NAMESPACE_URL,
-                f"a-share-lab:continuous-actual-valuation:{CONTINUOUS_METHOD_VERSION}:"
+                f"a-share-lab:continuous-actual-valuation:{validated['method_version']}:"
                 f"{validated['portfolio_id']}:{as_of.isoformat()}",
             )
         )
@@ -103,7 +119,7 @@ def run_continuous_performance(repository, *, as_of: date) -> dict[str, Any]:
                 dividend_cash=snapshot["dividend_cash"],
                 evidence=validated["evidence"],
                 external_flow=snapshot["external_flow"],
-                method_version=CONTINUOUS_METHOD_VERSION,
+                method_version=validated["method_version"],
             )
         ready = result["status"] == "ready"
         return _summary(
@@ -138,9 +154,11 @@ def _validate_snapshot(snapshot: Mapping, portfolio, as_of: date) -> dict[str, A
         or snapshot.get("holding_version") != portfolio.version
     ):
         raise ValueError("snapshot must match current user holding revision")
+    method_version = snapshot.get("method_version")
     if (
         snapshot.get("mode") != "actual"
-        or snapshot.get("method_version") != CONTINUOUS_METHOD_VERSION
+        or not isinstance(method_version, str)
+        or method_version not in _SUPPORTED_METHOD_VERSIONS
     ):
         raise ValueError("explicit continuous actual method required")
     portfolio_id = snapshot.get("portfolio_id")
@@ -160,6 +178,7 @@ def _validate_snapshot(snapshot: Mapping, portfolio, as_of: date) -> dict[str, A
         raise ValueError("snapshot units must cover exactly the current holding membership")
     return {
         "portfolio_id": portfolio_id,
+        "method_version": method_version,
         "position_units": units,
         "close_prices": prices,
         "evidence": {

@@ -364,24 +364,56 @@ def _cached_company_clearances(
     return cached
 
 
+def _joint_terminal_coverage_requirements(previous, reference, reports, sessions):
+    """A completed v1 trade must not cut short a still-open price reference."""
+    legacy = _terminal_coverage_requirements(previous, reports, sessions)
+    by_symbol = {}
+    for episode in reference.get("episodes", []):
+        by_symbol.setdefault(episode["symbol"], []).append(episode)
+    required_ids = {}
+    for report in reports:
+        for entry in report["entries"]:
+            required_ids.setdefault(entry["symbol"], set()).add(report["report_id"])
+    result = {}
+    for symbol, legacy_day in legacy.items():
+        episodes = by_symbol.get(symbol, [])
+        ids = {rid for episode in episodes for rid in episode.get("report_ids", [])}
+        if not episodes or ids != required_ids.get(symbol) or any(
+            episode["status"] not in {"closed", "excluded_late_publication"}
+            for episode in episodes
+        ):
+            continue
+        reference_day = max(date.fromisoformat(
+            episode["exit_date"] if episode["status"] == "closed" else episode["plan_date"]
+        ) for episode in episodes)
+        result[symbol] = max(legacy_day, reference_day)
+    return result
+
+
 def run_recommendation_tracking(
     repository, *, overlay_store, through: date, source_id=DEFAULT_MARKET_OVERLAY_SOURCE_ID,
     company_action_reader=None, run_at=None,
 ):
     """Ingest every original recommendation and replay only a verified chain."""
+    from ashare_lab.services.recommendation_reference import reference_summary, replay_reference
     from ashare_lab.services.recommendation_tracking import replay_tracking, tracking_summary
 
+    run_at = run_at or datetime.now(UTC)
     counts = ingest_published_recommendations(repository, through=through)
     with repository.connection() as connection:
         reports, _ = _accepted_reports(connection, through=through)
         previous_summary = tracking_summary(connection)
+        previous_reference = reference_summary(connection)
     symbols = sorted({entry["symbol"] for report in reports for entry in report["entries"]})
     outcome = {**counts, "status": "no_qualified_recommendations", "latest_verified_date": None}
     if not symbols:
         with repository.connection() as connection:
             outcome["replay"] = replay_tracking(
                 connection, sessions=[], bars={}, through=through, clearances={},
-                run_at=run_at or datetime.now(UTC),
+                run_at=run_at,
+            )
+            outcome["reference_replay"] = replay_reference(
+                connection, sessions=[], bars={}, through=through, clearances={}, run_at=run_at,
             )
     else:
         try:
@@ -393,14 +425,18 @@ def run_recommendation_tracking(
             if sessions:
                 clearances = _cached_company_clearances(
                     repository, symbols, sessions[-1], reader=company_action_reader,
-                    terminal_requirements=_terminal_coverage_requirements(
-                        previous_summary, reports, sessions
+                    terminal_requirements=_joint_terminal_coverage_requirements(
+                        previous_summary, previous_reference, reports, sessions
                     ),
                 )
                 with repository.connection() as connection:
                     outcome["replay"] = replay_tracking(
                         connection, sessions=sessions, bars=bars, through=sessions[-1],
-                        clearances=clearances, run_at=run_at or datetime.now(UTC),
+                        clearances=clearances, run_at=run_at,
+                    )
+                    outcome["reference_replay"] = replay_reference(
+                        connection, sessions=sessions, bars=bars, through=sessions[-1],
+                        clearances=clearances, run_at=run_at,
                     )
                 outcome["latest_verified_date"] = sessions[-1].isoformat()
                 outcome["status"] = "evaluated"
@@ -410,6 +446,7 @@ def run_recommendation_tracking(
             outcome["status"] = "evidence_or_replay_unavailable"
     with repository.connection() as connection:
         outcome["summary"] = tracking_summary(connection)
+        outcome["reference_summary"] = reference_summary(connection)
     return outcome
 
 
@@ -426,6 +463,7 @@ def main(argv=None):
     repository = SQLiteRepository(args.database, project_root() / "migrations")
     repository.initialize()
     if args.status:
+        from ashare_lab.services.recommendation_reference import reference_summary
         from ashare_lab.services.recommendation_tracking import (
             ensure_tracking_schema,
             tracking_summary,
@@ -433,6 +471,7 @@ def main(argv=None):
         with repository.connection() as connection:
             ensure_tracking_schema(connection)
             result = tracking_summary(connection)
+            result["reference_summary"] = reference_summary(connection)
     else:
         result = run_recommendation_tracking(
             repository, overlay_store=MarketOverlayStore(args.overlay_root), through=args.through,

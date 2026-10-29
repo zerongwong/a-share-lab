@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from ashare_lab.analytics.multi_timeframe import ExecutionState
 from ashare_lab.services.build_midterm_portfolio import _rank_candidates
 
 
@@ -40,3 +41,29 @@ def test_continuous_location_bonus_changes_only_continuous_ranking():
     )
     assert [row.symbol for row in ranked] == ["000002", "000001"]
     assert ranked[0].signal_score > ranked[1].signal_score
+
+
+def test_stabilized_retest_is_bounded_preference_not_breakout_exclusion():
+    breakout = _same_market_evidence("000001", 1.0)
+    retest = _same_market_evidence("000002", 1.0)
+    for row, state in ((breakout, ExecutionState.READY_BREAKOUT),
+                       (retest, ExecutionState.READY_PULLBACK)):
+        row.timeframe.execution = SimpleNamespace(state=state)
+        row.timeframe.execution_ready = True
+    rows = [breakout, retest]
+    strengths = {row.symbol: 0.7 for row in rows}
+    ranked = _rank_candidates(rows, 4, strengths, continuous_entry_policy=True)
+    assert [row.symbol for row in ranked] == ["000002", "000001"]
+    assert ranked[0].signal_score - ranked[1].signal_score == pytest.approx(0.05)
+    legacy = _rank_candidates(rows, 4, strengths)
+    assert legacy[0].signal_score == legacy[1].signal_score
+
+
+def test_unready_retest_receives_no_preference():
+    rows = [_same_market_evidence("000001", 1.0), _same_market_evidence("000002", 1.0)]
+    rows[1].timeframe.execution = SimpleNamespace(state=ExecutionState.READY_PULLBACK)
+    rows[1].timeframe.execution_ready = False
+    ranked = _rank_candidates(
+        rows, 4, {row.symbol: 0.7 for row in rows}, continuous_entry_policy=True,
+    )
+    assert ranked[0].signal_score == ranked[1].signal_score

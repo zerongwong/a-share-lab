@@ -23,6 +23,7 @@ from ashare_lab.analytics.continuous_signals import (
     CONTINUOUS_METHOD_VERSION,
     CONTINUOUS_SIGNAL_CONTRACT,
 )
+from ashare_lab.analytics.multi_timeframe import ExecutionState
 from ashare_lab.analytics.portfolio_count_policy import (
     CONTINUOUS_COUNT_POLICY_VERSION,
     MAX_CONTINUOUS_HOLDINGS,
@@ -141,6 +142,14 @@ def build_continuous_research_digest(
         "method_version": CONTINUOUS_METHOD_VERSION,
         "planned_exit_date": None,
         "signal_profile": CONTINUOUS_SIGNAL_CONTRACT.label,
+        "entry_preference_policy": "daily_stabilized_retest_5pct_score_bonus_v1",
+        "signal_policy": {
+            "weekly_role": "reject_down_or_insufficient_completed_weekly",
+            "confirmation_timeframe": "completed_daily",
+            "preferred_execution": "ready_pullback",
+            "secondary_execution": "ready_breakout",
+            "unconfirmed_retest_is_entry": False,
+        },
         "risk_observation_sessions": 20,
         "validation": "research_only_not_walk_forward_validated",
         "entries": [],
@@ -341,7 +350,7 @@ def _initial_plan(result) -> dict[str, Any]:
         elif count:
             note = f"已找到{count}只确认形态候选；买点风险、证据或组合门尚未全部通过，暂不新买。"
         else:
-            note = "本轮没有通过已完成周线突破及后续核验的股票，暂不新买。"
+            note = "本轮没有通过周线背景过滤、完整日线突破或回踩企稳及后续核验的股票，暂不新买。"
         return {
             "entries": [],
             "cash_weight": None if result.status is MidtermPortfolioStatus.DATA_NOT_READY else 1.0,
@@ -478,12 +487,17 @@ def _screening_candidates(result) -> list[dict[str, Any]]:
         else:
             reason = "个股门已通过，须结合组合与当日买价"
         pattern = candidate.timeframe.structure.state.value if candidate.timeframe else ""
+        execution = getattr(candidate.timeframe, "execution", None)
+        stabilized = (
+            getattr(candidate.timeframe, "execution_ready", False)
+            and getattr(execution, "state", None) is ExecutionState.READY_PULLBACK
+        )
         rows.append({
             "symbol": candidate.symbol,
             "name": candidate.name,
             "formation": {
                 "volume_confirmed_breakout": "确认突破",
-                "healthy_post_breakout_pullback": "健康回踩",
+                "healthy_post_breakout_pullback": "回踩企稳" if stabilized else "回踩待企稳",
             }.get(pattern, "形态待核验"),
             "reason": reason,
             "entry_qualified": False,

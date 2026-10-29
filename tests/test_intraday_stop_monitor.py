@@ -689,3 +689,187 @@ def test_worker_error_records_current_failure_and_attempts_generic_notice(env, m
     assert intraday_risk.supervise() == 2
     assert json.loads((env[1] / "last-status.json").read_text())["status"] == "monitor_worker_error"
     assert notices[0][-1] == "failure-notice"
+
+
+def _store_postclose_stop(repo, *, cutoff=ENTRY, line=9.8):
+    holding = get_active_holding_portfolio(repo).positions[0]
+    with repo.connection() as connection:
+        connection.execute(
+            """INSERT INTO holding_protective_stops
+               (position_key, symbol, entry_date, effective_stop, candidate_stop, data_cutoff,
+                source_timeframe, evidence_date, holding_version, method_version, details_json, updated_at)
+               VALUES (?, '600919', ?, ?, ?, ?, 'daily', ?, 1, 'synthetic', '{}', ?)""",
+            (
+                holding.position_key, holding.entry_date.isoformat(), line, line,
+                cutoff.isoformat(), cutoff.isoformat(), NOW.isoformat(),
+            ),
+        )
+    return holding
+
+
+def test_postclose_snapshot_confirms_structural_break_and_deduplicates_without_mutation(env):
+    holding = _store_postclose_stop(env[0])
+    before = get_active_holding_portfolio(env[0])
+    event, sent = run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.7, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert event["phase"] == "postclose"
+    assert event["accepted"] == 1 and event["delivery_confirmed"] is False
+    assert alerts(env[0], "structural_exit")[0]["confirmed"] == 1
+    assert "收盘快照确认跌破" in sent[0].body and "非交易所正式日线" in sent[0].body
+    assert sent[0].title == "A股收盘风险提醒"
+    assert get_active_holding_portfolio(env[0]) == before
+    assert env[0].get_holding_protective_stop(holding.position_key)["effective_stop"] == 9.8
+    _, again = run(
+        env, now=NOW.replace(hour=15, minute=6),
+        batches=quotes(9.7, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert not again
+
+
+@pytest.mark.parametrize("stamp", [
+    NOW.replace(hour=14, minute=59, second=59),
+    NOW.replace(day=11, hour=15, minute=0),
+    NOW.replace(hour=15, minute=6),
+])
+def test_postclose_rejects_preclose_prior_day_and_future_snapshots(env, stamp):
+    _store_postclose_stop(env[0])
+    event, sent = run(
+        env, now=NOW.replace(hour=15, minute=5), batches=quotes(9.1, now=stamp),
+    )
+    assert event["status"] == "degraded"
+    assert not alerts(env[0], "structural_exit") and not alerts(env[0], "cost_exit")
+    assert any("不能当作安全持有" in message.body for message in sent)
+
+
+@pytest.mark.parametrize("case", ["one_source", "disagree", "missing_action", "equal_line", "straddle_line"])
+def test_postclose_never_confirms_unknown_or_unbroken_structure(env, case):
+    if case == "missing_action":
+        register(env[0], clear=False)
+    _store_postclose_stop(env[0])
+    stamp = NOW.replace(hour=15, minute=0)
+    batches = quotes(9.8 if case == "equal_line" else 9.7, now=stamp)
+    if case == "one_source":
+        batches["sina"] = {}
+    elif case == "disagree":
+        batches["sina"] = quotes(10.0, now=stamp)["sina"]
+    elif case == "straddle_line":
+        batches = quotes(9.79, now=stamp)
+        batches["sina"] = quotes(9.81, now=stamp)["sina"]
+    _, sent = run(env, now=NOW.replace(hour=15, minute=5), batches=batches)
+    assert not alerts(env[0], "structural_exit") and not alerts(env[0], "cost_exit")
+    assert any("未确认退出" in message.body for message in sent)
+
+
+def test_postclose_recovers_confirmed_cost_alert_after_failed_last_minute_send(env):
+    late = NOW.replace(hour=14, minute=59)
+    run(env, now=late, batches=quotes(9.1, now=late), notifier=lambda _message: False)
+    event, sent = run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.9, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert event["accepted"] == 1
+    assert any("已触及8%" in message.body for message in sent)
+    assert alerts(env[0], "cost_exit")[0]["attempts"] == 2
+
+
+def test_postclose_low_can_catch_unobserved_cost_touch_despite_close_rebound(env):
+    _, sent = run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.9, low=9.19, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert alerts(env[0], "cost_exit")
+    assert any("已触及8%" in message.body for message in sent)
+
+
+def test_postclose_entry_day_low_before_fill_does_not_confirm_cost_exit(env):
+    register(env[0], entry=NOW.date(), effective=NOW.replace(hour=14))
+    run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.9, low=9.19, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert not alerts(env[0], "cost_exit")
+
+
+def test_postclose_structural_exit_failed_delivery_survives_next_day_rebound(env):
+    _store_postclose_stop(env[0])
+    stamp = NOW.replace(hour=15, minute=0)
+    for minute in (5, 8, 11):
+        run(
+            env, now=NOW.replace(hour=15, minute=minute), batches=quotes(9.7, now=stamp),
+            notifier=lambda _message: False,
+        )
+    event, sent = run(
+        env, now=NOW + timedelta(days=1), batches=quotes(10.0, now=NOW + timedelta(days=1)),
+    )
+    assert event["accepted"] == 1
+    assert any("收盘快照确认跌破" in message.body for message in sent)
+    assert alerts(env[0], "structural_exit")[0]["attempts"] == 4
+
+
+def test_postclose_clearance_loader_uses_eod_phase(env):
+    phases = []
+    run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.9, now=NOW.replace(hour=15, minute=0)),
+        company_action_clearance_loader=lambda *_args, **kwargs: phases.append(kwargs["phase"]) or {},
+    )
+    assert phases == ["eod"]
+
+
+def test_postclose_cannot_retroactively_use_line_derived_from_same_day_close(env):
+    _store_postclose_stop(env[0], cutoff=NOW.date())
+    run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.7, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert not alerts(env[0], "structural_exit")
+
+
+@pytest.mark.parametrize(
+    "case", ["future_cutoff", "future_knowledge", "after_quote_knowledge", "naive_knowledge"]
+)
+def test_postclose_rejects_protection_line_without_valid_knowledge_time(env, case):
+    holding = _store_postclose_stop(
+        env[0], cutoff=NOW.date() + timedelta(days=1) if case == "future_cutoff" else ENTRY,
+    )
+    if case != "future_cutoff":
+        stamp = (
+            NOW.replace(hour=16)
+            if case == "future_knowledge"
+            else NOW.replace(hour=15, minute=1)
+            if case == "after_quote_knowledge"
+            else NOW.replace(tzinfo=None)
+        )
+        with env[0].connection() as connection:
+            connection.execute(
+                "UPDATE holding_protective_stops SET updated_at=? WHERE position_key=?",
+                (stamp.isoformat(), holding.position_key),
+            )
+    event, sent = run(
+        env, now=NOW.replace(hour=15, minute=5),
+        batches=quotes(9.7, now=NOW.replace(hour=15, minute=0)),
+    )
+    assert event["status"] == "degraded" and not alerts(env[0], "structural_exit")
+    assert any("尚无已核验结构保护线" in message.body for message in sent)
+
+
+def test_postclose_structural_payload_uses_close_prices_not_intraday_lows(env):
+    import json
+
+    _store_postclose_stop(env[0])
+    stamp = NOW.replace(hour=15, minute=0)
+    data = quotes(9.7, low=9.1, now=stamp)
+    data["sina"] = quotes(9.7, low=9.3, now=stamp)["sina"]
+    run(env, now=NOW.replace(hour=15, minute=5), batches=data)
+    assert not alerts(env[0], "cost_exit")
+    payload = json.loads(alerts(env[0], "structural_exit")[0]["payload_json"])
+    assert payload["comparison"] == "close_snapshot"
+    assert payload["compared_prices"] == [9.7, 9.7]
+    assert payload["line"] == 9.8
+
+
+def test_intraday_stale_quote_rule_not_relaxed_by_postclose_path(env):
+    event, _ = run(env, batches=quotes(9.1, now=NOW - timedelta(seconds=91)))
+    assert event["status"] == "degraded" and not alerts(env[0], "cost_exit")

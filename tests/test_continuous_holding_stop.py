@@ -86,7 +86,9 @@ def _declare_tracking_mode(repository, mode):
     )
 
 
-@pytest.mark.parametrize("mode", [None, "continuous-signal-v1", "continuous-signal-v3"])
+@pytest.mark.parametrize(
+    "mode", [None, "continuous-signal-v1", "continuous-signal-v2", "continuous-signal-v3"]
+)
 def test_older_holding_declaration_preserves_daily_stop_profile(repository, mode):
     from test_review_active_holdings import _history
 
@@ -97,10 +99,11 @@ def test_older_holding_declaration_preserves_daily_stop_profile(repository, mode
     assert row.method_version.endswith("+continuous-v2")
 
 
-def test_explicit_new_v4_holding_uses_weekly_stop_not_new_entry_readmission(repository):
+@pytest.mark.parametrize("mode", ["continuous-signal-v4", "continuous-signal-v5"])
+def test_explicit_v4_v5_holding_uses_frozen_weekly_stop_not_new_entry_readmission(repository, mode):
     from test_review_active_holdings import _history
 
-    _declare_tracking_mode(repository, "continuous-signal-v4")
+    _declare_tracking_mode(repository, mode)
     row = _review(repository, _history(end=CUTOFF.isoformat()), persist=False).rows[0]
     assert row.status is HoldingReviewRowStatus.READY
     assert row.source_timeframe == "weekly_completed"
@@ -108,16 +111,34 @@ def test_explicit_new_v4_holding_uses_weekly_stop_not_new_entry_readmission(repo
     assert "signal_profile:continuous_weekly_breakout_daily_execution_v4;no_expiry" in row.reasons
 
 
-def test_retained_position_keeps_persisted_old_profile_after_declaration_version_update(repository):
+@pytest.mark.parametrize("new_mode", ["continuous-signal-v4", "continuous-signal-v5"])
+def test_retained_position_keeps_persisted_old_profile_after_declaration_version_update(
+    repository, new_mode
+):
     from test_review_active_holdings import _history
 
     _declare_tracking_mode(repository, "continuous-signal-v3")
     history = _history(end=CUTOFF.isoformat())
     first = _review(repository, history).rows[0]
-    _declare_tracking_mode(repository, "continuous-signal-v4")
+    _declare_tracking_mode(repository, new_mode)
     second = _review(repository, history).rows[0]
     assert first.position_key == second.position_key
     assert second.source_timeframe == "daily"
+    assert second.method_version == first.method_version
+    assert second.effective_stop >= first.effective_stop
+
+
+def test_retained_v4_position_keeps_weekly_profile_after_v5_entry_upgrade(repository):
+    from test_review_active_holdings import _history
+
+    assert continuous_signals.CONTINUOUS_SIGNAL_CONTRACT.structure_timeframe.value == "daily"
+    _declare_tracking_mode(repository, "continuous-signal-v4")
+    history = _history(end=CUTOFF.isoformat())
+    first = _review(repository, history).rows[0]
+    _declare_tracking_mode(repository, "continuous-signal-v5")
+    second = _review(repository, history).rows[0]
+    assert first.position_key == second.position_key
+    assert second.source_timeframe == "weekly_completed"
     assert second.method_version == first.method_version
     assert second.effective_stop >= first.effective_stop
 
@@ -228,12 +249,13 @@ def test_missing_coverage_end_does_not_allow_action_despite_valid_start(reposito
     assert repository.get_holding_protective_stop(row.position_key) is None
 
 
+@pytest.mark.parametrize("mode", [None, "continuous-signal-v4", "continuous-signal-v5"])
 def test_maturity_or_candidate_rank_never_reapplies_initial_entry_gate_to_intact_holding(
-    repository, monkeypatch
+    repository, monkeypatch, mode
 ):
-    from test_review_active_holdings import _history, _set_one
+    from test_review_active_holdings import _history
 
-    _set_one(repository, holding_weeks=52)
+    _declare_tracking_mode(repository, mode)
     monkeypatch.setattr(
         continuous_signals,
         "assess_continuous_entry",

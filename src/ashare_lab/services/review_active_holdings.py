@@ -24,9 +24,8 @@ import pandas as pd
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
 from ashare_lab.analytics.continuous_signals import (
-    CONTINUOUS_METHOD_VERSION,
-    CONTINUOUS_SIGNAL_CONTRACT,
     LEGACY_CONTINUOUS_HOLDING_CONTRACT,
+    PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT,
 )
 from ashare_lab.analytics.cost_stop import (
     COST_STOP_METHOD_VERSION,
@@ -400,16 +399,18 @@ def _review_one(
             )
         # An entry strategy upgrade is not user confirmation to reinterpret
         # an existing position.  Unversioned/v1-v3 holdings keep daily stops.
-        # Only explicit v4 declarations start the weekly protection profile.
+        # V5 changes new-entry timing only: explicit v4/v5 holdings retain the
+        # frozen v4 weekly protection profile, not the current entry contract.
         remembered_method = "" if stored is None else str(stored.get("method_version", ""))
         if remembered_method.endswith("+continuous-weekly-v4"):
-            holding_contract = CONTINUOUS_SIGNAL_CONTRACT
+            holding_contract = PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT
         elif remembered_method.endswith("+continuous-v2"):
             holding_contract = LEGACY_CONTINUOUS_HOLDING_CONTRACT
         else:
             holding_contract = (
-                CONTINUOUS_SIGNAL_CONTRACT
-                if portfolio.metadata.get("tracking_mode") == CONTINUOUS_METHOD_VERSION
+                PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT
+                if portfolio.metadata.get("tracking_mode")
+                in {"continuous-signal-v4", "continuous-signal-v5"}
                 else LEGACY_CONTINUOUS_HOLDING_CONTRACT
             )
         profile_kwargs = {"signal_contract": holding_contract} if continuous_profile else {}
@@ -578,7 +579,7 @@ def _review_one(
         ),
         method_version=(
             f"{HOLDING_TREE_METHOD_VERSION}+continuous-weekly-v4"
-            if continuous_profile and holding_contract is CONTINUOUS_SIGNAL_CONTRACT
+            if continuous_profile and holding_contract is PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT
             else f"{HOLDING_TREE_METHOD_VERSION}+continuous-v2"
             if continuous_profile
             else HOLDING_TREE_METHOD_VERSION

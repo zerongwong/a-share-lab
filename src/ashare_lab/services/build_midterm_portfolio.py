@@ -45,6 +45,7 @@ from ashare_lab.analytics.adaptive_portfolio import (
 )
 from ashare_lab.analytics.continuous_signals import (
     CONTINUOUS_SIGNAL_CONTRACT,
+    PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT,
     assess_continuous_entry,
     continuous_entry_stage_rank_score,
 )
@@ -1784,9 +1785,19 @@ def _build_horizon_price_observation_plan(
         # confirmed holding-horizon base support minus its 0.5 ATR buffer,
         # rounded down to a price tick.  The former breakout-line-minus-ATR
         # observation line is not a substitute for the actual protection.
+        # V5 changes entry confirmation, not the established weekly protective
+        # pivot. Assess that frozen profile for support/ATR only; its old entry
+        # qualification is deliberately NOT an additional candidate gate.
+        protection_timeframe = (
+            assess_multi_timeframe(
+                prepared, as_of=cutoff, holding_weeks=holding_weeks,
+                signal_contract=PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT,
+            )
+            if continuous_policy else timeframe
+        )
         protection = _candidate_stop(
             build_completed_timeframes(prepared, as_of=cutoff),
-            timeframe,
+            protection_timeframe,
             entry_date=cutoff.date(),
         )
     except (MultiTimeframeDataError, ValueError, TypeError, KeyError):
@@ -1825,13 +1836,16 @@ def _build_horizon_price_observation_plan(
         "primary_structure_reference_price": (
             None if primary_structure_line is None else round(primary_structure_line, 4)
         ),
-        "invalidation_source_timeframe": risk_source_timeframe,
+        "invalidation_source_timeframe": protection_timeframe.structure.timeframe.value,
         "reduction_review_source_timeframe": risk_source_timeframe,
         "initial_protection_support": protection.support,
         "initial_protection_atr": protection.atr14,
         "initial_protection_evidence_date": protection.evidence_date.isoformat(),
         "initial_protection_atr_cutoff": protection.atr_cutoff.isoformat(),
-        "initial_protection_method_version": HOLDING_TREE_METHOD_VERSION,
+        "initial_protection_method_version": (
+            f"{HOLDING_TREE_METHOD_VERSION}+continuous-weekly-v4"
+            if continuous_policy else HOLDING_TREE_METHOD_VERSION
+        ),
     }
     if entry_pattern is EntryPattern.HEALTHY_PULLBACK:
         reference_label = "日线执行线" if price_source_timeframe == "daily" else "期限主结构线"
@@ -1840,7 +1854,10 @@ def _build_horizon_price_observation_plan(
                 kind=ConditionalEntryPlanKind.HEALTHY_PULLBACK,
                 price_low=round(max(0.01, entry_line - 0.25 * atr), 4),
                 price_high=round(entry_line + 0.15 * atr, 4),
-                confirmation_rule=f"回踩{reference_label}附近且完整日线未失效",
+                confirmation_rule=(
+                    "日线突破后已回踩企稳；仅在计划区间复核，关键位失守不买"
+                    if continuous_policy else f"回踩{reference_label}附近且完整日线未失效"
+                ),
                 **common,
             ), continuous_policy=continuous_policy,
         )
@@ -1853,7 +1870,7 @@ def _build_horizon_price_observation_plan(
                     float(prepared.iloc[-1]["close"]) if continuous_policy else None
                 ),
                 confirmation_rule=(
-                    "已完成周线确认突破；日线维持关键位，次日不高于已验证收盘价追买"
+                    "周线背景未明显不利，完整日线已确认突破；次日守住关键位且不追价"
                     if continuous_policy else "完整日线收盘重新站回期限执行线"
                 ),
                 **common,
@@ -2132,9 +2149,17 @@ def _rank_candidates(
         # adding the term unconditionally would silently dilute their score.
         formation_score = 0.55 * row.timeframe.score
         if continuous_entry_policy:
+            execution = getattr(row.timeframe, "execution", None)
+            stabilized_pullback = (
+                getattr(row.timeframe, "execution_ready", False)
+                and getattr(execution, "state", None) is ExecutionState.READY_PULLBACK
+            )
             formation_score = (
-                0.50 * row.timeframe.score
+                0.45 * row.timeframe.score
                 + 0.05 * percentiles["early_location_preference"][index]
+                # Bounded preference, never permission or a forecast. Only an
+                # already admitted, completed-daily stabilized retest gets it.
+                + 0.05 * float(stabilized_pullback)
             )
         signal = (
             formation_score

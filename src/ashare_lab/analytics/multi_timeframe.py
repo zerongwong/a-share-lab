@@ -3,8 +3,8 @@
 The module separates three questions that must not be collapsed into one daily
 breakout score:
 
-* the slower, completed-bar timeframe decides the primary direction;
-* the holding-period-specific middle timeframe describes the base/breakout;
+* the slower, completed-bar timeframe provides the directional background;
+* the contract-specific structure timeframe describes the base/breakout;
 * complete daily bars provide the execution state for every horizon.
 
 Weekly and monthly bars are formed only after their period is complete.  A
@@ -100,10 +100,13 @@ class HorizonContract:
     daily_anchor_sessions: int
     relative_strength_sessions: int
     minimum_daily_sessions: int
-    # Opt-in continuous policy: daily execution must respect an independently
-    # confirmed higher-timeframe breakout, not demand a second daily breakout.
+    # Opt-in continuous policy: daily execution must respect the same confirmed
+    # structure breakout, not independently demand a different breakout line.
     # Legacy six-horizon behavior stays unchanged when false.
     execution_uses_structure: bool = False
+    # V5 opt-ins.  Defaults preserve the six horizon and frozen v4 contracts.
+    slow_direction_filter_only: bool = False
+    require_stabilized_retest: bool = False
 
     @property
     def audit_signature(self) -> tuple[object, ...]:
@@ -124,6 +127,8 @@ class HorizonContract:
             self.relative_strength_sessions,
             self.minimum_daily_sessions,
             self.execution_uses_structure,
+            self.slow_direction_filter_only,
+            self.require_stabilized_retest,
         )
 
 
@@ -751,10 +756,16 @@ def _assess_direction(
         direction = TrendDirection.MIXED
         score = 0.42 if latest >= slow_average else 0.25
         reasons = ("slow_timeframe_average_order_is_mixed",)
+    if contract.slow_direction_filter_only:
+        reasons = (*reasons, "weekly_background_filter_rejects_down_or_insufficient")
     return DirectionAssessment(
         timeframe=contract.slow_timeframe,
         direction=direction,
-        qualified=direction is TrendDirection.UP,
+        qualified=(
+            direction in {TrendDirection.UP, TrendDirection.MIXED}
+            if contract.slow_direction_filter_only
+            else direction is TrendDirection.UP
+        ),
         bars_available=available,
         bars_required=required,
         latest_close=latest,
@@ -1052,15 +1063,19 @@ def _assess_structure_execution(
     structure: StructureAssessment,
     contract: HorizonContract,
 ) -> ExecutionAssessment:
-    """Use complete daily bars to execute an already-confirmed weekly setup.
+    """Execute the same independently confirmed structure, never another line.
 
-    This opt-in path does not rediscover the base on daily bars.  Its reference
-    is the confirmed weekly breakout line and its event clock starts only at
-    the close of the confirming weekly bar.  A later daily floor breach cannot
+    V5 delegates to the daily-structure path below.  The frozen v4 path does
+    not rediscover the base on daily bars: its reference is the confirmed
+    weekly breakout line and its event clock starts only at the close of the
+    confirming weekly bar.  A later daily floor breach cannot
     be erased by an intraday recovery or a new daily breakout.  The existing
     two-percent retest tolerance and 15-percent daily-average extension guard
     are retained as research defaults, not newly calibrated parameters.
     """
+
+    if contract.require_stabilized_retest:
+        return _assess_daily_structure_execution(daily, structure, contract)
 
     minimum = contract.execution_ma_sessions
     line = structure.breakout_line
@@ -1152,6 +1167,106 @@ def _assess_structure_execution(
         latest_retest_touched=touched,
         latest_retest_reclaimed=reclaimed,
         reference_timeframe=structure.timeframe,
+    )
+
+
+def _assess_daily_structure_execution(
+    daily: pd.DataFrame,
+    structure: StructureAssessment,
+    contract: HorizonContract,
+) -> ExecutionAssessment:
+    """V5 daily confirmation of the daily breakout's own support area.
+
+    Stabilization is a frozen mechanical research definition: after a real
+    breakout, the subsequent path holds the existing two-percent floor, the
+    current complete bar touches the support neighbourhood and closes at/above
+    the line, its open and the prior close.  A declining retest is WAIT, never
+    silently reclassified as a ready breakout.  This does not assert that one
+    such candle predicts a reversal or guarantees a profitable entry.
+    """
+
+    minimum = contract.execution_ma_sessions
+    line = structure.breakout_line
+    latest = daily.iloc[-1]
+    latest_close = float(latest["close"])
+    average = float(daily["close"].tail(minimum).mean()) if len(daily) >= minimum else None
+    distance = None if average is None else latest_close / average - 1.0
+    activity = _activity_series(daily)
+    ratio = None
+    if activity is not None and len(activity) > minimum:
+        reference = float(activity.iloc[-minimum - 1 : -1].median())
+        if reference > 0:
+            ratio = float(activity.iloc[-1]) / reference
+    since = structure.days_or_bars_since_breakout
+    valid_structure = bool(
+        contract.structure_timeframe is BarTimeframe.DAILY
+        and structure.timeframe is BarTimeframe.DAILY
+        and structure.qualified
+        and structure.state in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}
+        and structure.base_qualified_at_breakout is True
+        and line is not None
+        and isfinite(line)
+        and line > 0
+        and since is not None
+    )
+    ready = False
+    if average is None:
+        state, score = ExecutionState.INSUFFICIENT, 0.0
+        reasons = (f"minimum_{minimum}_complete_daily_sessions_required",)
+    elif latest_close < average * 0.97:
+        state, score = ExecutionState.FAILED, 0.05
+        reasons = ("latest_close_below_execution_average_by_more_than_3pct",)
+    elif distance > 0.15:
+        state, score = ExecutionState.EXTENDED, 0.15
+        reasons = ("latest_close_more_than_15pct_above_execution_average",)
+    elif structure.post_breakout_floor_held is False:
+        state, score = ExecutionState.WAIT_RECLAIM, 0.30
+        reasons = ("post_daily_breakout_path_breached_2pct_floor",)
+    elif not valid_structure:
+        state, score = ExecutionState.WAIT_CONFIRMATION, 0.0
+        reasons = ("completed_daily_base_breakout_or_healthy_retest_not_confirmed",)
+    elif structure.state is StructureState.BREAKOUT and since == 0:
+        state, ready, score = ExecutionState.READY_BREAKOUT, True, 0.90
+        reasons = (
+            "completed_daily_base_breakout_confirmed",
+            "execution_references_same_daily_structure",
+            "new_breakout_secondary_to_stabilized_pullback",
+        )
+    elif (
+        since > 0
+        and structure.post_breakout_floor_held is True
+        and structure.latest_retest_touched
+        and structure.latest_retest_reclaimed
+        and latest_close >= float(latest["open"])
+        and len(daily) > 1
+        and latest_close >= float(daily.iloc[-2]["close"])
+    ):
+        state, ready, score = ExecutionState.READY_PULLBACK, True, 0.95
+        reasons = (
+            "completed_daily_base_breakout_confirmed",
+            "entire_post_breakout_path_holds_2pct_floor",
+            "daily_retest_touches_support_and_reclaims",
+            "daily_close_not_below_open_or_previous_close",
+            "stabilization_is_mechanical_research_definition",
+        )
+    else:
+        state, score = ExecutionState.WAIT_CONFIRMATION, 0.42
+        reasons = ("daily_retest_not_yet_stabilized_do_not_buy_while_falling",)
+    return ExecutionAssessment(
+        state=state,
+        ready=ready,
+        breakout_line=line,
+        sessions_since_breakout=since,
+        activity_ratio=ratio,
+        moving_average=average,
+        distance_to_average=distance,
+        score=score,
+        reasons=reasons,
+        base_qualified_at_breakout=structure.base_qualified_at_breakout,
+        post_breakout_floor_held=structure.post_breakout_floor_held,
+        latest_retest_touched=structure.latest_retest_touched,
+        latest_retest_reclaimed=structure.latest_retest_reclaimed,
+        reference_timeframe=BarTimeframe.DAILY,
     )
 
 

@@ -6,6 +6,8 @@ import os
 import plistlib
 from pathlib import Path
 
+from ashare_lab.cli.scheduled_tick import JOB_MODULES, SLOT_WINDOWS, TICK_MODULE, TICK_SECONDS
+
 EVENING_REPORT_LAUNCHAGENT_LABEL = "com.zerong.asharelab.evening-report"
 EVENING_REPORT_MODULE = "ashare_lab.cli.evening_report"
 PREOPEN_DEADLINE_LAUNCHAGENT_LABEL = "com.zerong.asharelab.preopen-deadline"
@@ -98,12 +100,17 @@ def _render_launchagent(
     interpreter = os.path.abspath(os.fspath(Path(python_bin).expanduser()))
     working_directory = str(Path(project_root).expanduser().resolve())
     document = plistlib.loads(source.read_bytes())
+    job = label.removeprefix("com.zerong.asharelab.")
     if not isinstance(document, dict) or document.get("Label") != label:
         raise ValueError("pre-open LaunchAgent template has an unexpected label")
+    if JOB_MODULES.get(job) != module or {
+        row["Hour"] * 60 + row["Minute"] for row in schedule
+    } != {start for start, _ in SLOT_WINDOWS[job]}:
+        raise ValueError("scheduled tick does not match the approved report slots")
     if "KeepAlive" in document:
         raise ValueError("evening report LaunchAgent must not contain KeepAlive")
-    if document.get("StartCalendarInterval") != schedule:
-        raise ValueError("pre-open LaunchAgent template has an unexpected weekday schedule")
+    if "StartCalendarInterval" in document or document.get("StartInterval") != TICK_SECONDS:
+        raise ValueError("pre-open LaunchAgent must use the timezone-independent tick")
     if document.get("RunAtLoad") is not True:
         raise ValueError("pre-open LaunchAgent must use RunAtLoad")
     # This deadline-sensitive computation reads the complete local market.
@@ -117,7 +124,9 @@ def _render_launchagent(
         "-i",
         interpreter,
         "-m",
-        module,
+        TICK_MODULE,
+        "--job",
+        job,
     ]
     document["WorkingDirectory"] = working_directory
     destination.write_bytes(plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False))

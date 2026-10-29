@@ -27,6 +27,7 @@ from ashare_lab.services.continuous_strategy_journal import _savepoint
 
 TRACKING_START = date(2026, 10, 8)
 TRACKING_METHOD = "recommendation-lifecycle-v1"
+VERSION_ISOLATED_TRACKING_METHOD = "recommendation-lifecycle-v2-method-isolated"
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 _ACTIVE = {
     "awaiting_confirmation", "pending_entry", "open", "pending_exit",
@@ -104,6 +105,9 @@ def ingest_report(connection: sqlite3.Connection, *, report_id: str, plan_date: 
         if len(symbol) != 6 or not symbol.isdecimal():
             raise ValueError("invalid public stock code")
         copied = json.loads(_json(entry))
+        rule = copied.get("entry_rule")
+        if isinstance(rule, dict) and rule.get("signal_method_version") not in (None, method_version):
+            raise ValueError("recommendation method conflicts with archived entry rule")
         if symbol in unique and unique[symbol] != copied:
             raise ValueError("conflicting same-report recommendations")
         unique[symbol] = copied
@@ -383,12 +387,17 @@ def replay_tracking(connection: sqlite3.Connection, *, sessions: list[date],
     ensure_tracking_schema(connection)
     reports = _reports(connection)
     usable = [r for r in reports if date.fromisoformat(r["plan_date"]) <= through]
+    # Preserve old observation hashes/semantics. Once V5 appears, version the
+    # replay and isolate strategy cohorts; never attribute a new method to an
+    # already-open legacy episode. Archived reports and old runs stay immutable.
+    isolate_methods = any(r["method_version"] == "continuous-signal-v5" for r in usable)
+    replay_method = VERSION_ISOLATED_TRACKING_METHOD if isolate_methods else TRACKING_METHOD
     by_day: dict[date, list[tuple[dict, dict]]] = {}
     for report in usable:
         for entry in report["entries"]:
             by_day.setdefault(date.fromisoformat(report["plan_date"]), []).append((report, entry))
     episodes: list[dict] = []
-    active: dict[str, dict] = {}
+    active: dict[tuple[str, str], dict] = {}
     for day in sorted(set(sessions) | set(by_day)):
         # Resolve a previously scheduled next-open fill/exit before linking
         # today's recommendation. Otherwise an expired old buy cap or an exit
@@ -401,7 +410,8 @@ def replay_tracking(connection: sqlite3.Connection, *, sessions: list[date],
                           clearances.get(episode["symbol"], {}), sessions)
                     processed.add(episode["episode_id"])
         for report, entry in by_day.get(day, []):
-            old = active.get(entry["symbol"])
+            key = (report["method_version"] if isolate_methods else "legacy", entry["symbol"])
+            old = active.get(key)
             blocked_before_entry = old and old["entry_price"] is None and old["status"] in {
                 "evidence_missing", "corporate_action_review_required",
             }
@@ -412,7 +422,7 @@ def replay_tracking(connection: sqlite3.Connection, *, sessions: list[date],
                 continue
             new = _new_episode(report, entry)
             episodes.append(new)
-            active[entry["symbol"]] = new
+            active[key] = new
             if day not in sessions:
                 new.update(status="evidence_missing", reason="plan_session_calendar_unverified")
         if day in sessions:
@@ -438,11 +448,24 @@ def replay_tracking(connection: sqlite3.Connection, *, sessions: list[date],
         "research_flags": (["inspect_gap_or_liquidity_losses"]
                            if any(r < -0.080001 for r in returns) else []),
     }
+    if isolate_methods:
+        methods = sorted({e["recommendation_method"] for e in episodes})
+        diagnostics["by_recommendation_method"] = {
+            method: {
+                "status_counts": dict(Counter(e["status"] for e in episodes
+                                              if e["recommendation_method"] == method)),
+                "completed_trades": sum(e["recommendation_method"] == method for e in closed),
+            } for method in methods
+        }
+        if len(methods) > 1:
+            diagnostics["closed_trade_mean_return"] = None
+            diagnostics["review_status"] = "separate_method_cohorts_not_a_pooled_comparison"
+    active_symbols = {episode["symbol"] for episode in active.values()}
     relevant = {s: {d.isoformat(): bar for d, bar in sorted(history.items()) if d <= through}
-                for s, history in sorted(bars.items()) if s in active}
+                for s, history in sorted(bars.items()) if s in active_symbols}
     input_hash = _hash(_json({"reports": usable, "sessions": [d.isoformat() for d in sessions],
                              "bars": relevant, "clearances": clearances}))
-    result = {"method_version": TRACKING_METHOD, "through": through.isoformat(),
+    result = {"method_version": replay_method, "through": through.isoformat(),
               "reports": len(usable), "mentions": sum(len(r["entries"]) for r in usable),
               "zero_entry_reports": sum(not r["entries"] for r in usable),
               "episodes": episodes, "diagnostics": diagnostics,
@@ -451,7 +474,7 @@ def replay_tracking(connection: sqlite3.Connection, *, sessions: list[date],
               "input_hash": input_hash}
     encoded = _json(result)
     result_hash = _hash(encoded)
-    run_hash = _hash(TRACKING_METHOD + through.isoformat() + input_hash)
+    run_hash = _hash(replay_method + through.isoformat() + input_hash)
     with _savepoint(connection):
         old = connection.execute("SELECT result_hash FROM tracking_runs WHERE run_hash=?",
                                  (run_hash,)).fetchone()

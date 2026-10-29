@@ -586,6 +586,40 @@ def test_first_provider_acceptance_writes_state_and_second_run_is_noop(tmp_path:
     assert all(row["detail_json"]["orders_enabled"] is False for row in delivery)
 
 
+def test_method_upgrade_does_not_resend_an_accepted_plan_for_same_session(
+    tmp_path: Path,
+) -> None:
+    assert CONTINUOUS_METHOD_VERSION == "continuous-signal-v5"
+    state_path = tmp_path / "state" / "evening-digest-state.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_provider_accepted_common_cutoff": CUTOFF.isoformat(),
+                "plan_for_date": FRIDAY.isoformat(),
+                "method_version": "continuous-signal-v4",
+                "count_policy_version": CONTINUOUS_COUNT_POLICY_VERSION,
+                "accepted_channels": ["serverchan"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    outcome = evening_report.run_evening_digest(
+        **_paths(tmp_path),
+        _latest_cutoff=lambda _root: CUTOFF,
+        _notifier=lambda _message: pytest.fail("accepted plan must not be resent"),
+    )
+
+    assert outcome.exit_code == evening_report.EXIT_OK
+    assert outcome.event == {
+        "job": "ashare-evening-digest",
+        "status": "noop_no_new_trading_day",
+        "common_cutoff": CUTOFF.isoformat(),
+        "plan_for_date": FRIDAY.isoformat(),
+    }
+
+
 def test_failed_chart_retries_only_image_with_fresh_publication_and_then_deduplicates(tmp_path):
     repository = _recommendation_repository(tmp_path)
     portfolio = _register_four_holding_channels(repository)
@@ -2255,7 +2289,7 @@ def test_held_account_morning_also_builds_independent_market_model(tmp_path, mon
     assert get_active_holding_portfolio(repository).id == portfolio.id
 
 
-def test_automatic_final_failure_does_not_wait_for_holding_analysis(tmp_path):
+def test_automatic_failure_leaves_partial_snapshot_for_fixed_deadline(tmp_path):
     from ashare_lab.cli import evening_digest
 
     options = _paths(tmp_path)
@@ -2277,9 +2311,77 @@ def test_automatic_final_failure_does_not_wait_for_holding_analysis(tmp_path):
         _notifier=lambda message: messages.append(message) or _accepted_summary(),
     )
     assert result.exit_code == evening_digest.EXIT_ERROR
+    # 08:50 is a build retry, not the fixed 08:58 partial-report deadline.
+    assert messages == []
+    assert not (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    snapshot = json.loads((tmp_path / "state" / "preopen-partial-snapshot.json").read_text())
+    assert snapshot["data_cutoff"] == CUTOFF.isoformat()
+    assert snapshot["plan_for_date"] == FRIDAY.isoformat()
+    assert snapshot["method_version"] == CONTINUOUS_METHOD_VERSION
+    assert "submission_unconfirmed" in snapshot["missing_codes"]
+
+
+def test_stale_market_keeps_cutoff_for_deadline_without_fabricating_candidates(tmp_path):
+    from ashare_lab.cli import preopen_deadline
+
+    options = _paths(tmp_path)
+    options["_clock"] = lambda: datetime(2026, 8, 28, 0, 50, tzinfo=UTC)
+    stale = date(2026, 8, 25)
+    result = evening_report.run_evening_digest(
+        **options,
+        _latest_cutoff=lambda _: stale,
+        _next_trading_day=lambda _: date(2026, 8, 26),
+        _build_digest=lambda **_: pytest.fail("stale data must not build a buy plan"),
+        _notifier=lambda _: pytest.fail("do not send an early generic failure"),
+    )
+    assert result.event["reason"] == "verified_market_data_stale_for_today"
+    messages = []
+    preopen_deadline.run_preopen_deadline(
+        state_root=tmp_path / "state",
+        clock=lambda: datetime(2026, 8, 28, 0, 58, tzinfo=UTC),
+        notifier=lambda message: messages.append(message) or True,
+    )
     assert len(messages) == 1
-    assert "不是荐股结论" in messages[0].body
-    assert (tmp_path / "state" / "evening-failure-notice-state.json").exists()
+    assert stale.isoformat() in messages[0].body
+    assert "行情尚未追平" in messages[0].body
+    assert "不等于市场没有机会" in messages[0].body
+    assert "交易日核验尚未完成" in messages[0].body
+
+
+def test_deadline_snapshot_survives_later_failure_and_strips_private_plan_fields(tmp_path):
+    from ashare_lab.cli import evening_digest, preopen_deadline
+
+    digest = _digest()
+    plan = dict(digest.continuous_plan)
+    plan["screening_candidates"] = [{
+        "name": "合成候选", "symbol": "600999", "formation": "回踩企稳",
+        "reason": "财务证据不足", "cost": 987654.32, "account_weight": 0.20,
+    }]
+    now = datetime(2026, 8, 28, 0, 50, tzinfo=UTC)
+    options = {**_paths(tmp_path), "_clock": lambda: now}
+    result = evening_digest.run_evening_digest(
+        **options,
+        _build_digest=lambda **_: replace(digest, continuous_plan=plan),
+        _latest_cutoff=lambda _: CUTOFF,
+        _next_trading_day=lambda _: FRIDAY,
+        _archive_digest=lambda **_: (_ for _ in ()).throw(RuntimeError("private archive failed")),
+        _notifier=lambda _: pytest.fail("failed archive must not submit a complete report"),
+    )
+    assert result.exit_code != evening_digest.EXIT_OK
+    messages = []
+    preopen_deadline.run_preopen_deadline(
+        state_root=tmp_path / "state",
+        clock=lambda: datetime(2026, 8, 28, 0, 58, tzinfo=UTC),
+        notifier=lambda message: messages.append(message) or True,
+    )
+    assert len(messages) == 1
+    assert "合成候选" in messages[0].body
+    assert "仅观察" in messages[0].body
+    assert "基本面证据仍需核验" in messages[0].body
+    assert "987654" not in messages[0].body
+    assert "600999" not in messages[0].body
+    assert "20%" not in messages[0].body
+    assert "private archive" not in messages[0].body
 
 
 def test_provider_receipt_is_saved_before_database_bookkeeping(tmp_path, monkeypatch):

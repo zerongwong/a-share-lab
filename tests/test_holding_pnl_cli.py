@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import signal
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -323,7 +323,7 @@ def test_public_recent_calendar_request_and_cache_extend_without_holding_dates(
     observations = [
         (date(2026, 9, 21), date(2026, 9, 22)),
         (date(2026, 9, 21), date(2026, 9, 22), date(2026, 9, 23)),
-        (date(2026, 9, 23), date(2026, 10, 6)),
+        (date(2026, 9, 21), date(2026, 9, 22), date(2026, 9, 23), date(2026, 10, 6)),
     ]
 
     def calendar(_self, start, end):
@@ -338,9 +338,9 @@ def test_public_recent_calendar_request_and_cache_extend_without_holding_dates(
         old_holding_date, date(2026, 10, 6), state_root=tmp_path
     )
     assert calls == [
-        (date(2026, 9, 9), date(2026, 9, 22)),
-        (date(2026, 9, 10), date(2026, 9, 23)),
-        (date(2026, 9, 23), date(2026, 10, 6)),
+        (date(2026, 6, 25), date(2026, 9, 22)),
+        (date(2026, 6, 26), date(2026, 9, 23)),
+        (date(2026, 7, 9), date(2026, 10, 6)),
     ]
     assert sessions == (
         date(2026, 9, 21),
@@ -350,7 +350,7 @@ def test_public_recent_calendar_request_and_cache_extend_without_holding_dates(
     )
     path = tmp_path / "verified-trading-sessions.json"
     cache = json.loads(path.read_text())
-    assert cache["verified_start"] == "2026-09-09"
+    assert cache["verified_start"] == "2026-06-25"
     assert cache["verified_end"] == "2026-10-06"
     assert "2024-01-01" not in path.read_text()
     assert path.stat().st_mode & 0o777 == 0o600
@@ -366,7 +366,7 @@ def test_calendar_cache_gap_resets_instead_of_counting_unverified_days(monkeypat
         lambda *_args, **_kwargs: (_ for _ in ()).throw(DataUnavailableError("synthetic")),
     )
 
-    observations = [(date(2026, 9, 22),), (date(2026, 10, 22),)]
+    observations = [(date(2026, 9, 22),), (date(2026, 12, 23),)]
     monkeypatch.setattr(
         BoundedBaoStockEod,
         "fetch_cn_trading_days",
@@ -374,11 +374,11 @@ def test_calendar_cache_gap_resets_instead_of_counting_unverified_days(monkeypat
     )
     cli._load_trading_sessions(date(1990, 1, 1), date(2026, 9, 22), state_root=tmp_path)
     sessions = cli._load_trading_sessions(
-        date(1990, 1, 1), date(2026, 10, 22), state_root=tmp_path
+        date(1990, 1, 1), date(2026, 12, 23), state_root=tmp_path
     )
-    assert sessions == (date(2026, 10, 22),)
+    assert sessions == (date(2026, 12, 23),)
     cache = json.loads((tmp_path / "verified-trading-sessions.json").read_text())
-    assert cache["verified_start"] == "2026-10-09"
+    assert cache["verified_start"] == "2026-09-25"
 
 
 def test_calendar_cache_reuses_same_day_verified_response(monkeypatch, tmp_path):
@@ -405,6 +405,60 @@ def test_calendar_cache_reuses_same_day_verified_response(monkeypatch, tmp_path)
         date(1990, 1, 1), date(2026, 9, 22), state_root=tmp_path
     )
     assert first == second == (date(2026, 9, 21), date(2026, 9, 22))
+    assert calls == [1]
+
+
+def test_same_day_old_fourteen_day_cache_is_expanded_to_fixed_ninety_day_window(
+    monkeypatch, tmp_path
+):
+    end = date(2026, 10, 14)
+    old_sessions = tuple(date(2026, 10, day) for day in (8, 9, 12, 13, 14))
+    cli._cache_trading_sessions(tmp_path, end - timedelta(days=13), end, old_sessions)
+    fresh = (date(2026, 9, 23), date(2026, 9, 24), date(2026, 9, 25), *old_sessions)
+    calls = []
+
+    def child(action, start, finish, *, timeout):
+        calls.append((action, start, finish, timeout))
+        return fresh
+
+    monkeypatch.setattr(cli, "_bounded_calendar_child", child)
+    result = cli._load_trading_sessions(date(2026, 9, 23), end, state_root=tmp_path)
+    assert result == fresh
+    assert calls == [("calendar-range-akshare", date(2026, 7, 17), end, 6.0)]
+    assert cli._read_session_cache(tmp_path) == (date(2026, 7, 17), end, fresh)
+    assert cli._load_trading_sessions(date(2020, 1, 1), end, state_root=tmp_path) == fresh
+    assert len(calls) == 1
+
+
+def test_same_day_short_cache_upgrade_preserves_conflict_fail_closed(monkeypatch, tmp_path):
+    from ashare_lab.domain.errors import DataQualityError
+
+    end = date(2026, 10, 14)
+    cli._cache_trading_sessions(
+        tmp_path, end - timedelta(days=13), end, (date(2026, 10, 13), end)
+    )
+    path = tmp_path / "verified-trading-sessions.json"
+    before = path.read_text()
+    monkeypatch.setattr(cli, "_bounded_calendar_child", lambda *_args, **_kwargs: (end,))
+    with pytest.raises(DataQualityError, match="冲突"):
+        cli._load_trading_sessions(date(2026, 9, 23), end, state_root=tmp_path)
+    assert path.read_text() == before
+
+
+def test_akshare_calendar_accepts_ninety_days_but_rejects_larger_window(monkeypatch):
+    import akshare as ak
+    import pandas as pd
+
+    from ashare_lab.domain.errors import DataUnavailableError
+
+    end = date(2026, 10, 14)
+    calls = []
+    frame = pd.DataFrame({"trade_date": pd.date_range("1990-01-01", end, freq="B").date})
+    monkeypatch.setattr(ak, "tool_trade_date_hist_sina", lambda: calls.append(1) or frame)
+    sessions = cli._akshare_trading_sessions(end - timedelta(days=89), end)
+    assert sessions[0] == date(2026, 7, 17) and sessions[-1] == end
+    with pytest.raises(DataUnavailableError, match="请求区间"):
+        cli._akshare_trading_sessions(end - timedelta(days=90), end)
     assert calls == [1]
 
 

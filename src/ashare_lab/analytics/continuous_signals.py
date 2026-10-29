@@ -1,7 +1,7 @@
 """Frozen entry/monitoring profile, independent from an intended exit date.
 
 The numerical rules are conservative research hypotheses, not a validated
-predictor of a future 'main wave'.  Weekly structure and daily execution are
+predictor of a future 'main wave'.  Weekly background and daily structure are
 explicitly frozen observation windows; no expiry exists.
 An entry gate must never be reapplied to an intact existing holding.
 """
@@ -19,10 +19,13 @@ from ashare_lab.analytics.multi_timeframe import (
     HorizonContract,
     MultiTimeframeAssessment,
     StructureState,
+    TrendDirection,
 )
 
-CONTINUOUS_METHOD_VERSION = "continuous-signal-v4"
-CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
+CONTINUOUS_METHOD_VERSION = "continuous-signal-v5"
+# Frozen v4 profile: strategy upgrades must not reinterpret old holdings or
+# alter the comparison baseline used by research replays.
+PREVIOUS_CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
     4,  # legacy transport discriminator ONLY; not a holding deadline
     "continuous_weekly_breakout_daily_execution_v4",
     BarTimeframe.WEEKLY,
@@ -40,6 +43,27 @@ CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
     20,
     140,
     execution_uses_structure=True,
+)
+CONTINUOUS_SIGNAL_CONTRACT = HorizonContract(
+    4,  # transport discriminator ONLY, never a holding deadline
+    "continuous_weekly_filter_daily_breakout_pullback_v5",
+    BarTimeframe.WEEKLY,
+    8,
+    26,
+    BarTimeframe.DAILY,
+    60,
+    10,
+    30,
+    0.18,
+    60,
+    10,
+    20,
+    60,
+    20,
+    140,
+    execution_uses_structure=True,
+    slow_direction_filter_only=True,
+    require_stabilized_retest=True,
 )
 RISK_OBSERVATION_SESSIONS = 20
 
@@ -78,11 +102,10 @@ def assess_continuous_entry(
 ) -> ContinuousEntryAdmission:
     """Require completed breakout evidence while rejecting weak or late stages.
 
-    V4 admits a range/base reversal only when completed weekly bars prove both
-    upward direction and a base breakout or healthy retest.  Daily bars assess
-    the buying location and whether that weekly structure remains intact; they
-    cannot manufacture a missing weekly breakout.  Early and orderly uptrends
-    are also admitted.
+    V5 uses completed weekly bars to reject a clearly adverse or unavailable
+    background, not to demand a weekly breakout.  A mixed weekly background
+    remains mixed, never relabelled as UP.  Complete daily bars must establish
+    the base breakout and executable new breakout or stabilized retest.
     Location is therefore a ranking preference rather than an eligibility
     veto.  Downtrends, insufficient history, extended/parabolic formations and
     explicitly frozen formations remain ineligible.
@@ -110,18 +133,19 @@ def assess_continuous_entry(
         reasons.append("entry_extension_exceeds_existing_limits")
     if (
         not timeframe.candidate_qualified
-        or timeframe.structure.timeframe is not BarTimeframe.WEEKLY
+        or timeframe.structure.timeframe is not BarTimeframe.DAILY
         or timeframe.slow_direction.timeframe is not BarTimeframe.WEEKLY
         or not timeframe.slow_direction.qualified
+        or timeframe.slow_direction.direction not in {TrendDirection.UP, TrendDirection.MIXED}
     ):
-        reasons.append("completed_weekly_direction_and_structure_not_qualified")
+        reasons.append("completed_weekly_filter_and_daily_structure_not_qualified")
     if timeframe.structure.state not in {StructureState.BREAKOUT, StructureState.HEALTHY_PULLBACK}:
         reasons.append("confirmed_base_breakout_or_healthy_retest_required")
     if not timeframe.execution_ready or timeframe.execution.state not in {
         ExecutionState.READY_BREAKOUT,
         ExecutionState.READY_PULLBACK,
     }:
-        reasons.append("daily_execution_of_confirmed_weekly_structure_required")
+        reasons.append("daily_execution_of_confirmed_daily_structure_required")
     return ContinuousEntryAdmission(not reasons, tuple(reasons))
 
 
@@ -131,7 +155,7 @@ def continuous_entry_stage_rank_score(stage: MediumTermStageAssessment) -> float
     if stage.stage is MediumTermStage.EARLY_UPTREND and not stage.hard_freeze_new_entry:
         return 1.0
     if stage.stage is MediumTermStage.RANGE and not stage.hard_freeze_new_entry:
-        # The separate contract has already proved a weekly confirmed breakout;
+        # The separate contract has already proved a daily confirmed breakout;
         # this is a base reversal, not admission of an arbitrary range.
         return 0.8
     if stage.stage is MediumTermStage.ORDERLY_UPTREND and not stage.hard_freeze_new_entry:

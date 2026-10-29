@@ -125,6 +125,8 @@ def test_empty_accepted_reports_are_recorded_once_without_market_or_provider_rea
     assert result["entries_seen"] == 0
     assert result["summary"]["zero_entry_reports"] == 1
     assert result["summary"]["episodes"] == []
+    assert result["reference_summary"]["zero_entry_reports"] == 1
+    assert result["reference_summary"]["episodes"] == []
     assert service.ingest_published_recommendations(repository)["reports_ingested"] == 0
 
 
@@ -188,6 +190,8 @@ def test_replay_uses_verified_bars_and_reuses_complete_same_day_public_evidence(
     assert calls == [(("600001",), NEXT)]
     assert result["summary"]["episodes"][0]["entry_price"] == 10.0
     assert result["summary"]["episodes"][0]["entry_date"] == NEXT.isoformat()
+    assert result["reference_summary"]["episodes"][0]["entry_date"] == PLAN.isoformat()
+    assert result["reference_summary"]["execution_eligible"] is False
 
 
 def test_unknown_company_actions_are_retried_not_cached_as_clear(repository):
@@ -324,7 +328,7 @@ def test_budget_limited_provider_queries_rotate_persistently(repository, monkeyp
     assert calls[2][:2] == tuple(symbols[10:])
 
 
-def test_all_unfilled_and_no_new_reports_does_not_refresh_completed_observation(repository):
+def test_v1_unfilled_does_not_freeze_a_still_open_reference_observation(repository):
     entry = _entry()
     entry["entry_rule"]["trigger_price"] = 10.15
     _archive(repository, [entry])
@@ -333,8 +337,26 @@ def test_all_unfilled_and_no_new_reports_does_not_refresh_completed_observation(
         company_action_reader=_clear_reader([]),
     )
     assert first["summary"]["episodes"][0]["status"] == "unfilled"
+    assert first["reference_summary"]["episodes"][0]["status"] == "open"
+    calls = []
     result = service.run_recommendation_tracking(
         repository, overlay_store=LaterOverlay(), through=date(2026, 10, 13),
-        company_action_reader=lambda *a, **kw: pytest.fail("unfilled plan needs no refresh"),
+        company_action_reader=_clear_reader(calls),
     )
     assert result["summary"]["episodes"][0]["status"] == "unfilled"
+    assert calls == [(("600001",), date(2026, 10, 13))]
+    assert result["reference_summary"]["episodes"][0]["status"] == "closed"
+
+
+def test_late_formal_recommendation_reference_is_excluded_not_backfilled(repository):
+    _archive(repository, [_entry()])
+    with repository.connection() as connection:
+        connection.execute(
+            "UPDATE recommendation_delivery_events SET attempted_at='2026-10-08T02:00:00+00:00'"
+        )
+    result = service.run_recommendation_tracking(
+        repository, overlay_store=Overlay(), through=NEXT, company_action_reader=_clear_reader([]),
+    )
+    reference = result["reference_summary"]["episodes"][0]
+    assert reference["status"] == "excluded_late_publication"
+    assert reference["entry_price"] is None

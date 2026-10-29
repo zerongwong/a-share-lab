@@ -378,12 +378,12 @@ def test_real_continuous_builder_accepts_current_five_name_shortlist_policy() ->
 def test_continuous_search_only_runs_after_candidate_evidence_and_never_weights_unknown(monkeypatch, receipt_mode):
     import importlib
 
-    from test_continuous_signals import _weekly_setup
+    from test_continuous_v5 import _daily_setup
 
     module = importlib.import_module("ashare_lab.services.build_midterm_portfolio")
     histories, metadata = _universe()
     symbols = tuple(metadata)[:3]
-    recent = _weekly_setup()
+    recent = _daily_setup(retest=True)
     early_dates = pd.bdate_range(end=recent.trade_date.iloc[0] - pd.Timedelta(days=1), periods=460)
     early_close = np.linspace(7.0, 8.99, 460)
     early = pd.DataFrame({"trade_date": early_dates, "open": early_close,

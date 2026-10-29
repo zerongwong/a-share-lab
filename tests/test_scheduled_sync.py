@@ -861,10 +861,14 @@ def test_launchagent_template_is_independent_bounded_and_secret_free() -> None:
         "-i",
         "__PYTHON_BIN__",
         "-m",
-        "ashare_lab.cli.scheduled_sync_worker",
+        "ashare_lab.cli.scheduled_tick",
+        "--job",
+        "daily-sync",
     ]
     assert document["RunAtLoad"] is True
-    assert document["StartCalendarInterval"] == [
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
+    assert scheduled_sync._DAILY_SYNC_SCHEDULE == [
         {"Hour": 6, "Minute": 30},
         {"Hour": 7, "Minute": 30},
         {"Hour": 8, "Minute": 0},
@@ -909,10 +913,14 @@ def test_launchagent_renderer_replaces_placeholders_without_inserting_arguments(
         "-i",
         str(python_bin.absolute()),
         "-m",
-        "ashare_lab.cli.scheduled_sync_worker",
+        "ashare_lab.cli.scheduled_tick",
+        "--job",
+        "daily-sync",
     ]
     assert document["WorkingDirectory"] == str(project_root.resolve())
-    assert document["StartCalendarInterval"] == [
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
+    assert scheduled_sync._DAILY_SYNC_SCHEDULE == [
         {"Hour": 6, "Minute": 30},
         {"Hour": 7, "Minute": 30},
         {"Hour": 8, "Minute": 0},

@@ -10,25 +10,16 @@
         <string>-i</string>
         <string>__PYTHON_BIN__</string>
         <string>-m</string>
-        <string>ashare_lab.cli.preopen_deadline</string>
+        <string>ashare_lab.cli.scheduled_tick</string>
+        <string>--job</string>
+        <string>preopen-deadline</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__PROJECT_ROOT__</string>
     <key>RunAtLoad</key>
     <true/>
-    <key>StartCalendarInterval</key>
-    <array>
-        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>59</integer></dict>
-        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>59</integer></dict>
-        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>59</integer></dict>
-        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>59</integer></dict>
-        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>58</integer></dict>
-        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>8</integer><key>Minute</key><integer>59</integer></dict>
-    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
     <key>ProcessType</key>
     <string>Standard</string>
     <key>ThrottleInterval</key>

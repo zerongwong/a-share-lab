@@ -24,7 +24,7 @@ from zoneinfo import ZoneInfo
 from ashare_lab.bootstrap import application_data_dir
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
-_NOTICE_START = time(8, 50)
+_NOTICE_START = time(8, 58)
 _WATCHDOG_START = time(8, 58)
 _SEND_END = time(9, 0)
 NOTICE_TIMEOUT_SECONDS = 12.0
@@ -224,15 +224,9 @@ def _notify_locked(
         session = _known_session(state_root, now)
         if session is False:
             return "noop_verified_nontrading_day"
-        from ashare_lab.ports.notifications import NotificationMessage
+        from ashare_lab.services.preopen_partial_report import render_preopen_partial_message
 
-        if session is True:
-            title = "A股盘前计划暂未完成｜暂停新买"
-            body = "盘前计划尚未完成或未获推送受理确认。请勿沿用旧买入建议。本条不是荐股结论，也未确认持仓买卖信号。"
-        else:
-            title = "A股盘前计划／交易日核验尚未完成"
-            body = "盘前计划或交易日核验尚未完成，请勿沿用旧买入建议。本条仅为系统状态提醒，不代表今日一定开市或没有合适股票。"
-        message = NotificationMessage(title=title, body=body, group="A股研究室·盘前状态")
+        message = render_preopen_partial_message(state_root, now=now, session=session)
         last_guard_status = None
 
         def before_send() -> bool:

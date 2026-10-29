@@ -126,7 +126,7 @@ def test_initial_plan_distinguishes_missing_data_from_no_formations_and_blocked_
     assert service._initial_plan(result)["cash_weight"] is None
     assert "尚不能判断" in service._initial_plan(result)["status_note"]
     result.status = MidtermPortfolioStatus.NO_ELIGIBLE_PORTFOLIO
-    assert "没有通过已完成周线" in service._initial_plan(result)["status_note"]
+    assert "没有通过周线背景过滤、完整日线" in service._initial_plan(result)["status_note"]
     result.horizon_candidate_count = 3
     assert "已找到3只" in service._initial_plan(result)["status_note"]
     assert service._initial_plan(result)["entries"] == []
@@ -435,7 +435,9 @@ def test_continuous_outer_builder_requests_one_frozen_profile_and_versions_only_
     assert digest.method_version == CONTINUOUS_METHOD_VERSION
     assert digest.continuous_plan["planned_exit_date"] is None
     assert digest.continuous_plan["holding_based"] is False
-    assert digest.continuous_plan["signal_profile"] == "continuous_weekly_breakout_daily_execution_v4"
+    assert digest.continuous_plan["signal_profile"] == "continuous_weekly_filter_daily_breakout_pullback_v5"
+    assert digest.continuous_plan["signal_policy"]["confirmation_timeframe"] == "completed_daily"
+    assert digest.continuous_plan["signal_policy"]["unconfirmed_retest_is_entry"] is False
     assert digest.continuous_plan["holding_count"] == 0
     assert digest.continuous_plan["count_state"] == "cash"
     assert digest.continuous_plan["maximum_new_account_weight"] == pytest.approx(0.20)

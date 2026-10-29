@@ -1,7 +1,8 @@
 """Minute-polled holding-risk alerts, isolated from full-market updates.
 
 No screening, stop ratcheting, trade execution, or membership changes occur.
-Structural touches are provisional until the existing completed-close review.
+Structural touches are provisional until cross-checked post-close snapshots or
+the existing completed-close review. Public snapshots are not official EOD bars.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from datetime import date, time
+from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -25,14 +26,61 @@ from ashare_lab.services.intraday_alert_store import (
 )
 
 CN = ZoneInfo("Asia/Shanghai")
-METHOD_VERSION = "intraday-holding-stop-monitor-v1"
+METHOD_VERSION = "intraday-holding-stop-monitor-v2"
+
+
+def in_postclose_hours(now):
+    now = now.astimezone(CN)
+    return now.weekday() < 5 and time(15, 5) <= now.time() < time(16)
 
 
 def in_monitor_hours(now):
     now = now.astimezone(CN)
     return now.weekday() < 5 and (
-        time(9, 25) <= now.time() <= time(11, 30, 59) or time(13) <= now.time() <= time(15, 0, 59)
+        time(9, 25) <= now.time() <= time(11, 30, 59)
+        or time(13) <= now.time() <= time(15, 0, 59)
+        or in_postclose_hours(now)
     )
+
+
+def postclose_quotes(quotes, *, now):
+    """Use same-day completed-session snapshots, never relabel stale live quotes."""
+    return tuple(
+        quote
+        for quote in quotes
+        if quote.quoted_at.tzinfo is not None
+        and quote.quoted_at.astimezone(CN).date() == now.astimezone(CN).date()
+        and time(15) <= quote.quoted_at.astimezone(CN).time()
+        and quote.quoted_at <= now
+        and all(
+            math.isfinite(value) and value > 0
+            for value in (quote.price, quote.low, quote.high, quote.previous_close)
+        )
+        and quote.low <= quote.price <= quote.high
+    )
+
+
+def _known_stop(stored, *, now, observation_time):
+    if stored is None:
+        return None
+    try:
+        cutoff = date.fromisoformat(str(stored["data_cutoff"]))
+        known_at = datetime.fromisoformat(str(stored["updated_at"]))
+        line = float(stored["effective_stop"])
+        if (
+            # A line calculated from today's closing bar is not a level
+            # known during today's session. Never retroactively apply it.
+            cutoff >= now.date()
+            or known_at.tzinfo is None
+            or known_at > now
+            or known_at > observation_time
+            or not math.isfinite(line)
+            or line <= 0
+        ):
+            return None
+    except (KeyError, TypeError, ValueError):
+        return None
+    return stored
 
 
 def read_config(root: Path):
@@ -117,6 +165,7 @@ def run_monitor(
     company_action_authorization_checker=None,
 ):
     now = now.astimezone(CN)
+    postclose = in_postclose_hours(now)
     event = {
         "method": METHOD_VERSION,
         "checked_at": now.isoformat(),
@@ -125,6 +174,8 @@ def run_monitor(
         "failed": 0,
         "orders_enabled": False,
         "interval_seconds": 60,
+        "phase": "postclose" if postclose else "intraday",
+        "delivery_confirmed": False,
     }
     if read_config(root) is None:
         return event
@@ -158,7 +209,7 @@ def run_monitor(
             now=now,
             confirmed=False,
             payload={
-                "body": f"{now:%m-%d %H:%M}｜盘中监控需注意\n{reason}\n请核对券商行情；本程序不自动下单。"
+                "body": f"{now:%m-%d %H:%M}｜{'收盘' if postclose else '盘中'}监控需注意\n{reason}\n请核对券商行情；本程序不自动下单。"
             },
         )
 
@@ -183,7 +234,7 @@ def run_monitor(
                     repository,
                     as_of=now.date(),
                     reviewed_at=now,
-                    phase="intraday",
+                    phase="eod" if postclose else "intraday",
                 )
                 if not isinstance(clearances, dict):
                     clearances = {}
@@ -219,7 +270,8 @@ def run_monitor(
             if holding.entry_date > now.date():
                 issues.add("入场日期晚于今天，无法核验该笔持仓。")
                 continue
-            quotes = fresh_quotes(
+            quote_selector = postclose_quotes if postclose else fresh_quotes
+            quotes = quote_selector(
                 tuple(
                     batch[holding.symbol] for batch in batches.values() if holding.symbol in batch
                 ),
@@ -227,7 +279,11 @@ def run_monitor(
             )
             paired = crosscheck(quotes)
             if not paired:
-                issues.add("部分持仓行情过期、缺失或双源不一致；不能当作安全持有。")
+                issues.add(
+                    "部分持仓缺少同日15点后双源收盘快照或价格不一致；不能当作安全持有。"
+                    if postclose
+                    else "部分持仓行情过期、缺失或双源不一致；不能当作安全持有。"
+                )
             if not quotes:
                 continue
             clearance = (clearances or {}).get(holding.symbol)
@@ -247,9 +303,11 @@ def run_monitor(
                     if clearance is not None and clearance.clear is False
                     else "除权/分红区间证据未齐；触线会提示优先核验，不伪造确认卖出。"
                 )
-            stored = repository.get_holding_protective_stop(holding.position_key)
-            if stored is not None and str(stored["data_cutoff"]) >= now.date().isoformat():
-                stored = None  # Today's closing line was not knowable at the open.
+            stored = _known_stop(
+                repository.get_holding_protective_stop(holding.position_key),
+                now=now,
+                observation_time=min(q.quoted_at for q in quotes),
+            )
             details = {} if stored is None else stored.get("details_json", {})
             if stored is None:
                 issues.add("部分持仓尚无已核验结构保护线；成本检查仍独立执行。")
@@ -281,30 +339,65 @@ def run_monitor(
                 continue
             # Agreement on last prices alone does not validate a source's low.
             # Both fresh sources must independently show the cost-line touch.
-            confirmed = bool(
+            cost_confirmed = bool(
                 cost_touch and paired and clear and all(value <= cost_line for value in tested)
             )
-            kind = "cost_exit" if confirmed else "cost_review" if cost_touch else "structure_touch"
-            line = float(cost_line) if cost_touch else structural_line
+            structural_confirmed = bool(
+                postclose
+                and structural_touch
+                and paired
+                and clear
+                and all(q.price < structural_line for q in quotes)
+            )
+            confirmed = cost_confirmed or structural_confirmed
+            kind = (
+                "cost_exit"
+                if cost_confirmed
+                else "structural_exit"
+                if structural_confirmed
+                else "cost_review"
+                if cost_touch
+                else "structure_touch"
+            )
+            line = (
+                structural_line
+                if structural_confirmed and not cost_confirmed
+                else float(cost_line)
+                if cost_touch
+                else structural_line
+            )
             latest = max(quotes, key=lambda q: q.quoted_at)
             label = (
                 "🔴 已触及8%成本止损｜退出风险提示"
-                if confirmed
+                if cost_confirmed
+                else "🔴 收盘快照确认跌破结构保护线｜退出风险提示"
+                if structural_confirmed
                 else "⚠️ 疑似触及8%成本止损｜立即核验"
                 if cost_touch
+                else "⚠️ 收盘触及结构保护线｜立即核验，未确认退出"
+                if postclose
                 else "⚠️ 盘中触及结构保护线｜等待收盘确认"
             )
             body = (
                 f"{holding.name}（{holding.symbol}）\n{label}\n"
                 f"行情 {latest.quoted_at:%m-%d %H:%M:%S}｜现价{latest.price:.2f}｜触发线{line:.2f}\n"
                 + (
+                    (
+                        "来源：腾讯＋新浪同日15点后收盘快照，非交易所正式日线。\n"
+                        if paired
+                        else "来源：同日15点后快照，双源核验未通过，非交易所正式日线。\n"
+                    )
+                    if postclose
+                    else ""
+                )
+                + (
                     "除权/分红或双源行情待核验，请立即查看券商。\n"
-                    if cost_touch and not confirmed
+                    if (cost_touch or (postclose and structural_touch)) and not confirmed
                     else ""
                 )
             )
             incident = f"{holding.position_key}:{kind}"
-            if kind != "cost_exit":
+            if kind not in {"cost_exit", "structural_exit"}:
                 incident += f":{now.date()}:{line:.4f}"
             put_alert(
                 repository,
@@ -321,9 +414,16 @@ def run_monitor(
                     "quote_times": [q.quoted_at.isoformat() for q in quotes],
                     "company_action_clear": clear,
                     "paired": paired,
-                    "comparison": "day_low" if use_low else "last_price",
-                    "compared_prices": [float(value) for value in tested],
+                    "comparison": "close_snapshot"
+                    if structural_confirmed and not cost_confirmed
+                    else "day_low"
+                    if use_low
+                    else "last_price",
+                    "compared_prices": [q.price for q in quotes]
+                    if structural_confirmed and not cost_confirmed
+                    else [float(value) for value in tested],
                     "method": METHOD_VERSION,
+                    "phase": "postclose" if postclose else "intraday",
                 },
             )
         if issues:
@@ -336,9 +436,9 @@ def run_monitor(
     pending = pending_alerts(repository, position_keys=keys, portfolio_id=portfolio.id, now=now)
     if pending and allowed():
         message = NotificationMessage(
-            title="A股盘中风险提醒"
+            title=("A股收盘风险提醒" if postclose else "A股盘中风险提醒")
             if any(i["kind"] != "health" for i in pending)
-            else "A股盘中监控状态",
+            else ("A股收盘监控状态" if postclose else "A股盘中监控状态"),
             body="\n\n".join(i["payload"]["body"].strip() for i in pending)
             + "\n\n仅预警，不自动下单；T+1、停牌、跌停可能影响卖出。确认成交后再评估替补，无合格项留现金。",
             urgency=NotificationUrgency.TIME_SENSITIVE,

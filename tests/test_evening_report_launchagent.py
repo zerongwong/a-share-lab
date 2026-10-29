@@ -9,9 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from ashare_lab.cli.scheduled_tick import SLOT_WINDOWS, TICK_MODULE
 from ashare_lab.services.evening_report_launchagent import (
     EVENING_REPORT_LAUNCHAGENT_LABEL,
-    EVENING_REPORT_MODULE,
     EVENING_REPORT_SCHEDULE,
     HOLDING_PNL_LAUNCHAGENT_LABEL,
     HOLDING_PNL_MODULE,
@@ -45,14 +45,14 @@ def test_report_template_is_independent_secret_free_and_weekday_preopen_only() -
         "-i",
         "__PYTHON_BIN__",
         "-m",
-        EVENING_REPORT_MODULE,
+        TICK_MODULE,
+        "--job",
+        "evening-report",
     ]
     assert document["RunAtLoad"] is True
-    assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
-    assert [item["Weekday"] for item in document["StartCalendarInterval"]] == [
-        day for day in range(1, 6) for _ in range(4)
-    ]
-    assert {(item["Hour"], item["Minute"]) for item in document["StartCalendarInterval"]} == {
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
+    assert {(item["Hour"], item["Minute"]) for item in EVENING_REPORT_SCHEDULE} == {
         (8, 20),
         (8, 30),
         (8, 40),
@@ -61,8 +61,7 @@ def test_report_template_is_independent_secret_free_and_weekday_preopen_only() -
     assert document["ProcessType"] == "Standard"
     assert "LowPriorityIO" not in document
     assert "Nice" not in document
-    assert 0 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
-    assert 6 not in {item["Weekday"] for item in document["StartCalendarInterval"]}
+    assert {start for start, _ in SLOT_WINDOWS["evening-report"]} == {500, 510, 520, 530}
     assert "KeepAlive" not in document
     assert document["StandardOutPath"] == "/dev/null"
     assert document["StandardErrorPath"] == "/dev/null"
@@ -94,11 +93,14 @@ def test_evening_report_renderer_replaces_the_complete_argument_array(tmp_path: 
         "-i",
         str(python_bin.absolute()),
         "-m",
-        EVENING_REPORT_MODULE,
+        TICK_MODULE,
+        "--job",
+        "evening-report",
     ]
-    assert len(document["ProgramArguments"]) == 5
+    assert len(document["ProgramArguments"]) == 7
     assert document["WorkingDirectory"] == str(project_root.resolve())
-    assert document["StartCalendarInterval"] == EVENING_REPORT_SCHEDULE
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
     assert "__PYTHON_BIN__" not in document["ProgramArguments"]
     assert output.stat().st_mode & 0o777 == 0o600
 
@@ -151,8 +153,9 @@ def test_deadline_template_is_independent_and_runs_before_nine_only(tmp_path):
     document = plistlib.loads(output.read_bytes())
     assert document["Label"] == PREOPEN_DEADLINE_LAUNCHAGENT_LABEL
     assert document["Label"] != EVENING_REPORT_LAUNCHAGENT_LABEL
-    assert document["ProgramArguments"][-2:] == ["-m", PREOPEN_DEADLINE_MODULE]
-    assert document["StartCalendarInterval"] == PREOPEN_DEADLINE_SCHEDULE
+    assert document["ProgramArguments"][-4:] == ["-m", TICK_MODULE, "--job", "preopen-deadline"]
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
     assert len(PREOPEN_DEADLINE_SCHEDULE) == 10
     assert {(item["Hour"], item["Minute"]) for item in PREOPEN_DEADLINE_SCHEDULE} == {
         (8, 58),
@@ -175,8 +178,9 @@ def test_pnl_template_has_own_label_and_three_postclose_attempts(tmp_path):
         EVENING_REPORT_LAUNCHAGENT_LABEL,
         PREOPEN_DEADLINE_LAUNCHAGENT_LABEL,
     }
-    assert document["ProgramArguments"][-2:] == ["-m", HOLDING_PNL_MODULE]
-    assert document["StartCalendarInterval"] == HOLDING_PNL_SCHEDULE
+    assert document["ProgramArguments"][-4:] == ["-m", TICK_MODULE, "--job", "holding-pnl"]
+    assert document["StartInterval"] == 60
+    assert "StartCalendarInterval" not in document
     assert len(HOLDING_PNL_SCHEDULE) == 15
     assert {(row["Hour"], row["Minute"]) for row in HOLDING_PNL_SCHEDULE} == {
         (15, 35),

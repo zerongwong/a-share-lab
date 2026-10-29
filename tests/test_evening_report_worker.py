@@ -93,6 +93,13 @@ def test_timeout_terminates_only_owned_group_and_deduplicates_failure_notice(tmp
         assert event["reason"] == "evening_worker_deadline_exceeded"
         assert process.timeouts == [470, 5, 5]
     assert signals == [(45678, signal.SIGTERM), (45678, signal.SIGKILL)] * 2
+    assert messages == []  # 08:50 failure must not consume the fixed deadline receipt.
+    deadline = _options(tmp_path)["_clock"]().replace(minute=58)
+    for _ in range(2):
+        worker.notify_incomplete_once(
+            state_root=tmp_path / "state", now=deadline, clock=lambda: deadline,
+            notifier=notifier,
+        )
     assert len(messages) == 1
     assert "暂停新买" in messages[0].title
     assert messages[0].image_url is None
@@ -114,7 +121,7 @@ def test_leader_exit_still_terminates_remaining_descendants():
 
 def test_provider_rejection_does_not_suppress_later_timeout_notice(tmp_path):
     calls = []
-    now = _options(tmp_path)["_clock"]()
+    now = _options(tmp_path)["_clock"]().replace(minute=58)
     for accepted in (False, True):
         status = worker.notify_incomplete_once(
             state_root=tmp_path / "state",
@@ -131,10 +138,11 @@ def test_known_plan_receipt_prevents_misleading_failure_notice(tmp_path):
     state.mkdir(exist_ok=True)
     original = {"plan_for_date": "2026-09-08", "accepted_channels": ["serverchan"]}
     (state / "evening-digest-state.json").write_text(json.dumps(original))
+    now = _options(tmp_path)["_clock"]().replace(minute=58)
     status = worker.notify_incomplete_once(
         state_root=state,
-        now=_options(tmp_path)["_clock"](),
-        clock=_options(tmp_path)["_clock"],
+        now=now,
+        clock=lambda: now,
         notifier=lambda _message: pytest.fail("already accepted plan must not be contradicted"),
     )
     assert status == "plan_already_provider_accepted"
@@ -152,7 +160,7 @@ def test_failed_worker_is_observable_even_if_it_cannot_import_analytics(tmp_path
     )
     assert result == (1 if code == 1 else 2)
     assert event["reason"] == "evening_worker_not_completed"
-    assert len(messages) == 1
+    assert messages == []  # Deadline task reports the final available partial snapshot.
     assert signals == [(45678, signal.SIGTERM), (45678, signal.SIGKILL)]
 
 
@@ -188,7 +196,7 @@ def test_spawn_failure_is_logged_without_unsafe_exception_details(tmp_path):
     assert result == 2
     assert event["reason"] == "evening_worker_start_or_wait_failed"
     assert "SCT-secret" not in (tmp_path / "logs" / "evening-report.jsonl").read_text()
-    assert len(messages) == 1
+    assert messages == []
 
 
 @pytest.mark.parametrize("date_hour", [(6, 9), (8, 8), (8, 10)])
@@ -354,7 +362,7 @@ def test_late_attempt_without_shutdown_budget_does_not_spawn(tmp_path):
     )
     assert code == 0
     assert event["status"] == "noop_insufficient_worker_budget"
-    assert len(messages) == 1
+    assert messages == []  # The independent 08:58 task has not run yet.
 
 
 @pytest.mark.parametrize("minute", [20, 30, 40])

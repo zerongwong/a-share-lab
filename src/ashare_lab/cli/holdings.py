@@ -171,7 +171,11 @@ def _portfolio_payload(portfolio: object) -> dict[str, Any]:
         "status": portfolio.status,
         "holding_portfolio_id": portfolio.id,
         "holding_portfolio_version": portfolio.version,
-        "tracking_mode": CONTINUOUS_TRACKING_MODE,
+        # The ledger may contain positions registered under an older signal
+        # contract.  Listing holdings is an audit view, so report the mode that
+        # was frozen with this exact revision instead of relabelling it with
+        # whichever entry contract the current code happens to use.
+        "tracking_mode": portfolio.metadata.get("tracking_mode"),
         "effective_at": portfolio.effective_at.isoformat(),
         HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY: channels,
         "positions": [

@@ -1,4 +1,4 @@
-"""Install/run a bounded one-minute personal risk watcher; no trading API."""
+"""Minute-polled session and 15:05–16:00 close-risk watcher; no trading API."""
 
 from __future__ import annotations
 
@@ -305,7 +305,7 @@ def failure_notice(*, _clock=None, _repository=None):
         return {"status": final_suppression}
     accepted = send_serverchan(
         NotificationMessage(
-            title="A股盘中监控中断提醒",
+            title="A股持仓监控中断提醒",
             urgency=NotificationUrgency.TIME_SENSITIVE,
             body=f"{now:%m-%d %H:%M}｜本机监控任务超时或异常，当前不能保证止损提醒。本条不是买卖信号，交易日历未核验时也不代表今日一定开市。请直接查看券商行情；程序将继续重试，不会自动下单。",
         ),
@@ -362,7 +362,7 @@ def test_notification():
         accepted = send_serverchan(
             NotificationMessage(
                 title="A股盘中预警｜启用测试",
-                body="这是一条启用测试，不是买卖建议。\n\n交易时段每60秒检查已确认持仓；成本亏损达到8%即触发风险核验与提醒，结构触线先预警、收盘确认。\n\n需要电脑开机联网；不会自动下单。行情与微信可能延迟，8%不是实际亏损保证上限。",
+                body="这是一条启用测试，不是买卖建议。\n\n交易时段每60秒检查已确认持仓；成本亏损达到8%即触发风险核验与提醒，结构触线先预警。15:05–16:00继续用双源收盘快照复核已有保护线并补发失败提醒。\n\n需要电脑开机联网；不会自动下单。行情与微信可能延迟，8%不是实际亏损保证上限。",
             )
         )
         state["status"] = "provider_accepted" if accepted else "delivery_unconfirmed"

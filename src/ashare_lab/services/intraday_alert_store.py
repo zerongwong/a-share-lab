@@ -6,6 +6,8 @@ import hashlib
 import json
 from datetime import UTC, date, datetime
 
+CONFIRMED_EXIT_KINDS = frozenset({"cost_exit", "structural_exit"})
+
 
 def put_alert(repository, *, incident, position_key, portfolio, kind, now, confirmed, payload):
     key = hashlib.sha256(incident.encode()).hexdigest()
@@ -43,12 +45,12 @@ def pending_alerts(repository, *, position_keys, portfolio_id, now):
                 continue
         elif row["portfolio_id"] != portfolio_id or row["observed_on"] != now.date().isoformat():
             continue
-        if row["kind"] != "cost_exit" and row["observed_on"] != now.date().isoformat():
+        if row["kind"] not in CONFIRMED_EXIT_KINDS and row["observed_on"] != now.date().isoformat():
             continue
         # Never submit an alert whose observation is in the future.
         if datetime.fromisoformat(row["observed_at"]) > now:
             continue
-        if row["attempts"] >= 3 and row["kind"] != "cost_exit":
+        if row["attempts"] >= 3 and row["kind"] not in CONFIRMED_EXIT_KINDS:
             continue
         if row["attempted_at"] and (
             now - datetime.fromisoformat(row["attempted_at"])
@@ -56,7 +58,9 @@ def pending_alerts(repository, *, position_keys, portfolio_id, now):
             continue
         row["payload"] = json.loads(row["payload_json"])
         result.append(row)
-    return sorted(result, key=lambda r: (r["kind"] != "cost_exit", r["observed_at"]))[:10]
+    return sorted(
+        result, key=lambda r: (r["kind"] not in CONFIRMED_EXIT_KINDS, r["observed_at"])
+    )[:10]
 
 
 def mark_attempt(repository, key, now):

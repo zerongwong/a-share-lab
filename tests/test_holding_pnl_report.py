@@ -160,12 +160,23 @@ def test_actual_quantity_cost_weighted_floating_pnl_not_daily_or_simple_mean(env
     assert report.daily_amount == Decimal("-50.0")
     assert report.daily_percent == Decimal("-50") / Decimal("4950") * Decimal(100)
     assert report.held_trading_days == 2
+    assert report.held_natural_days == 2
+    assert report.average_daily_percent == Decimal("-1")
+    assert report.average_daily_amount == Decimal("-50")
+    assert report.rows[0].held_trading_days == 2
+    assert report.rows[0].held_natural_days == 2
+    assert report.rows[0].average_daily_percent == Decimal("5")
+    assert report.rows[0].average_daily_amount == Decimal("50")
+    assert report.rows[1].average_daily_percent == Decimal("-2.5")
+    assert report.rows[1].average_daily_amount == Decimal("-100")
     body = render_holding_pnl_report(report, include_principal=True)
     assert body.split("\n\n", 1)[0] == "🌷 2026-09-22 · 收盘"
-    assert "⏳ 现组合共同持有：2 个交易日" in body
+    assert "⏳ 累计持有：2 个自然日 ｜ 2 个交易日" in body
     assert "💼 持仓投入本金：5,000.00 元" in body
     assert "🩵 **当日收益（价差）**：-1.01% ｜ -50.00 元" in body
     assert "💜 **累计收益（价差）**：-2.00% ｜ -100.00 元" in body
+    assert "🪻 **日均收益（累计÷交易日）**：-1.00% ｜ -50.00 元" in body
+    assert "↳ 2 自然日 / 2 交易日 ｜ 日均 +5.00% · +50.00 元" in body
     assert "\n\n甲股票：+10.00% ｜ +100.00 元\n\n" in body
     assert "\n\n乙股票：-5.00% ｜ -200.00 元\n\n" in body
     assert body.endswith("🌱 数据来源：腾讯＋新浪收盘快照 · AKShare等交易日历")
@@ -174,7 +185,7 @@ def test_actual_quantity_cost_weighted_floating_pnl_not_daily_or_simple_mean(env
     assert "100股" not in body and "成本10" not in body
 
 
-def test_common_holding_days_use_verified_sessions_from_latest_entry(env):
+def test_staggered_entries_show_individual_periods_not_fake_common_average(env):
     now = NOW.replace(day=28)
     current = get_active_holding_portfolio(env[0])
     mixed = replace(
@@ -189,12 +200,21 @@ def test_common_holding_days_use_verified_sessions_from_latest_entry(env):
         now=now,
         batches=batches(now),
         clearances=clearances(now),
-        trading_sessions=tuple(
-            date(2026, 9, day) for day in (21, 22, 23, 24, 25, 28)
-        ),
+        trading_sessions=tuple(date(2026, 9, day) for day in (21, 22, 23, 24, 25, 28)),
         previous_portfolio=mixed,
+        unchanged_bases=frozenset(holding.position_key for holding in mixed.positions),
     )
-    assert report.held_trading_days == 3  # 24、25、28日，周末不计入。
+    assert report.held_trading_days is None
+    assert report.held_natural_days is None
+    assert report.rows[0].held_trading_days == 6
+    assert report.rows[0].held_natural_days == 8
+    assert report.rows[1].held_trading_days == 3  # 24、25、28日，周末不计入。
+    assert report.rows[1].held_natural_days == 5
+    assert report.rows[0].average_daily_percent == Decimal(10) / 6
+    assert report.rows[1].average_daily_percent == Decimal(-5) / 3
+    assert report.average_daily_percent is None
+    assert report.average_daily_amount is None
+    assert "非同批建仓，日均逐股列示" in render_holding_pnl_report(report)
     assert report.daily_amount == Decimal("-50.0")
 
 
@@ -210,8 +230,11 @@ def test_invalid_or_missing_calendar_never_guesses_holding_days_or_daily_return(
     )
     assert report.complete and report.pnl_amount == Decimal("-100")
     assert report.held_trading_days is None
+    assert report.held_natural_days == 2
+    assert report.average_daily_percent is None and report.average_daily_amount is None
+    assert report.rows[0].average_daily_percent is None
     assert report.daily_amount is None
-    assert "现组合共同持有：待核验" in render_holding_pnl_report(report)
+    assert "累计持有：2 个自然日 ｜ 交易日数待核验" in render_holding_pnl_report(report)
 
 
 def test_same_day_holding_revision_does_not_claim_an_account_daily_return(env):
@@ -249,8 +272,142 @@ def test_cached_previous_session_keeps_daily_change_when_range_calendar_is_unava
 
     event, messages, _ = run(env, session_loader=unavailable)
     assert event["status"] == "provider_accepted"
-    assert "现组合共同持有：待核验" in messages[0].body
+    assert "累计持有：2 个自然日 ｜ 交易日数待核验" in messages[0].body
     assert "当日收益（价差）**：-1.01% ｜ -50.00 元" in messages[0].body
+
+
+def test_entry_day_is_one_day_and_average_is_not_the_daily_price_change(env):
+    now = NOW.replace(day=21)
+    current = get_active_holding_portfolio(env[0])
+    report = build_holding_pnl_report(
+        current,
+        now=now,
+        batches=batches(now),
+        clearances=clearances(now),
+        trading_sessions=(ENTRY,),
+        previous_portfolio=None,
+    )
+    assert report.held_trading_days == report.held_natural_days == 1
+    assert report.average_daily_percent == report.pnl_percent == Decimal(-2)
+    assert report.average_daily_amount == report.pnl_amount == Decimal(-100)
+    assert report.daily_percent is None and report.daily_amount is None
+
+
+def test_holiday_gap_counts_natural_days_without_inventing_trading_sessions(env):
+    now = NOW.replace(month=10, day=9)
+    current = get_active_holding_portfolio(env[0])
+    portfolio = replace(
+        current,
+        effective_at=now.replace(month=9, day=30),
+        positions=tuple(
+            replace(holding, entry_date=date(2026, 9, 30)) for holding in current.positions
+        ),
+    )
+    report = build_holding_pnl_report(
+        portfolio,
+        now=now,
+        batches=batches(now),
+        clearances=clearances(now),
+        trading_sessions=(date(2026, 9, 30), date(2026, 10, 8), date(2026, 10, 9)),
+    )
+    assert report.held_natural_days == 10
+    assert report.held_trading_days == 3
+    assert report.average_daily_percent == Decimal(-2) / 3
+    assert report.average_daily_amount == Decimal(-100) / 3
+    assert report.rows[0].average_daily_amount == Decimal(100) / 3
+
+
+@pytest.mark.parametrize("field", ["cost", "quantity"])
+def test_later_cost_or_quantity_change_blocks_average_but_preserves_current_floating_pnl(
+    env, field
+):
+    current = get_active_holding_portfolio(env[0])
+    replace_active_holdings(
+        env[0],
+        [
+            HoldingPositionInput(
+                symbol=holding.symbol,
+                name=holding.name,
+                entry_date=holding.entry_date,
+                cost_price=holding.cost_price + 1
+                if index == 0 and field == "cost"
+                else holding.cost_price,
+                stock_sleeve_weight=holding.stock_sleeve_weight,
+                metadata=(
+                    {**holding.metadata, "quantity": 150}
+                    if index == 0 and field == "quantity"
+                    else holding.metadata
+                ),
+            )
+            for index, holding in enumerate(current.positions)
+        ],
+        holding_weeks=4,
+        effective_at=NOW.replace(hour=10),
+    )
+    event, messages, _ = run(env)
+    assert event["status"] == "provider_accepted"
+    assert "累计收益（价差）**：待核验" not in messages[0].body
+    assert "日均收益（累计÷交易日）**：持仓历程或交易日历待核验" in messages[0].body
+    assert "成本/股数历程待核验" in messages[0].body
+    assert "日均 -2.50% · -100.00 元" in messages[0].body
+
+
+def test_metadata_only_revision_does_not_reset_verified_original_basis(env):
+    current = get_active_holding_portfolio(env[0])
+    replace_active_holdings(
+        env[0],
+        [
+            HoldingPositionInput(
+                symbol=holding.symbol,
+                name=holding.name,
+                entry_date=holding.entry_date,
+                cost_price=holding.cost_price,
+                stock_sleeve_weight=holding.stock_sleeve_weight,
+                metadata={**holding.metadata, "note": "metadata update only"},
+            )
+            for holding in current.positions
+        ],
+        holding_weeks=4,
+        effective_at=NOW.replace(hour=10),
+    )
+    event, messages, _ = run(env)
+    assert event["status"] == "provider_accepted"
+    assert "日均收益（累计÷交易日）**：-1.00% ｜ -50.00 元" in messages[0].body
+    assert "当日收益（价差）**：待核验" in messages[0].body
+
+
+def test_quantity_changed_then_restored_is_not_a_verified_unchanged_lifecycle(env):
+    current = get_active_holding_portfolio(env[0])
+    for quantity, hour in [(150, 10), (100, 11)]:
+        replace_active_holdings(
+            env[0],
+            [
+                HoldingPositionInput(
+                    symbol=holding.symbol,
+                    name=holding.name,
+                    entry_date=holding.entry_date,
+                    cost_price=holding.cost_price,
+                    stock_sleeve_weight=holding.stock_sleeve_weight,
+                    metadata={**holding.metadata, "quantity": quantity}
+                    if index == 0
+                    else holding.metadata,
+                )
+                for index, holding in enumerate(current.positions)
+            ],
+            holding_weeks=4,
+            effective_at=NOW.replace(hour=hour),
+        )
+    assert "成本/股数历程待核验" in run(env)[1][0].body
+
+
+def test_late_first_registration_cannot_prove_unchanged_history(env):
+    current = get_active_holding_portfolio(env[0])
+    late = replace(current, effective_at=NOW)
+    report = build(env, portfolio=late)
+    assert report.held_trading_days == 2
+    assert report.pnl_amount == Decimal(-100)
+    assert report.average_daily_percent is None and report.average_daily_amount is None
+    assert all(row.average_daily_amount is None for row in report.rows)
 
 
 def test_principal_requires_separate_explicit_authorization(env):
@@ -301,6 +458,9 @@ def test_bad_close_or_identity_never_enters_pnl(env, change):
     assert not report.complete
     assert report.rows[0].pnl_amount is None and report.rows[0].pnl_percent is None
     assert report.pnl_amount is None and report.pnl_percent is None
+    assert report.rows[0].average_daily_percent is None
+    assert report.rows[0].average_daily_amount is None
+    assert report.average_daily_percent is None and report.average_daily_amount is None
 
 
 def test_single_source_is_not_eod_confirmation(env):
@@ -331,6 +491,9 @@ def test_company_action_unknown_or_stale_blocks_comparable_return(env, changes):
     assert report.rows[0].pnl_percent is None
     assert "除权分红核验未完成" in report.rows[0].issues
     assert report.pnl_amount is None
+    assert report.rows[0].average_daily_percent is None
+    assert report.rows[0].average_daily_amount is None
+    assert report.average_daily_percent is None and report.average_daily_amount is None
 
 
 @pytest.mark.parametrize(
@@ -352,6 +515,8 @@ def test_missing_confirmed_quantity_allows_percent_only_not_partial_portfolio(en
     report = build(env, portfolio=portfolio)
     assert report.rows[0].pnl_percent == Decimal(10)
     assert report.rows[0].pnl_amount is None
+    assert report.rows[0].average_daily_percent == Decimal(5)
+    assert report.rows[0].average_daily_amount is None
     assert report.pnl_amount is None and report.pnl_percent is None
     body = render_holding_pnl_report(report)
     assert "股数待补齐" in body

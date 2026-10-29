@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from ashare_lab.adapters.sqlite_repository import SQLiteRepository
+from ashare_lab.analytics.continuous_signals import CONTINUOUS_METHOD_VERSION
 from ashare_lab.cli.holdings import build_parser, main
 from ashare_lab.services.holding_ledger import (
     HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY,
+    HoldingPositionInput,
     get_active_holding_portfolio,
+    replace_active_holdings,
 )
 
 
@@ -81,7 +86,7 @@ def test_local_json_replace_list_and_clear(tmp_path: Path, capsys: object) -> No
     assert main(["list"], _repository=repository) == 0
     listed = json.loads(capsys.readouterr().out)
     assert listed["holding_portfolio_version"] == 1
-    assert listed["tracking_mode"] == "continuous-signal-v4"
+    assert listed["tracking_mode"] == CONTINUOUS_METHOD_VERSION
     assert "holding_weeks" not in listed
     assert listed["positions"][0]["cost_price"] is None
     assert listed[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == []
@@ -123,7 +128,7 @@ def test_replace_saves_only_explicit_per_provider_summary_consent(
     portfolio = get_active_holding_portfolio(repository)
     assert portfolio is not None
     assert portfolio.holding_weeks == 4
-    assert portfolio.metadata["tracking_mode"] == "continuous-signal-v4"
+    assert portfolio.metadata["tracking_mode"] == CONTINUOUS_METHOD_VERSION
     assert portfolio.metadata[HOLDING_SUMMARY_DELIVERY_CHANNELS_KEY] == ["bark"]
     assert "external_delivery_consent" not in portfolio.metadata
 
@@ -133,6 +138,32 @@ def test_holding_cli_hides_retired_fixed_horizon_selector() -> None:
 
     assert "--holding-weeks" not in help_text
     assert "计划周期" not in help_text
+
+
+def test_list_preserves_tracking_mode_frozen_with_older_holding_revision(
+    tmp_path: Path,
+    capsys: object,
+) -> None:
+    repository = _repository(tmp_path)
+    replace_active_holdings(
+        repository,
+        (
+            HoldingPositionInput(
+                symbol="600919",
+                name="江苏银行",
+                entry_date=date(2026, 8, 28),
+                stock_sleeve_weight=1.0,
+            ),
+        ),
+        holding_weeks=4,
+        effective_at=datetime(2026, 8, 28, 21, tzinfo=ZoneInfo("Asia/Shanghai")),
+        metadata={"tracking_mode": "continuous-signal-v4"},
+    )
+
+    assert main(["list"], _repository=repository) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert listed["tracking_mode"] == "continuous-signal-v4"
+    assert listed["tracking_mode"] != CONTINUOUS_METHOD_VERSION
 
 
 def test_explicit_share_quantity_survives_ledger_roundtrip(tmp_path, capsys):

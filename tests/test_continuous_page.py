@@ -69,6 +69,9 @@ def test_import_and_initial_page_do_not_load_data_or_call_network():
     assert "不发送微信" in _text(ui)
     assert "一组组合" in _text(ui)
     assert "比较0–5只" in _text(ui)
+    assert "已完成周线只过滤明显不利趋势" in _text(ui)
+    assert "已完成日线确认突破" in _text(ui)
+    assert "突破后回踩企稳优先，但不是唯一合格买点" in _text(ui)
     assert "新仓通常约总资金15%" in _text(ui)
     assert not any(kind in {"selectbox", "radio"} for kind, _args, _kwargs in ui.messages)
 

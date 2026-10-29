@@ -93,7 +93,8 @@ def test_unknown_or_stale_calendar_uses_conservative_status(tmp_path, bad_state)
             (tmp_path / "preopen-session-state.json").write_text("{}")
     messages = []
     _run(tmp_path, messages=messages)
-    assert "交易日核验尚未完成" in messages[0].title
+    assert "交易日待核验" in messages[0].title
+    assert "交易日核验尚未完成" in messages[0].body
     assert "不代表今日一定开市" in messages[0].body
 
 
@@ -512,3 +513,53 @@ def test_unexpected_sender_error_is_not_mislabelled_provider_rejection(tmp_path,
 
     monkeypatch.setattr(deadline, "_send_serverchan_notice", broken_sender)
     assert _locked_send(tmp_path) == "failure_notice_worker_failed"
+
+
+def test_early_failure_does_not_consume_fixed_deadline_receipt(tmp_path):
+    early = NOW.replace(minute=50)
+    status = deadline.notify_incomplete_once(
+        state_root=tmp_path, now=early, clock=lambda: early,
+        notifier=lambda _: pytest.fail("08:50 cannot preempt the fixed deadline"),
+    )
+    assert status == "noop_outside_preopen_notice_window"
+    assert not (tmp_path / "evening-failure-notice-state.json").exists()
+
+
+def test_deadline_sends_today_partial_observations_under_existing_guards(tmp_path):
+    from ashare_lab.services.preopen_partial_report import write_preopen_partial_snapshot
+
+    _state(tmp_path)
+    assert write_preopen_partial_snapshot(
+        tmp_path, report_date=NOW.date(), generated_at=NOW - timedelta(minutes=2),
+        data_cutoff=NOW.date() - timedelta(days=1),
+        cycle_label="中期上行｜短线增强", entry_strictness="standard",
+        screening_candidates=[{"name": "示例股份", "formation": "回踩企稳", "reason": "财务待核验"}],
+        missing_codes=("fundamental_incomplete",),
+    )
+    messages = []
+    code, event = _run(tmp_path, messages=messages)
+    assert code == 0 and event["status"] == "failure_notice_provider_accepted"
+    assert "示例股份" in messages[0].body and "仅观察，不代表可以买" in messages[0].body
+    assert "2026-09-21" in messages[0].body
+    _run(tmp_path, now=NOW + timedelta(minutes=1), messages=messages)
+    assert len(messages) == 1
+
+
+def test_snapshot_read_cannot_bypass_before_send_deadline_guard(tmp_path, monkeypatch):
+    from ashare_lab.services import preopen_partial_report
+
+    current = NOW
+    original = preopen_partial_report.render_preopen_partial_message
+
+    def delayed(*args, **kwargs):
+        nonlocal current
+        message = original(*args, **kwargs)
+        current = NOW.replace(hour=9, minute=0)
+        return message
+
+    monkeypatch.setattr(preopen_partial_report, "render_preopen_partial_message", delayed)
+    status = deadline._notify_locked(
+        state_root=tmp_path, expected_date=NOW.date().isoformat(), clock=lambda: current,
+        notifier=lambda _: pytest.fail("no late send after rendering"),
+    )
+    assert status == "noop_outside_preopen_notice_window"
